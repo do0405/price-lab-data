@@ -23,6 +23,7 @@ ASSET='research.pldelta'
 MAX_ASSET_BYTES=129*1024**2
 MAX_PAGES=100
 _HEX=re.compile(r'[0-9a-f]{64}')
+UNSET=object()
 
 
 def package_tag(sequence,digest):
@@ -149,6 +150,73 @@ def newest_package(*,token=None):
     raise ValueError('Latest research package discovery bound reached; refusing a new bootstrap')
 
 
+def _canonical_head(head):
+    if head is None:return None
+    if not isinstance(head,dict) or set(head)!={'sequence','package_sha256'}:
+        raise ValueError('Invalid canonical research head')
+    if type(head['sequence']) is not int or not 1<=head['sequence']<2**63:
+        raise ValueError('Invalid canonical research head sequence')
+    package_tag(head['sequence'],head['package_sha256'])
+    return head
+
+
+def canonical_newest(head,*,token=None):
+    """Resolve the committed exact identity; a newer ready release is irrelevant."""
+    head=_canonical_head(head)
+    if head is None:return None
+    tag=package_tag(head['sequence'],head['package_sha256'])
+    try:release=_api('GET','/releases/tags/'+tag,token=token)
+    except RuntimeError as exc:
+        if 'HTTP 404' not in str(exc):raise
+        raise ValueError('Canonical research head is missing') from None
+    meta=package_metadata(release)
+    if (meta['sequence'],meta['package_sha256'])!=(head['sequence'],head['package_sha256']):
+        raise ValueError('Canonical research head identity mismatch')
+    return release
+
+
+def canonical_packages(head,*,after_sequence=0,expected_cursor_hash=None,token=None):
+    """Walk exact digest ancestry in bounded listings, ignoring orphan branches."""
+    head=_canonical_head(head)
+    if type(after_sequence) is not int or not 0<=after_sequence<2**63:
+        raise ValueError('Invalid canonical research cursor')
+    if after_sequence and (not isinstance(expected_cursor_hash,str) or not _HEX.fullmatch(expected_cursor_hash)):
+        raise ValueError('Applied research cursor hash is required')
+    if head is None:
+        if after_sequence:raise ValueError('Canonical research package rollback detected')
+        return []
+    if after_sequence>head['sequence']:
+        raise ValueError('Canonical research package rollback detected')
+    found={};selected=[];sequence=head['sequence'];digest=head['package_sha256']
+    for page in range(1,MAX_PAGES+1):
+        rows=_api('GET',f'/releases?per_page=100&page={page}',token=token)
+        if not isinstance(rows,list) or len(rows)>100:raise ValueError('Invalid research package listing')
+        for release in rows:
+            if not isinstance(release,dict):raise ValueError('Invalid research package listing')
+            if not str(release.get('tag_name','')).startswith('delta-research-'):continue
+            if release.get('draft') or release.get('prerelease'):continue
+            meta=package_metadata(release);identity=(meta['sequence'],meta['package_sha256'])
+            if identity in found and package_metadata(found[identity])!=meta:
+                raise ValueError('Conflicting canonical research package metadata')
+            found[identity]=release
+        while (sequence,digest) in found:
+            release=found[(sequence,digest)];meta=package_metadata(release)
+            if sequence==after_sequence:
+                if digest!=expected_cursor_hash:
+                    raise ValueError('Canonical research cursor mismatch')
+                return list(reversed(selected))
+            selected.append(release)
+            if sequence==1:
+                if after_sequence:raise ValueError('Canonical research cursor is missing')
+                return list(reversed(selected))
+            sequence-=1;digest=meta['previous_package_sha256']
+            if sequence==after_sequence and digest!=expected_cursor_hash:
+                raise ValueError('Canonical research cursor mismatch')
+        if len(rows)<100:
+            raise ValueError('Canonical research head or ancestor is missing; sequence gap')
+    raise ValueError('Canonical research package discovery bound reached')
+
+
 def download_package(release,directory):
     meta=package_metadata(release);asset=release['assets'][0]
     directory=Path(directory);directory.mkdir(parents=True,exist_ok=True)
@@ -190,9 +258,14 @@ def load_package(release,work_root,*,key=None):
     return payload
 
 
-def publish_package(payload,*,key=None,token=None,work_root=None):
+def publish_package(payload,*,key=None,token=None,work_root=None,expected_head=UNSET):
     from .research_delta_codec import validate_payload,package_digest,seal_package
     validate_payload(payload);digest=package_digest(payload)
+    if expected_head is not UNSET:
+        parent=_canonical_head(expected_head)
+        if (payload['sequence']!=(parent['sequence']+1 if parent else 1) or
+                payload.get('previous_package_sha256')!=(parent['package_sha256'] if parent else None)):
+            raise ValueError('Research package does not extend the canonical head')
     tag=package_tag(payload['sequence'],digest)
     try:old=_api('GET','/releases/tags/'+tag,token=token)
     except RuntimeError as exc:
@@ -202,8 +275,8 @@ def publish_package(payload,*,key=None,token=None,work_root=None):
         meta=package_metadata(old)
         if meta['package_sha256']!=digest:raise ValueError('Immutable research package collision')
         return {'release_url':old['html_url'],'tag':tag,'unchanged':True,'sequence':payload['sequence'],'package_sha256':digest}
-    latest=newest_package(token=token)
-    parent=package_metadata(latest) if latest else None
+    latest=newest_package(token=token) if expected_head is UNSET else None
+    parent=package_metadata(latest) if latest else (expected_head if expected_head is not UNSET else None)
     if (payload['sequence']!=(parent['sequence']+1 if parent else 1) or
             payload.get('previous_package_sha256')!=(parent['package_sha256'] if parent else None)):
         raise ValueError('Research log advanced; collect again from the authenticated latest state')
@@ -243,6 +316,7 @@ def pull_latest(root,*,key=None,max_packages=1,max_bytes=None,token=None):
     import duckdb
     from .ingestion import resolve_current,managed_lock
     from .research_delta_apply import apply_packages
+    from .research_ownership import read_control
     if type(max_packages) is not int or not 1<=max_packages<=100:raise ValueError('Invalid research apply bound')
     if max_bytes is not None and (type(max_bytes) is not int or max_bytes<1):raise ValueError('Invalid research byte bound')
     root=Path(root);root.mkdir(parents=True,exist_ok=True)
@@ -254,7 +328,11 @@ def pull_latest(root,*,key=None,max_packages=1,max_bytes=None,token=None):
             if 'research_delta_receipts' in {r[0] for r in db.execute('SHOW TABLES').fetchall()}:
                 row=db.execute("SELECT sequence,package_sha256 FROM research_delta_receipts WHERE stream_id='kr-reference-evidence-v1' ORDER BY sequence DESC LIMIT 1").fetchone()
                 if row:after,cursor_hash=row
-        releases=list_packages(after_sequence=after,expected_cursor_hash=cursor_hash,token=token)
+        def discover(sequence,digest):
+            control=read_control(token=token,key=key)
+            options=dict(after_sequence=sequence,expected_cursor_hash=digest,token=token)
+            return canonical_packages(control['head'],**options) if control else list_packages(**options)
+        releases=discover(after,cursor_hash)
         selected=[];size=0
         for release in releases[:max_packages]:
             amount=release['assets'][0]['size']
@@ -275,8 +353,7 @@ def pull_latest(root,*,key=None,max_packages=1,max_bytes=None,token=None):
             # Rediscovery is reporting after the committed cursor, not a second
             # application or a reason to roll back an already valid publication.
             try:
-                more=bool(list_packages(after_sequence=result['applied_sequence'],
-                    expected_cursor_hash=result['package_sha256'],token=token))
+                more=bool(discover(result['applied_sequence'],result['package_sha256']))
             except Exception:result['warning_code']='RESEARCH_TIP_CHECK_UNAVAILABLE'
         return {**result,'status':'MORE_AVAILABLE' if more else result['status'],
             'more_available':more,'downloaded':bool(selected),'transport':'research-delta-v1',

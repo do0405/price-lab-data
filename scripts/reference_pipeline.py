@@ -59,7 +59,18 @@ def assert_database_free_runtime():
         if next(ROOT.rglob(pattern),None) is not None:raise ValueError('Cloud research must contain raw delta packages only')
 
 
-def run_pipeline(*,seconds=420,max_requests=100,max_batches=100,work_root=None):
+def takeover_state(prior,owner,now):
+    state=copy.deepcopy(prior['state'])
+    # A previous machine's plain connection failure is rechecked on this PC
+    # after >=60s. Provider HTTP Retry-After and contract failures stay intact.
+    observed=datetime.fromisoformat(prior['collected_at'].replace('Z','+00:00'))
+    if owner is not None and owner.role=='local' and (now-observed).total_seconds()>=60:
+        for provider,value in list(state['cooldowns'].items()):
+            if value.get('reason')=='TRANSPORT_UNAVAILABLE':state['cooldowns'].pop(provider)
+    return state
+
+
+def run_pipeline(*,seconds=420,max_requests=100,max_batches=100,work_root=None,owner=None):
     from price_lab.research_delta_codec import open_bootstrap,package_digest
     from price_lab.research_delta_transport import newest_package,load_package,publish_package
     from price_lab.research_delta_collect import collect_batch,official_fetcher,extend_sessions
@@ -71,9 +82,43 @@ def run_pipeline(*,seconds=420,max_requests=100,max_batches=100,work_root=None):
     work=Path(work_root or ROOT/'data/research');work.mkdir(parents=True,exist_ok=True)
     key=os.environ.get('PRICE_DATA_KEY');end=clock()+timedelta(seconds=seconds)
     bootstrap=open_bootstrap(ROOT/'config/research-bootstrap.pldelta',key)
-    release=newest_package();prior=load_package(release,work,key=key) if release else None
-    state=prior['state'] if prior else bootstrap['state']
+    if owner is None:
+        release=newest_package()
+    else:
+        from price_lab.research_ownership import read_control
+        from price_lab.research_delta_transport import canonical_newest
+        control=read_control(key=key)
+        release=canonical_newest(control['head']) if control else newest_package()
+    prior=load_package(release,work,key=key) if release else None
     if prior and prior['bootstrap_anchor_sha256']!=bootstrap['anchor_sha256']:raise ValueError('Research bootstrap stream mismatch')
+    if owner is not None:
+        if control and owner.role=='local':owner.prefer_local()
+        head=dict(sequence=prior['sequence'],package_sha256=package_digest(prior)) if prior else None
+        if not owner.acquire(initial_head=head,anchor_sha256=bootstrap['anchor_sha256']):
+            return dict(status='WAITING_OTHER_COLLECTOR',batches=0,published=[],source_requests=0,
+                continue_ready=False,cloud_database=False,collector_role=owner.role)
+        try:
+            if owner.role=='local':owner.prefer_local()
+            # Another producer may have committed between the initial read and acquire.
+            control=read_control(key=key)
+            release=canonical_newest(control['head'])
+            prior=load_package(release,work,key=key) if release else None
+            return _produce(bootstrap,prior,work,key,end,clock,seconds,max_requests,max_batches,owner)
+        finally:
+            try:owner.release()
+            except Exception:pass  # Expiry is the fallback; never roll back a committed head.
+    return _produce(bootstrap,prior,work,key,end,clock,seconds,max_requests,max_batches,None)
+
+
+def _produce(bootstrap,prior,work,key,end,clock,seconds,max_requests,max_batches,owner):
+    from price_lab.research_delta_codec import package_digest
+    from price_lab.research_delta_transport import publish_package
+    from price_lab.research_delta_collect import collect_batch,official_fetcher,extend_sessions
+    from price_lab.research_quota import reserve_requests
+    from price_lab import daily_delta_transport as daily
+    state=takeover_state(prior,owner,clock()) if prior else bootstrap['state']
+    if prior and prior['bootstrap_anchor_sha256']!=bootstrap['anchor_sha256']:raise ValueError('Research bootstrap stream mismatch')
+    if owner is not None:owner.guard(force=True)
     latest_daily=daily.newest_package()
     if latest_daily:
         price=daily.load_package(latest_daily,work,key=key)
@@ -81,9 +126,15 @@ def run_pipeline(*,seconds=420,max_requests=100,max_batches=100,work_root=None):
         del price
     fetch=official_fetcher()
     invocation=f"{os.environ.get('GITHUB_RUN_ID','manual')}-{os.environ.get('GITHUB_RUN_ATTEMPT','1')}-{uuid.uuid4().hex}"
-    sent=[];status='RUNNING';total_requests=0
+    sent=[];status='RUNNING';total_requests=0;yielded=False
+    def can_send():
+        if owner is not None:owner.guard()
+        return not price_window(clock())
     for index in range(max_batches):
         if price_window(clock()) or clock()>=end-timedelta(seconds=60):break
+        if owner is not None:
+            owner.guard(force=True)
+            if owner.role=='local':owner.prefer_local()
         initial={**state['discovery'].get('quota_floor',bootstrap['quota']),'allow_initialize':prior is None}
         last_floor=None
         def reserve(counts,**kwargs):
@@ -96,7 +147,7 @@ def run_pipeline(*,seconds=420,max_requests=100,max_batches=100,work_root=None):
         rid=f"{invocation}-{index}"
         result=collect_batch(copy.deepcopy(state),fetch=fetch,reserve=reserve,now=clock(),max_requests=max_requests,
             reservation_id=rid,initial=initial,deadline=end-timedelta(seconds=60),clock=clock,
-            can_send=lambda:not price_window(clock()))
+            can_send=can_send)
         state=result['state'];status=result['status']
         total_requests+=sum(result['requests_by_provider'].values())
         if last_floor:state['discovery']['quota_floor']=last_floor
@@ -106,20 +157,29 @@ def run_pipeline(*,seconds=420,max_requests=100,max_batches=100,work_root=None):
             sequence=prior['sequence']+1 if prior else 1,
             previous_package_sha256=package_digest(prior) if prior else None,
             bootstrap_anchor_sha256=bootstrap['anchor_sha256'],collected_at=clock().isoformat(),records=records,state=state)
-        published=publish_package(payload,key=key,work_root=work)
+        publish_options={}
+        if owner is not None:
+            owner.guard(force=True)
+            publish_options['expected_head']=dict(sequence=prior['sequence'],package_sha256=package_digest(prior)) if prior else None
+        published=publish_package(payload,key=key,work_root=work,**publish_options)
+        if owner is not None:owner.commit_head(payload)
         sent.append({'sequence':published['sequence'],'records':len(records),'package_sha256':published['package_sha256']})
         prior=payload
         print(json.dumps({'stage':'research_batch','status':status,**sent[-1],'cloud_database':False}),flush=True)
+        if owner is not None and owner.role=='cloud' and owner.should_yield():
+            yielded=True;status='YIELDED_TO_LOCAL';break
         if status=='IDLE' or status.startswith('WAITING'):break
     return {'status':status,'batches':len(sent),'published':sent,'cloud_database':False,
-        'source_requests':total_requests,'continue_ready':total_requests>0 and continuation_ready(state,clock())}
+        'source_requests':total_requests,'continue_ready':not yielded and total_requests>0 and continuation_ready(state,clock()),
+        'collector_role':owner.role if owner is not None else 'legacy-test'}
 
 
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--seconds',type=int,default=420)
     parser.add_argument('--max-requests',type=int,default=100);parser.add_argument('--max-batches',type=int,default=100)
     args=parser.parse_args();assert_database_free_runtime()
-    result=run_pipeline(seconds=args.seconds,max_requests=args.max_requests,max_batches=args.max_batches)
+    from price_lab.research_ownership import ResearchOwner
+    result=run_pipeline(seconds=args.seconds,max_requests=args.max_requests,max_batches=args.max_batches,owner=ResearchOwner('cloud'))
     if args.max_batches>1 and result.get('continue_ready'):
         result['continuation']=request_continuation()
     assert_database_free_runtime();print(json.dumps(result),flush=True)
