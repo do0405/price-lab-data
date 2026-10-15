@@ -264,9 +264,20 @@ def pull_latest(root,*,key=None,max_packages=1,max_bytes=None,token=None):
             selected.append(release);size+=amount
         if selected:
             result=apply_packages((load_package(r,root/'research-download',key=key) for r in selected),root)
+            if result.get('error_code')=='RESEARCH_STORAGE_RESERVE_REQUIRED':
+                return {**result,'more_available':False,'downloaded':True,
+                    'transport':'research-delta-v1','ciphertext_bytes':size,'cloud_database':False}
             if result['status'] not in ('PUBLISHED','UNCHANGED'):raise ValueError('Research validation failed; previous cursor retained')
         else:result={'status':'UNCHANGED','applied_packages':[],'manifest':current}
         more=len(selected)<len(releases)
+        if selected and not more:
+            # A multi-GB local publication can overlap new ready cloud batches.
+            # Rediscovery is reporting after the committed cursor, not a second
+            # application or a reason to roll back an already valid publication.
+            try:
+                more=bool(list_packages(after_sequence=result['applied_sequence'],
+                    expected_cursor_hash=result['package_sha256'],token=token))
+            except Exception:result['warning_code']='RESEARCH_TIP_CHECK_UNAVAILABLE'
         return {**result,'status':'MORE_AVAILABLE' if more else result['status'],
             'more_available':more,'downloaded':bool(selected),'transport':'research-delta-v1',
             'ciphertext_bytes':size,'cloud_database':False}

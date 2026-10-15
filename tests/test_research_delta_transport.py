@@ -83,3 +83,4 @@ def test_signed_journal_cannot_regress_below_authenticated_packet_floor(monkeypa
         quota.reserve_requests({'kind':1},reservation_id='retry',initial={'quota_day':'2026-10-16',
             'used':{'krx':200,'kis':0,'kind':0},'revision':3,'allow_initialize':False},
             now=datetime(2026,10,15,16,tzinfo=timezone.utc),key=b'x'*32)
+
