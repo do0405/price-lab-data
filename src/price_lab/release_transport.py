@@ -25,14 +25,23 @@ def release_manifest(manifest):
     Its detailed rows are in the authenticated container and reference tables,
     while release discovery needs only the dataset identity and price status.
     """
-    public={k:v for k,v in manifest.items() if k!='resolved_path'}
-    validation=public.get('validation',{})
-    public['validation']={k:validation[k] for k in ('valid','markets','pending_adjustments','history') if k in validation}
+    def scalars(value,fields):
+        if not isinstance(value,dict):return {}
+        return {k:(v[:256] if isinstance(v,str) else v) for k in fields if k in value
+                and (v:=value[k]) is not None and type(v) in (str,int,float,bool)}
+    public=scalars(manifest,('schema_version','key_version','sequence','sha256','parent_sha256','database','created_at'))
+    public['markets']={m:scalars(item,('target','actual')) for m,item in manifest.get('markets',{}).items() if m in ('kr','us','crypto')}
+    validation=manifest.get('validation',{})
+    public['validation']=scalars(validation,('valid','pending_adjustments'))
+    if isinstance(validation.get('history'),dict):
+        public['validation']['history']=scalars(validation['history'],('present','archives'))
     reference=validation.get('kr_reference')
     if isinstance(reference,dict):
-        public['validation']['kr_reference']={k:reference[k] for k in
+        public['validation']['kr_reference']=scalars(reference,
             ('status','observations','identity_status','capitalization_status','lifecycle_status',
-             'unknown_identity','unknown_settlements','publication_time_verified') if k in reference}
+             'unknown_identity','unknown_settlements','publication_time_verified'))
+    if len(json.dumps(public,ensure_ascii=True).encode('utf-8'))>16000:
+        raise ValueError('Release summary exceeds fixed metadata budget')
     return public
 
 def _request(method,path,*,token=None,payload=None,stream=None):

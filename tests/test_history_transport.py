@@ -15,6 +15,18 @@ def test_large_coverage_report_is_kept_out_of_release_body_without_mutation():
     result=release_manifest(source)
     assert len(json.dumps(result))<10000
     assert len(source['validation']['kr_reference']['rows'])==10000
+
+
+def test_release_summary_omits_unbounded_calendar_and_ancestry():
+    from price_lab.release_transport import release_manifest
+    source={'sha256':'a'*64,'parent_sha256':'b'*64,'sequence':6000,
+        'ancestors':['c'*64]*6000,'calendar_evidence':{'kr':{str(n):{'open':True,'evidence':'official calendar'} for n in range(4000)}},
+        'validation':{'history':{'present':True,'archives':3,'arbitrary_rows':['x']*10000},'valid':True}}
+    result=release_manifest(source)
+    assert len(json.dumps(result).encode())<10000
+    assert 'ancestors' not in result and 'calendar_evidence' not in result
+    assert result['sha256']==source['sha256'] and result['validation']['history']['archives']==3
+    assert len(source['ancestors'])==6000 and len(source['calendar_evidence']['kr'])==4000
     assert result['sha256']==source['sha256'] and result['validation']['valid']
 
 
@@ -53,11 +65,14 @@ def test_candidate_upload_and_restore_never_publish_local_or_stable(tmp_path,mon
     u.prepare_candidate_root(root,candidate);u.integrate_archives([archive(tmp_path)],root=candidate)
     bodies=[];files={};state={}
     def request(method,path,**kwargs):
+        if method=='GET' and path.startswith('/releases?'):return []
         if method=='GET':raise RuntimeError('HTTP 404')
         if method=='POST' and path=='/releases':
             state.update(kwargs['payload']);state.update(id=1,assets=[],upload_url='https://uploads.github.com/repos/do0405/price-lab-data/releases/1/assets{?name}',html_url='https://github.com/do0405/price-lab-data/releases/1')
         elif method=='POST':files[path.split('name=')[-1]]=kwargs['stream'].read()
-        elif method=='PATCH':state.update(kwargs['payload'])
+        elif method=='PATCH':
+            assert kwargs['payload'].get('tag_name')==state['tag_name'], 'GitHub draft PATCH must retain its tag explicitly'
+            state.update(kwargs['payload'])
         bodies.append(dict(state));return dict(state)
     monkeypatch.setattr(t,'_request',request)
     out=t.upload_candidate(candidate,key=b'x'*32,token='test')
@@ -65,6 +80,25 @@ def test_candidate_upload_and_restore_never_publish_local_or_stable(tmp_path,mon
     assert all(b.get('draft') for b in bodies)
     assert (root/'current.json').read_bytes()==before
     assert files and t.candidate_metadata(state)['ready']
+
+
+def test_uploaded_untagged_draft_is_rebound_without_reupload(tmp_path,monkeypatch):
+    root=managed(tmp_path);cp=i.resolve_current(root);tag=t.PREFIX+cp['sha256']
+    release={'id':9,'name':tag,'tag_name':'untagged-server-placeholder','draft':True,'assets':[{'id':1}],
+        'body':json.dumps({'purpose':'unified-history','schema_version':1,'ready':True,
+            'checkpoint':{'sha256':cp['sha256']},'ciphertext_sha256':'b'*64})}
+    events=[]
+    def request(method,path,**kwargs):
+        if method=='GET' and path.startswith('/releases/tags/'):raise RuntimeError('HTTP 404')
+        if method=='GET' and path.startswith('/releases?'):return [release]
+        if method=='PATCH':
+            assert kwargs['payload']['tag_name']==tag
+            events.append('rebind');release.update(kwargs['payload']);return release
+        raise AssertionError('uploaded draft was recreated or uploaded again')
+    monkeypatch.setattr(t,'_request',request)
+    monkeypatch.setattr(t,'encrypt_checkpoint',lambda *a,**k:(_ for _ in ()).throw(AssertionError('uploaded draft was encrypted again')))
+    out=t.upload_candidate(root,key=b'x'*32,token='test')
+    assert out['unchanged'] and out['tag']==tag and events==['rebind']
 
 
 def test_restore_rejects_unexpected_ciphertext_before_db_use(tmp_path,monkeypatch):

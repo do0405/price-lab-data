@@ -50,6 +50,32 @@ def pending_candidates(*,token=None,max_pages=5,limit=8,exclude=()):
     return sorted(result,key=lambda r:(r.get('created_at',''),r['tag_name']))[:limit]
 
 
+def _recover_untagged_candidate(tag,digest,*,token=None):
+    """Rebind an authenticated legacy draft by exact name + envelope identity.
+
+    GitHub can replace a draft tag after PATCH when tag_name is omitted. Keep
+    its already uploaded ciphertext; never guess identity from asset names.
+    """
+    matches=[]
+    for page in range(1,6):
+        rows=_request('GET',f'/releases?per_page=100&page={page}',token=token)
+        if not isinstance(rows,list):raise ValueError('Invalid candidate recovery listing')
+        for release in rows:
+            if (not isinstance(release,dict) or release.get('draft') is not True
+                    or release.get('name')!=tag or not str(release.get('tag_name','')).startswith('untagged-')):continue
+            try:metadata=candidate_metadata({**release,'tag_name':tag})
+            except ValueError:continue
+            if metadata['checkpoint']['sha256']==digest:matches.append(release)
+        if len(rows)<100:break
+    if len(matches)>1:raise ValueError('Ambiguous uploaded candidate drafts require reconciliation')
+    if not matches:return None
+    release=matches[0]
+    repaired=_request('PATCH','/releases/'+str(release['id']),token=token,
+        payload={'tag_name':tag,'name':tag,'target_commitish':'main'})
+    candidate_metadata(repaired)
+    return repaired
+
+
 def upload_candidate(root,*,key=None,token=None):
     current=resolve_current(root)
     if current is None:raise ValueError('Validated integration candidate required')
@@ -57,7 +83,7 @@ def upload_candidate(root,*,key=None,token=None):
     try:old=_request('GET','/releases/tags/'+tag,token=token)
     except RuntimeError as exc:
         if 'HTTP 404' not in str(exc):raise
-        old=None
+        old=_recover_untagged_candidate(tag,current['sha256'],token=token)
     if old:
         try:metadata=candidate_metadata(old)
         except ValueError:metadata=None
@@ -78,13 +104,15 @@ def upload_candidate(root,*,key=None,token=None):
             'tag_name':tag,'name':tag,'draft':True,'prerelease':False,
             'target_commitish':'main','body':json.dumps(body,sort_keys=True)})
         # Incomplete drafts are not discovered. Clear old partial uploads only.
-        _request('PATCH','/releases/'+str(release['id']),token=token,payload={'body':json.dumps(body,sort_keys=True)})
+        identity={'tag_name':tag,'name':tag,'target_commitish':'main'}
+        _request('PATCH','/releases/'+str(release['id']),token=token,payload={**identity,'body':json.dumps(body,sort_keys=True)})
         for asset in release.get('assets',[]):_request('DELETE','/releases/assets/'+str(asset['id']),token=token)
         for path in paths:
             with path.open('rb') as stream:
                 _request('POST',release['upload_url'].split('{')[0]+'?name='+path.name,token=token,stream=stream)
         body['ready']=True
-        _request('PATCH','/releases/'+str(release['id']),token=token,payload={'body':json.dumps(body,sort_keys=True)})
+        ready=_request('PATCH','/releases/'+str(release['id']),token=token,payload={**identity,'body':json.dumps(body,sort_keys=True)})
+        candidate_metadata(ready)
     return {'status':'UPLOADED_PENDING_INTEGRATION','tag':tag,'sha256':current['sha256'],'unchanged':False}
 
 

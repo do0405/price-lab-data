@@ -23,6 +23,7 @@ def run_pipeline(*,root=None,audit=False,publish_only=False,integration_only=Fal
     from price_lab.providers import Providers
     from price_lab.release_transport import pull_latest,publish_current,record_periodic_status
     from price_lab.history_transport import process_pending
+    from price_lab.kr_reference_refresh import refresh_recent_reference
     root=Path(root or ROOT/'data'/'market')
     if not publish_only:
         pull_latest(root)
@@ -35,6 +36,13 @@ def run_pipeline(*,root=None,audit=False,publish_only=False,integration_only=Fal
     current=resolve_current(root)
     if current is None:raise ValueError('Checkpoint bootstrap required')
     result=publish_current(root)
+    if not publish_only and not integration_only:
+        reference=refresh_recent_reference(root)
+        # Every remote checkpoint must be the published latest's direct child.
+        # Reference failure leaves the successful daily price publication intact.
+        if reference['status']=='PUBLISHED':result=publish_current(root)
+        result['reference']={k:reference[k] for k in ('status','network_requests','reason','error','sequence') if k in reference}
+        print(json.dumps({'stage':'kr_reference',**result['reference']}),flush=True)
     candidates=process_pending(root)
     result['integration']=candidates
     current=resolve_current(root)
