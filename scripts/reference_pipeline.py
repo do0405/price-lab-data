@@ -19,6 +19,39 @@ def price_window(now):
     return 19*60+27<=ny.hour*60+ny.minute<20*60+7 or 20*60+27<=kr.hour*60+kr.minute<21*60+7
 
 
+def continuation_ready(state,now):
+    from price_lab.research_quota import LIMITS,KST
+    if price_window(now):return False
+    floor=state['discovery'].get('quota_floor',{})
+    today=now.astimezone(KST).date().isoformat()
+    used=floor.get('used',{}) if floor.get('quota_day')==today else {}
+    for provider,tasks in state['pending'].items():
+        retry=state['cooldowns'].get(provider,{}).get('next_retry_at')
+        if retry and datetime.fromisoformat(retry.replace('Z','+00:00'))>now:continue
+        if tasks and LIMITS[provider]-used.get(provider,0)>=(2 if provider=='kis' else 1):return True
+    return False
+
+
+def request_continuation():
+    """At most one successor; fixed workflow/main only, cron remains recovery."""
+    if (os.environ.get('GITHUB_ACTIONS')!='true' or os.environ.get('GITHUB_REF')!='refs/heads/main'
+        or os.environ.get('GITHUB_EVENT_NAME') not in ('schedule','workflow_dispatch')):
+        return {'status':'NOT_ACTIONS_MAIN'}
+    if price_window(datetime.now(timezone.utc)):return {'status':'WAITING_PRICE_WINDOW'}
+    from price_lab.daily_delta_transport import _api
+    try:
+        current=int(os.environ['GITHUB_RUN_ID'])
+        for status in ('queued','in_progress'):
+            runs=_api('GET','/actions/workflows/reference-evidence.yml/runs?status='+status+'&per_page=100')['workflow_runs']
+            if not isinstance(runs,list) or len(runs)>100:raise ValueError('Invalid continuation listing')
+            if any(r.get('id')!=current and r.get('status') in ('queued','in_progress','waiting','requested','pending') for r in runs):
+                return {'status':'ALREADY_QUEUED'}
+        _api('POST','/actions/workflows/reference-evidence.yml/dispatches',
+            payload={'ref':'main','inputs':{'max_requests':'100','max_batches':'100'}})
+        return {'status':'DISPATCHED'}
+    except Exception:return {'status':'WAITING_SCHEDULE_RECOVERY'}
+
+
 def assert_database_free_runtime():
     if 'duckdb' in sys.modules or 'price_lab.local_credentials' in sys.modules:
         raise ValueError('Cloud research must not import a database or private credentials')
@@ -48,7 +81,7 @@ def run_pipeline(*,seconds=420,max_requests=100,max_batches=100,work_root=None):
         del price
     fetch=official_fetcher()
     invocation=f"{os.environ.get('GITHUB_RUN_ID','manual')}-{os.environ.get('GITHUB_RUN_ATTEMPT','1')}-{uuid.uuid4().hex}"
-    sent=[];status='RUNNING'
+    sent=[];status='RUNNING';total_requests=0
     for index in range(max_batches):
         if price_window(clock()) or clock()>=end-timedelta(seconds=60):break
         initial={**state['discovery'].get('quota_floor',bootstrap['quota']),'allow_initialize':prior is None}
@@ -65,6 +98,7 @@ def run_pipeline(*,seconds=420,max_requests=100,max_batches=100,work_root=None):
             reservation_id=rid,initial=initial,deadline=end-timedelta(seconds=60),clock=clock,
             can_send=lambda:not price_window(clock()))
         state=result['state'];status=result['status']
+        total_requests+=sum(result['requests_by_provider'].values())
         if last_floor:state['discovery']['quota_floor']=last_floor
         records=result['records']
         if not records and prior and state==prior['state']:break
@@ -77,7 +111,8 @@ def run_pipeline(*,seconds=420,max_requests=100,max_batches=100,work_root=None):
         prior=payload
         print(json.dumps({'stage':'research_batch','status':status,**sent[-1],'cloud_database':False}),flush=True)
         if status=='IDLE' or status.startswith('WAITING'):break
-    return {'status':status,'batches':len(sent),'published':sent,'cloud_database':False}
+    return {'status':status,'batches':len(sent),'published':sent,'cloud_database':False,
+        'source_requests':total_requests,'continue_ready':total_requests>0 and continuation_ready(state,clock())}
 
 
 def main():
@@ -85,6 +120,8 @@ def main():
     parser.add_argument('--max-requests',type=int,default=100);parser.add_argument('--max-batches',type=int,default=100)
     args=parser.parse_args();assert_database_free_runtime()
     result=run_pipeline(seconds=args.seconds,max_requests=args.max_requests,max_batches=args.max_batches)
+    if args.max_batches>1 and result.get('continue_ready'):
+        result['continuation']=request_continuation()
     assert_database_free_runtime();print(json.dumps(result),flush=True)
 
 

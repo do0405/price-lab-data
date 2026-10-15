@@ -15,6 +15,48 @@ def test_actual_start_guard_preserves_price_window():
     assert p.price_window(datetime(2026,10,15,23,37,tzinfo=timezone.utc))
     assert not p.price_window(datetime(2026,10,15,16,0,tzinfo=timezone.utc))
 
+
+def test_continuation_does_not_duplicate_an_existing_pending_run(monkeypatch):
+    from price_lab import daily_delta_transport as api
+    p=script();monkeypatch.setattr(p,'price_window',lambda now:False)
+    for k,v in {'GITHUB_ACTIONS':'true','GITHUB_RUN_ID':'123','GITHUB_REF':'refs/heads/main',
+                'GITHUB_EVENT_NAME':'workflow_dispatch'}.items():monkeypatch.setenv(k,v)
+    calls=[]
+    def request(method,path,**kwargs):
+        calls.append((method,path,kwargs))
+        return {'workflow_runs':[{'id':123,'status':'in_progress'},{'id':124,'status':'queued'}]}
+    monkeypatch.setattr(api,'_api',request)
+    assert p.request_continuation()['status']=='ALREADY_QUEUED'
+    assert len(calls)==1
+
+
+def test_continuation_requests_only_the_same_main_workflow_and_fails_safely(monkeypatch):
+    from price_lab import daily_delta_transport as api
+    p=script();monkeypatch.setattr(p,'price_window',lambda now:False)
+    for k,v in {'GITHUB_ACTIONS':'true','GITHUB_RUN_ID':'123','GITHUB_REF':'refs/heads/main',
+                'GITHUB_EVENT_NAME':'schedule'}.items():monkeypatch.setenv(k,v)
+    calls=[]
+    def request(method,path,**kwargs):
+        calls.append((method,path,kwargs))
+        return {'workflow_runs':[{'id':123,'status':'in_progress'}]} if method=='GET' else {}
+    monkeypatch.setattr(api,'_api',request)
+    assert p.request_continuation()['status']=='DISPATCHED'
+    assert calls[-1][0]=='POST' and calls[-1][1]=='/actions/workflows/reference-evidence.yml/dispatches'
+    assert calls[-1][2]['payload']=={'ref':'main','inputs':{'max_requests':'100','max_batches':'100'}}
+    monkeypatch.setattr(api,'_api',lambda *a,**k:(_ for _ in ()).throw(RuntimeError('HTTP failure')))
+    assert p.request_continuation()['status']=='WAITING_SCHEDULE_RECOVERY'
+
+
+def test_continuation_eligibility_respects_independent_quota_and_cooldown():
+    p=script();now=datetime(2026,10,15,16,tzinfo=timezone.utc)
+    state={'pending':{'krx':[{}],'kis':[],'kind':[]},'cooldowns':{},
+        'discovery':{'quota_floor':{'quota_day':'2026-10-16','used':{'krx':8000,'kis':0,'kind':0}}}}
+    assert not p.continuation_ready(state,now)
+    state['pending']['kind']=[{}]
+    assert p.continuation_ready(state,now)
+    state['cooldowns']['kind']={'next_retry_at':'2026-10-16T16:00:00Z'}
+    assert not p.continuation_ready(state,now)
+
 def test_runtime_import_does_not_load_database_or_credentials():
     import subprocess,sys
     root=Path(__file__).resolve().parents[1]
