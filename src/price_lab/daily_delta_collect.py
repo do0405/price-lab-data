@@ -119,6 +119,7 @@ def collect_delta(providers,prior_payload=None,bootstrap=None,now=None,
     if hasattr(providers,'load_session_evidence'):providers.load_session_evidence(copy.deepcopy(state['calendar_evidence']))
     universe={(a['market'],a['symbol']):a for a in state['assets']};parts=[];plans={}
     state.setdefault('audit_cursor',{})
+    stage='calendar';market='all'
     try:
         original_state_bytes=len(_canonical(state));payload_bytes=original_state_bytes
         if payload_bytes>MAX_RAW_BYTES:raise ValueError('Package raw size limit exceeded')
@@ -148,8 +149,11 @@ def collect_delta(providers,prior_payload=None,bootstrap=None,now=None,
                 position=positions[days[0]]
                 action_start=all_days[position-1]+pd.Timedelta(days=1) if position else days[0]
                 assets=pd.DataFrame([a for (m,_),a in universe.items() if m==market])
+                stage='fetch'
                 batch=providers.fetch_market_part(market,list(days),assets,audit=audit,action_start=action_start)
+                stage='normalize'
                 part=_part(batch,market,days,action_start)
+                stage='encode'
                 payload_bytes+=len(_canonical(part))
                 if payload_bytes>MAX_RAW_BYTES:raise ValueError('Package raw size limit exceeded')
                 parts.append(part)
@@ -158,8 +162,10 @@ def collect_delta(providers,prior_payload=None,bootstrap=None,now=None,
                     universe[key]={**universe.get(key,{}),**{k:v for k,v in asset.items() if v is not None}}
             state['sessions'][market]=[str(d.date()) for d in all_days]
             state['watermarks'][market]=state['sessions'][market][-1]
-    except Exception:
-        raise ValueError('Required market collection failed') from None
+    except Exception as exc:
+        from .providers import ProviderError
+        category='provider' if isinstance(exc,ProviderError) else 'validation' if isinstance(exc,ValueError) else 'other'
+        raise ValueError(f'Required market collection failed (market={market}; stage={stage}; type={category})') from None
     state['assets']=sorted(universe.values(),key=lambda a:(a['market'],a['symbol']))
     state['calendar_evidence']=_native(copy.deepcopy(getattr(providers,'calendar_evidence',state['calendar_evidence'])))
     payload_bytes+=len(_canonical(state))-original_state_bytes+1024

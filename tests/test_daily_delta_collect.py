@@ -89,6 +89,13 @@ def test_any_required_market_failure_prevents_payload_and_state_advance(monkeypa
     assert initial==before and 'secret' not in str(error.value) and 'URL' not in str(error.value)
 
 
+def test_failure_reports_fixed_stage_without_upstream_contents(monkeypatch):
+    c=calendar(monkeypatch)
+    with pytest.raises(ValueError,match='market=kr; stage=fetch; type=other') as error:
+        c.collect_delta(Provider(fail='kr'),bootstrap=bootstrap(),now=NOW)
+    assert 'private' not in str(error.value) and 'secret' not in str(error.value)
+
+
 def test_catchup_and_audit_are_bounded_to_twenty_sessions_per_part(monkeypatch):
     days=[str(d.date()) for d in pd.date_range('2024-01-01',periods=100)]
     c=calendar(monkeypatch,days);p=Provider();now=datetime(2024,4,11,12,tzinfo=timezone.utc)
