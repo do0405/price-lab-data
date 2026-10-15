@@ -10,3 +10,4 @@ __pycache__/
 *.duckdb
 *.wal
 *.pldata
+*.pldelta
