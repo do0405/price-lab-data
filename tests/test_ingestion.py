@@ -423,3 +423,37 @@ def test_decimal_raw_storage_does_not_publish_identical_float_batch(tmp_path):
     with duckdb.connect(i.resolve_current(root)['resolved_path'],read_only=True) as db:
         assert dict((r[1],r[2]) for r in db.execute("PRAGMA table_info('ingest_raw_bars')").fetchall())['turnover']=='DECIMAL(38,12)'
 
+
+def test_publication_wait_preserves_current_and_catches_up_without_new_clock_date(tmp_path):
+    i=module();source=seed(tmp_path/'seed.duckdb');root=tmp_path/'managed'
+    class PublicationProvider(FakeProvider):
+        ready=False
+        def published_sessions(self,market,sessions,now=None):
+            return sessions if self.ready else sessions[:-1]
+    provider=PublicationProvider()
+    first=i.refresh(provider,seed_path=source,supplement_path=None,root=root,markets=('us',),now='2024-01-08T22:00Z')
+    assert first['status']=='PUBLISHED' and first['manifest']['markets']['us']['actual']=='2024-01-05'
+    assert all(max(dates)<=pd.Timestamp('2024-01-05') for dates in provider.calls)
+    provider.ready=True
+    caught_up=i.refresh(provider,seed_path=source,supplement_path=None,root=root,markets=('us',),now='2024-01-08T22:00Z')
+    assert caught_up['status']=='PUBLISHED' and caught_up['manifest']['markets']['us']['actual']=='2024-01-08'
+    before=(root/'current.json').read_bytes();provider.ready=False
+    kept=i.refresh(provider,seed_path=source,supplement_path=None,root=root,markets=('us',),now='2024-01-08T22:00Z')
+    assert kept['status']=='UNCHANGED' and (root/'current.json').read_bytes()==before
+
+
+def test_publication_hook_cannot_hide_a_historical_calendar_hole(tmp_path):
+    i=module();source=seed(tmp_path/'seed.duckdb');root=tmp_path/'managed'
+    class InvalidPublication(FakeProvider):
+        def published_sessions(self,market,sessions,now=None):return sessions[1:]
+    out=i.refresh(InvalidPublication(),seed_path=source,supplement_path=None,root=root,markets=('us',),now='2024-01-08T22:00Z')
+    assert out['status']=='FAILED' and i.resolve_current(root) is None
+
+
+def test_publication_hook_cannot_defer_old_missing_tail(tmp_path):
+    i=module();source=seed(tmp_path/'seed.duckdb');root=tmp_path/'managed'
+    class StalePublication(FakeProvider):
+        def published_sessions(self,market,sessions,now=None):return sessions[:-2]
+    out=i.refresh(StalePublication(),seed_path=source,supplement_path=None,root=root,markets=('us',),now='2024-01-08T22:00Z')
+    assert out['status']=='FAILED' and i.resolve_current(root) is None
+

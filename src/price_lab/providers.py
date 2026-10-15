@@ -307,6 +307,18 @@ class Providers:
         proof=self.calendar_evidence.setdefault('kr',{})
         for day,opened in states.items():proof[day]={'open':opened,'provider':'kis','tr_id':'CTCA0903R'}
         return [d for d in all_dates if _day(d) not in states or states[_day(d)]]
+    def published_sessions(self,market,sessions,now=None):
+        """Conservative KRX collection policy, distinct from exchange closure/SLA.
+
+        Collect a session's confirmed daily bulk data from the following
+        calendar day at 08:15 Seoul. Do not substitute unverified same-day bars.
+        Ingestion preserves already collected sessions and rejects old omissions.
+        """
+        if market!='kr':return list(sessions)
+        instant=pd.Timestamp(now if now is not None else datetime.now(timezone.utc))
+        if instant.tzinfo is None:raise ValueError('now must be timezone-aware')
+        instant=instant.tz_convert('Asia/Seoul')
+        return [d for d in sessions if (pd.Timestamp(d)+pd.Timedelta(days=1)).tz_localize('Asia/Seoul')+pd.Timedelta(hours=8,minutes=15)<=instant]
     def fetch_market(self,market,sessions,assets,audit=False):
         return self.fetch_market_part(market,sessions,assets,audit=audit)
     def fetch_market_part(self,market,sessions,assets,audit=False,action_start=None):

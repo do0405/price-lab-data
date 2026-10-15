@@ -1,7 +1,12 @@
 name: Durable daily prices
 on:
   schedule:
-    - cron: '37 1,11 * * *'
+    # Post-US-close; IANA timezone follows DST. 08:37/09:37 next day in Seoul.
+    - cron: '37 19 * * *'
+      timezone: America/New_York
+    # Post-Korea-close; weekends retained for crypto and revision checks.
+    - cron: '37 20 * * *'
+      timezone: Asia/Seoul
   workflow_dispatch:
     inputs:
       audit:

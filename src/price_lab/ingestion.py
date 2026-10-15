@@ -481,11 +481,22 @@ def refresh(providers,*,seed_path=SOURCE,supplement_path=BENCHMARKS,root=MANAGED
                 if callable(getattr(provider,'load_session_evidence',None)):provider.load_session_evidence(evidence)
                 loaded.add(id(provider))
             reconcile=getattr(provider,'reconcile_sessions',None)
-            if callable(reconcile):
+            publication=getattr(provider,'published_sessions',None)
+            if callable(reconcile) or callable(publication):
                 try:
-                    reconciled=list(pd.DatetimeIndex(reconcile(market,all_dates,collected[market])).normalize())
-                    if reconciled!=sorted(set(reconciled)) or not set(reconciled)<=set(all_dates) or not (collected[market]&set(all_dates))<=set(reconciled):raise IngestionError('Invalid official calendar reconciliation')
-                    all_dates=reconciled
+                    if callable(reconcile):
+                        reconciled=list(pd.DatetimeIndex(reconcile(market,all_dates,collected[market])).normalize())
+                        if reconciled!=sorted(set(reconciled)) or not set(reconciled)<=set(all_dates) or not (collected[market]&set(all_dates))<=set(reconciled):raise IngestionError('Invalid official calendar reconciliation')
+                        all_dates=reconciled
+                    if callable(publication):
+                        released=list(pd.DatetimeIndex(publication(market,all_dates,now=now)).normalize())
+                        if released!=all_dates[:len(released)]:raise IngestionError('Invalid publication session prefix')
+                        pending=all_dates[len(released):]
+                        instant=pd.Timestamp(now if now is not None else datetime.now(timezone.utc))
+                        if instant.tzinfo is None:raise IngestionError('Publication clock must be timezone-aware')
+                        oldest_pending=instant.tz_convert('Asia/Seoul').tz_localize(None).normalize()-pd.Timedelta(days=1)
+                        if any(d<oldest_pending for d in pending):raise IngestionError('Publication policy cannot defer historical sessions')
+                        all_dates=sorted(set(released)|(collected[market]&set(all_dates)))
                 except Exception as exc:
                     reason=str(exc) if isinstance(exc,(IngestionError,ProviderError)) else type(exc).__name__
                     failed_id='calendar-'+uuid.uuid4().hex

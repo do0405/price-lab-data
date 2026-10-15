@@ -122,3 +122,25 @@ def test_composed_provider_part_uses_calendar_action_start_without_extra_bars():
     assets=pd.DataFrame(columns=['market','symbol','name','exchange'])
     provider.fetch_market_part('us',dates,assets,audit=True,action_start=pd.Timestamp('2024-02-03'))
     assert alpaca.calls==[('bars',dates),('actions',pd.Timestamp('2024-02-03'),dates[-1])]
+
+
+@pytest.mark.parametrize('instant,expected',[
+    ('2026-10-15T20:37:00+09:00',['2026-10-13','2026-10-14']),
+    ('2026-10-16T08:14:59+09:00',['2026-10-13','2026-10-14']),
+    ('2026-10-16T08:15:00+09:00',['2026-10-13','2026-10-14','2026-10-15']),
+    ('2026-10-17T08:37:00+09:00',['2026-10-13','2026-10-14','2026-10-15','2026-10-16']),
+])
+def test_kr_publication_cutoff_is_separate_from_exchange_close(instant,expected):
+    p=module();provider=p.Providers(alpaca=object(),krx=object(),kis=object())
+    dates=list(pd.date_range('2026-10-13','2026-10-16'))
+    assert [str(d.date()) for d in provider.published_sessions('kr',dates,now=instant)]==expected
+    assert provider.published_sessions('us',dates,now=instant)==dates
+    assert provider.published_sessions('crypto',dates,now=instant)==dates
+
+
+def test_publication_cutoff_requires_aware_clock_and_accepts_utc():
+    p=module();provider=p.Providers(alpaca=object(),krx=object(),kis=object())
+    dates=[pd.Timestamp('2026-10-15')]
+    assert provider.published_sessions('kr',dates,now='2026-10-15T23:15:00Z')==dates
+    with pytest.raises(ValueError,match='timezone'):
+        provider.published_sessions('kr',dates,now='2026-10-16T08:15:00')

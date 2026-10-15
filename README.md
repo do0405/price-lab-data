@@ -6,7 +6,7 @@ The repository is public. API credentials belong only in Actions Secrets: `ALPAC
 
 ## Operation
 
-The default-branch workflow runs at 01:37 and 11:37 UTC (10:37 and 20:37 Korea), and can be started manually. GitHub scheduling may be delayed. Its runs are serialized and only trusted schedule/manual main-branch runs receive credentials. A Sunday run reconciles complete retained history; other runs reconcile the latest five sessions plus missing calendar dates. There is no rolling deletion at 750 sessions.
+The default-branch workflow runs daily at 19:37 America/New_York (08:37/09:37 next day in Korea, following DST) and 20:37 Asia/Seoul, and can be started manually. Both slots are after the respective regular close, with time for provider publication/revisions. Weekends remain enabled for crypto. GitHub scheduling may be delayed. Its runs are serialized and only trusted schedule/manual main-branch runs receive credentials. A Sunday run reconciles complete retained history; other runs reconcile the latest five sessions plus missing calendar dates. There is no rolling deletion at 750 sessions.
 
 Each run restores the last authenticated encrypted Release checkpoint, collects completed exchange sessions, validates all required markets/actions/benchmarks, and creates a draft Release. It uploads the complete encrypted checkpoint before making that Release current. A failure leaves the last published Release intact. Prior checkpoints are retained; no billing plan, paid runner or storage upgrade is enabled by this project.
 
@@ -19,6 +19,10 @@ The DuckDB includes raw observations, adjustment evidence and a consumer `backte
 KSD record dates are not treated as split execution dates. Relisting and reference-price evidence must confirm a unit change. Unresolved split adjustment events block publication instead of guessing a factor. An explicit open-ended KSD halt with complete zero-volume raw-session evidence can remain pending with an unknown execution date; it is rechecked on every refresh, and a resumed traded bar without date/reference proof blocks publication. Alpaca corporate action requests explicitly cover forward/reverse splits. Other distributions, mergers and symbol-history splicing are outside this split-only data contract. Provider event namespace/ID/revision prevent duplicate application and support corrections. Invalid batches and incomplete required benchmark sessions block publication.
 
 The universe still has collection-time active/survivorship limitations. This pipeline does not manufacture historical delisted constituents, point-in-time capitalizations or missing security classifications. Provider subscriptions, permissions, availability and correction windows remain external dependencies. Check the Actions run log for health; the presence of a local checkpoint does not prove the latest scheduled run succeeded.
+
+KRX bulk collection uses a conservative next-calendar-day 08:15 Seoul eligibility policy, separately from exchange close. This is an operating cutoff, not a verified publication SLA. The Korean evening run does not claim same-day KRX confirmation. Previously collected sessions are retained; only the newest pending tail may wait, and historical holes or empty required responses still fail validation. A same-day provisional KIS full-universe feed is not included.
+
+New dates and valid corrections are upserted by market/symbol/session into a copied working DB, then published as a new immutable full checkpoint. Old raw seed/evidence and previous checkpoints remain. Unchanged data does not create a new Release. Full snapshots increase storage and transfer volume with retained history and versions. An offline PC receives the newer checkpoint on its next explicit/startup pull; its local file is not updated while powered off.
 
 ## Local runtime
 
