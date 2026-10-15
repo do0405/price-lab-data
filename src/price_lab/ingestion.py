@@ -270,7 +270,15 @@ def _normalize_batch(batch,market,sessions):
 
 
 def _upsert(db,frame,batch):
-    db.register('incoming_raw',frame)
+    # Compare the representation that will actually be persisted. Seed raw may
+    # use DECIMAL for turnover while provider DataFrames use DOUBLE: comparing
+    # before that cast falsely detects the same rounded payload on every run.
+    schema=db.execute("PRAGMA table_info('ingest_raw_bars')").fetchall()
+    if [r[1] for r in schema]!=RAW_COLUMNS:raise IngestionError('Raw storage schema mismatch')
+    projection=','.join('CAST("'+r[1]+'" AS '+r[2]+') AS "'+r[1]+'"' for r in schema)
+    db.register('incoming_payload',frame)
+    db.execute('CREATE TEMP TABLE incoming_raw AS SELECT '+projection+' FROM incoming_payload')
+    db.unregister('incoming_payload')
     changed=db.execute('SELECT count(*) FROM(SELECT * FROM incoming_raw EXCEPT SELECT * FROM ingest_raw_bars)').fetchone()[0]
     # Preserved source raw can predate its first eligible managed row. Publishing
     # that recovered history is a dataset change even if the raw payload matches.
@@ -298,7 +306,7 @@ def _upsert(db,frame,batch):
         FROM incoming_raw n LEFT JOIN old_factors f USING(market,symbol,session_date)
         WHERE n.open>0 AND n.low>0 AND n.close>0 AND n.high>=greatest(n.open,n.close,n.low) AND n.low<=least(n.open,n.close)
         AND NOT EXISTS(SELECT 1 FROM ingest_seed_quarantine q WHERE q.market=n.market AND q.symbol=n.symbol AND q.session_date=n.session_date)''')
-    db.execute('DROP TABLE old_factors');db.unregister('incoming_raw')
+    db.execute('DROP TABLE old_factors');db.execute('DROP TABLE incoming_raw')
     assets=batch.assets[['market','symbol','name','exchange']].drop_duplicates(['market','symbol'],keep='last')
     if not assets.empty:
         db.register('incoming_assets',assets)

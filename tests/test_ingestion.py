@@ -398,3 +398,28 @@ def test_revision_returning_to_seed_factor_restores_all_old_prices(tmp_path):
         with duckdb.connect(i.resolve_current(root)['resolved_path'],read_only=True) as db:
             assert db.execute("SELECT close FROM backtest_bars WHERE symbol='A' AND session_date='2024-01-02'").fetchone()[0]==expected
 
+
+def test_decimal_raw_storage_does_not_publish_identical_float_batch(tmp_path):
+    i=module();source=seed(tmp_path/'seed.duckdb');root=tmp_path/'managed'
+    with duckdb.connect(str(source)) as db:
+        db.execute("CREATE TABLE ohlcv AS SELECT market,symbol,session_date,raw_open AS open,high,low,raw_close AS close,raw_volume AS volume,turnover::DECIMAL(38,12) AS turnover,vwap,currency,'provider' AS source FROM backtest_bars")
+    class DecimalProvider(FakeProvider):
+        value=2644.0155280000004
+        def fetch_market(self,*args,**kwargs):
+            batch=super().fetch_market(*args,**kwargs)
+            batch.bars['turnover']=self.value
+            return batch
+    provider=DecimalProvider()
+    first=i.refresh(provider,seed_path=source,supplement_path=None,root=root,markets=('us',),now='2024-01-05T22:00Z')
+    assert first['status']=='PUBLISHED'
+    before=(root/'current.json').read_bytes()
+    for _ in range(2):
+        again=i.refresh(provider,seed_path=source,supplement_path=None,root=root,markets=('us',),now='2024-01-05T22:00Z')
+        assert again['status']=='UNCHANGED'
+        assert (root/'current.json').read_bytes()==before
+    provider.value+=.000001
+    corrected=i.refresh(provider,seed_path=source,supplement_path=None,root=root,markets=('us',),now='2024-01-05T22:00Z')
+    assert corrected['status']=='PUBLISHED' and corrected['manifest']['sequence']==2
+    with duckdb.connect(i.resolve_current(root)['resolved_path'],read_only=True) as db:
+        assert dict((r[1],r[2]) for r in db.execute("PRAGMA table_info('ingest_raw_bars')").fetchall())['turnover']=='DECIMAL(38,12)'
+
