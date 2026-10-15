@@ -90,3 +90,35 @@ def test_alpaca_requests_only_supported_split_actions_not_every_distribution():
     p=module();s=Session([Response({'corporate_actions':{},'next_page_token':None})])
     assert p.AlpacaProvider('fake','fake',client=p.HttpClient(s,min_interval=0)).fetch_actions('2024-01-02','2024-01-05')==[]
     assert s.calls[0][2]['params']['types']=='forward_split,reverse_split'
+
+
+def test_kis_calendar_batches_caches_and_requires_requested_day():
+    p=module();s=Session([Response({'access_token':'fake'}),Response({'rt_cd':'0','output':[
+        {'bass_dt':'20240101','opnd_yn':'N'},{'bass_dt':'20240102','opnd_yn':'Y'},{'bass_dt':'20240103','opnd_yn':'N'}]})])
+    kis=p.KisProvider('fake','fake',client=p.HttpClient(s,min_interval=0))
+    assert kis.session_status(pd.date_range('2024-01-01','2024-01-03'))=={'2024-01-01':False,'2024-01-02':True,'2024-01-03':False}
+    assert kis.session_status([pd.Timestamp('2024-01-02')])=={'2024-01-02':True} and len(s.calls)==2
+    assert s.calls[1][2]['params']=={'BASS_DT':'20240101','CTX_AREA_FK':'','CTX_AREA_NK':''}
+    bad=p.KisProvider('fake','fake',client=p.HttpClient(Session([Response({'access_token':'fake'}),Response({'rt_cd':'0','output':[]})]),min_interval=0))
+    with pytest.raises(p.ProviderError,match='calendar'):bad.session_status([pd.Timestamp('2024-01-02')])
+
+
+def test_audit_provider_reuses_one_asset_snapshot_across_parts():
+    p=module();s=Session([Response([{'symbol':'NEW','name':'New','exchange':'NASDAQ','class':'us_equity','status':'active'}])])
+    provider=p.AlpacaProvider('fake','fake',client=p.HttpClient(s,min_interval=0))
+    first=provider.fetch_assets('us');first.loc[0,'symbol']='MUTATED'
+    second=provider.fetch_assets('us')
+    assert list(second.symbol)==['NEW'] and len(s.calls)==1
+
+
+def test_composed_provider_part_uses_calendar_action_start_without_extra_bars():
+    p=module()
+    class Alpaca:
+        calls=[]
+        def fetch_assets(self,market):return pd.DataFrame([dict(market='us',symbol='A',name='A',exchange='NYSE')])
+        def fetch_bars(self,market,symbols,sessions):self.calls.append(('bars',list(sessions)));return pd.DataFrame()
+        def fetch_actions(self,start,end):self.calls.append(('actions',pd.Timestamp(start),pd.Timestamp(end)));return []
+    alpaca=Alpaca();provider=p.Providers(alpaca=alpaca,krx=object(),kis=object());dates=list(pd.bdate_range('2024-02-05',periods=3))
+    assets=pd.DataFrame(columns=['market','symbol','name','exchange'])
+    provider.fetch_market_part('us',dates,assets,audit=True,action_start=pd.Timestamp('2024-02-03'))
+    assert alpaca.calls==[('bars',dates),('actions',pd.Timestamp('2024-02-03'),dates[-1])]

@@ -131,19 +131,21 @@ class AlpacaProvider:
     def __init__(self,key=None,secret=None,client=None,feed='sip',trading_base='https://paper-api.alpaca.markets'):
         self._key=key if key is not None else os.environ.get('ALPACA_API_KEY')
         self._secret=secret if secret is not None else os.environ.get('ALPACA_API_SECRET')
-        self.client=client or HttpClient();self.feed=feed;self.trading_base=trading_base
+        self.client=client or HttpClient();self.feed=feed;self.trading_base=trading_base;self._asset_cache={}
     def _headers(self):
         if not self._key or not self._secret:raise ProviderError('Missing Alpaca credentials')
         return {'APCA-API-KEY-ID':self._key,'APCA-API-SECRET-KEY':self._secret}
     def fetch_assets(self,market):
         if market not in ('us','crypto'):raise ProviderError('Invalid Alpaca asset market')
+        if market in self._asset_cache:return self._asset_cache[market].copy()
         values=self.client.request_json('GET',self.trading_base+'/v2/assets',headers=self._headers(),params={'status':'active','asset_class':'us_equity' if market=='us' else 'crypto'})
         if not isinstance(values,list) or not values:raise ProviderError('Alpaca empty active asset response')
         allowed={'NYSE','NASDAQ','AMEX','ARCA','NYSE_ARCA','BATS'}
         rows=[{'market':market,'symbol':r['symbol'],'name':r.get('name') or r['symbol'],'exchange':r.get('exchange') or 'CRYPTO'} for r in values
               if r.get('status')=='active' and (market=='crypto' or r.get('exchange') in allowed)]
         if not rows:raise ProviderError('Alpaca supported universe empty')
-        return pd.DataFrame(rows)
+        frame=pd.DataFrame(rows);self._asset_cache[market]=frame
+        return frame.copy()
     def _pages(self,path,params,field):
         token=None;seen=set()
         for _ in range(100000):
@@ -216,7 +218,7 @@ class KisProvider:
     BASE='https://openapi.koreainvestment.com:9443'
     def __init__(self,key=None,secret=None,client=None):
         self._key=key if key is not None else os.environ.get('KIS_APP_KEY');self._secret=secret if secret is not None else os.environ.get('KIS_APP_SECRET')
-        self.client=client or HttpClient(min_interval=.2);self._token=None
+        self.client=client or HttpClient(min_interval=.2);self._token=None;self._calendar={}
     def _headers(self,tr_id):
         if not self._key or not self._secret:raise ProviderError('Missing KIS credentials')
         if self._token is None:
@@ -228,6 +230,25 @@ class KisProvider:
         value=self.client.request_json('GET',self.BASE+path,headers=self._headers(tr_id),params=params)
         if value.get('rt_cd')!='0':raise ProviderError('KIS unsuccessful response')
         return value
+    def session_status(self,dates):
+        """Reuse every returned day; never infer closure from an empty response."""
+        wanted=sorted({_day(d) for d in dates})
+        for date in wanted:
+            if date in self._calendar:continue
+            value=self._get('/uapi/domestic-stock/v1/quotations/chk-holiday','CTCA0903R',{'BASS_DT':date.replace('-',''),'CTX_AREA_FK':'','CTX_AREA_NK':''})
+            records=value.get('output')
+            if isinstance(records,dict):records=[records] if records else []
+            if not isinstance(records,list) or not records:raise ProviderError('KIS calendar response empty')
+            received={}
+            for record in records:
+                label=str(record.get('bass_dt',''));flag=record.get('opnd_yn')
+                if len(label)!=8 or not label.isdigit() or flag not in ('Y','N'):raise ProviderError('KIS calendar row invalid')
+                day=_day(pd.to_datetime(label,format='%Y%m%d'));opened=flag=='Y'
+                if day in received and received[day]!=opened:raise ProviderError('KIS calendar conflicting rows')
+                received[day]=opened
+            if date not in received:raise ProviderError('KIS calendar requested day missing')
+            self._calendar.update(received)
+        return {day:self._calendar[day] for day in wanted}
     def fetch_benchmarks(self,sessions):
         rows=[];wanted=set(pd.DatetimeIndex(sessions).normalize())
         for symbol in BENCHMARKS['kr']:
@@ -242,7 +263,7 @@ class KisProvider:
                     day=pd.to_datetime(r.get('stck_bsop_date'),format='%Y%m%d',errors='raise')
                     if day not in wanted or not start<=day<=end:continue
                     values={k:_number(r[v]) for k,v in [('open','stck_oprc'),('high','stck_hgpr'),('low','stck_lwpr'),('close','stck_clpr'),('volume','acml_vol'),('turnover','acml_tr_pbmn')]}
-                    rows.append(dict(market='kr',symbol=symbol,session_date=day,**values,vwap=values['turnover']/values['volume'] if values['volume'] else values['close'],currency='KRW',source='kis_etf_raw'))
+                    rows.append(dict(market='kr',symbol=symbol,session_date=day,**values,vwap=values['turnover']/values['volume'] if values['volume'] else values['close'],currency='KRW',source='kis_etf_raw',is_supplement=True))
                 start=end+pd.Timedelta(days=1)
         return pd.DataFrame(rows)
     def fetch_actions(self,start,end):
@@ -271,22 +292,42 @@ class Providers:
         self.alpaca=alpaca or AlpacaProvider(client=HttpClient(raw_dir=raw_dir))
         self.krx=krx or KrxProvider(client=HttpClient(min_interval=1.,raw_dir=raw_dir))
         self.kis=kis or KisProvider(client=HttpClient(min_interval=.2,raw_dir=raw_dir))
+        self.calendar_evidence={}
+    def begin_refresh(self):
+        # One current metadata snapshot for every part, refreshed next attempt.
+        if hasattr(self.alpaca,'_asset_cache'):self.alpaca._asset_cache.clear()
+    def load_session_evidence(self,evidence):
+        self.calendar_evidence=json.loads(_canonical(evidence or {}))
+        for day,item in self.calendar_evidence.get('kr',{}).items():
+            if isinstance(item,dict) and isinstance(item.get('open'),bool):self.kis._calendar[day]=item['open']
+    def reconcile_sessions(self,market,all_dates,known_sessions):
+        if market!='kr':return list(all_dates)
+        unknown=[d for d in all_dates if d not in set(known_sessions)]
+        states=self.kis.session_status(unknown)
+        proof=self.calendar_evidence.setdefault('kr',{})
+        for day,opened in states.items():proof[day]={'open':opened,'provider':'kis','tr_id':'CTCA0903R'}
+        return [d for d in all_dates if _day(d) not in states or states[_day(d)]]
     def fetch_market(self,market,sessions,assets,audit=False):
+        return self.fetch_market_part(market,sessions,assets,audit=audit)
+    def fetch_market_part(self,market,sessions,assets,audit=False,action_start=None):
+        """Bars use sessions only; actions may cover the preceding calendar gap."""
         if not sessions:raise ProviderError('No completed sessions requested')
+        action_start=pd.Timestamp(action_start if action_start is not None else min(sessions)).normalize()
+        if action_start.tzinfo is not None or action_start>min(sessions):raise ProviderError('Invalid corporate action collection boundary')
         actions=[];universe=assets[['market','symbol','name','exchange']].copy()
         if market in ('us','crypto'):
             active=self.alpaca.fetch_assets(market)
             universe=pd.concat([universe,active],ignore_index=True).drop_duplicates(['market','symbol'],keep='last')
             symbols=sorted(set(universe.symbol)|set(BENCHMARKS[market]))
             bars=self.alpaca.fetch_bars(market,symbols,sessions)
-            if market=='us':actions=self.alpaca.fetch_actions(min(sessions),max(sessions))
+            if market=='us':actions=self.alpaca.fetch_actions(action_start,max(sessions))
         elif market=='kr':
             frames=[];universes=[]
             for date in sessions:
                 b,a=self.krx.fetch_day(date);frames.append(b);universes.append(a)
             frames.append(self.kis.fetch_benchmarks(sessions));bars=pd.concat(frames,ignore_index=True)
             universe=pd.concat([universe,*universes],ignore_index=True).drop_duplicates(['market','symbol'],keep='last')
-            actions=self.kis.fetch_actions(min(sessions),max(sessions))
+            actions=self.kis.fetch_actions(action_start,max(sessions))
         else:raise ProviderError('Unknown provider market')
         return MarketBatch(market,bars,universe,actions,list(sessions),{'actions_complete':True,'benchmarks_complete':True,
             'turnover':'KR exact provider value; US/crypto provider VWAP*volume','kr_actions':'KSD nominal changes require relisting/reference confirmation'})

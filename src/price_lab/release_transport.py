@@ -1,4 +1,6 @@
 """Public GitHub Releases transport; checkpoint contents remain authenticated/encrypted."""
+import base64
+from datetime import datetime,timezone
 import json
 import os
 from pathlib import Path
@@ -6,7 +8,7 @@ import tempfile
 from urllib.parse import urlsplit
 import requests
 from .cloud_data import decrypt_checkpoint,encrypt_checkpoint
-from .ingestion import resolve_current
+from .ingestion import resolve_current,atomic_json,sha256_file,managed_lock
 
 REPOSITORY='do0405/price-lab-data'
 ASSET='checkpoint.pldata'
@@ -26,7 +28,32 @@ def _request(method,path,*,token=None,payload=None,stream=None):
 def latest_release():
     return _request('GET','/releases/latest')
 
+def record_periodic_status(manifest,*,now=None):
+    """Monthly verified operating record also keeps the public repo active."""
+    if os.environ.get('GITHUB_REF')!='refs/heads/main' or os.environ.get('GITHUB_EVENT_NAME') not in ('schedule','workflow_dispatch'):
+        return {'recorded':False,'reason':'trusted cloud runs only'}
+    now=now or datetime.now(timezone.utc)
+    head=_request('GET','/commits/main')
+    last=datetime.fromisoformat(head['commit']['committer']['date'].replace('Z','+00:00'))
+    if (now-last).total_seconds()<25*86400:return {'recorded':False,'reason':'recent repository activity'}
+    path='/contents/.github/price-pipeline-status.json'
+    try:old=_request('GET',path)
+    except RuntimeError as exc:
+        if 'HTTP 404' not in str(exc):raise
+        old={}
+    record={'last_validated_at':now.isoformat(),'sequence':manifest['sequence'],'sha256':manifest['sha256'],'markets':manifest['markets']}
+    payload={'message':'Record verified price pipeline status','branch':'main','content':base64.b64encode((json.dumps(record,sort_keys=True,indent=2)+'\n').encode()).decode()}
+    if old.get('sha'):payload['sha']=old['sha']
+    _request('PUT',path,payload=payload)
+    return {'recorded':True,'path':'.github/price-pipeline-status.json'}
+
 def pull_latest(root,*,key=None):
+    root=Path(root);root.mkdir(parents=True,exist_ok=True)
+    # Separate transport lock: decrypt_checkpoint owns the dataset publication lock.
+    with managed_lock(root/'transport'):
+        return _pull_latest(root,key=key)
+
+def _pull_latest(root,*,key=None):
     root=Path(root);root.mkdir(parents=True,exist_ok=True)
     release=latest_release()
     if release.get('draft') or release.get('prerelease'):raise ValueError('Only published stable checkpoints are accepted')
@@ -36,6 +63,12 @@ def pull_latest(root,*,key=None):
     if parsed.scheme!='https' or parsed.netloc!='github.com' or not parsed.path.startswith('/'+REPOSITORY+'/releases/download/'):
         raise ValueError('Unexpected checkpoint download URL')
     if not 0<asset['size']<=8*1024**3:raise ValueError('Checkpoint download size outside limit')
+    current=resolve_current(root)
+    receipt_path=root/'cloud-receipt.json'
+    try:receipt=json.loads(receipt_path.read_text(encoding='utf-8'))
+    except (OSError,ValueError):receipt={}
+    if current and receipt.get('release_id')==release['id'] and receipt.get('asset_id')==asset['id'] and receipt.get('asset_size')==asset['size'] and receipt.get('sha256')==current['sha256']:
+        return {'manifest':current,'release_url':release['html_url'],'release_tag':release['tag_name'],'unchanged':True,'downloaded':False}
     with tempfile.TemporaryDirectory(prefix='download-',dir=root) as temporary:
         target=Path(temporary)/ASSET;total=0
         # Public download: credentials are never sent to an asset/CDN endpoint.
@@ -49,7 +82,8 @@ def pull_latest(root,*,key=None):
                     out.write(block)
         if total!=asset['size']:raise ValueError('Incomplete checkpoint download')
         manifest=decrypt_checkpoint(target,root,key=key)
-    return {'manifest':manifest,'release_url':release['html_url'],'release_tag':release['tag_name']}
+        atomic_json(receipt_path,{'release_id':release['id'],'asset_id':asset['id'],'asset_size':asset['size'],'sha256':manifest['sha256'],'ciphertext_sha256':sha256_file(target)})
+    return {'manifest':manifest,'release_url':release['html_url'],'release_tag':release['tag_name'],'downloaded':True}
 
 def publish_current(root,*,key=None,token=None):
     current=resolve_current(root,verify=True)
@@ -80,8 +114,8 @@ def publish_current(root,*,key=None,token=None):
         # Replace assets only while the release is still private/draft.
         for old in release.get('assets',[]):
             _request('DELETE','/releases/assets/'+str(old['id']),token=token)
-        _request('PATCH','/releases/'+str(release['id']),token=token,payload={'body':body})
+        _request('PATCH','/releases/'+str(release['id']),token=token,payload={'body':body,'tag_name':tag,'name':tag,'target_commitish':'main'})
         with asset.open('rb') as stream:
             _request('POST',release['upload_url'].split('{')[0]+'?name='+ASSET,token=token,stream=stream)
-        published=_request('PATCH','/releases/'+str(release['id']),token=token,payload={'draft':False,'make_latest':'true'})
+        published=_request('PATCH','/releases/'+str(release['id']),token=token,payload={'draft':False,'make_latest':'true','tag_name':tag,'name':tag,'target_commitish':'main'})
     return {'release_url':published['html_url'],'tag':tag,'unchanged':False,'ciphertext_sha256':envelope['ciphertext_sha256']}

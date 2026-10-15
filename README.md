@@ -16,7 +16,7 @@ The file `checkpoint.pldata` uses streaming gzip + AES-256-GCM with authenticate
 
 The DuckDB includes raw observations, adjustment evidence and a consumer `backtest_bars` view of split-adjusted OHLCV + turnover + VWAP. Raw OHLCV stays available. Adjusted turnover is value invariant under unit splits. US/crypto turnover is explicitly the provider VWAP times volume; Korean turnover is the provider's actual traded value. This is price return data, without total-return dividend reinvestment. The seed retains its original raw, quarantined and manual-override evidence tables.
 
-KSD record dates are not treated as split execution dates. Relisting and reference-price evidence must confirm a unit change. Unresolved events block publication instead of guessing a factor. Provider event namespace/ID/revision prevent duplicate application and support corrections. Invalid batches and incomplete required benchmark sessions block publication.
+KSD record dates are not treated as split execution dates. Relisting and reference-price evidence must confirm a unit change. Unresolved split adjustment events block publication instead of guessing a factor. An explicit open-ended KSD halt with complete zero-volume raw-session evidence can remain pending with an unknown execution date; it is rechecked on every refresh, and a resumed traded bar without date/reference proof blocks publication. Alpaca corporate action requests explicitly cover forward/reverse splits. Other distributions, mergers and symbol-history splicing are outside this split-only data contract. Provider event namespace/ID/revision prevent duplicate application and support corrections. Invalid batches and incomplete required benchmark sessions block publication.
 
 The universe still has collection-time active/survivorship limitations. This pipeline does not manufacture historical delisted constituents, point-in-time capitalizations or missing security classifications. Provider subscriptions, permissions, availability and correction windows remain external dependencies. Check the Actions run log for health; the presence of a local checkpoint does not prove the latest scheduled run succeeded.
 
@@ -24,3 +24,5 @@ The universe still has collection-time active/survivorship limitations. This pip
 
 Python 3.13: `python -m pip install -r requirements-ingestion.txt`, then `python -m pytest tests -q`.
 After a trusted operator bootstraps the first encrypted Release, run `python scripts/price_pipeline.py` with the required environment secrets. The included script never requests brokerage account access or submits orders.
+
+A trusted successful run records minimal verified watermarks in .github/price-pipeline-status.json when the main-branch commit is at least25days old. This supplies a useful operating audit and repository activity before GitHub public-repository inactivity rules can disable schedules; the record contains no keys or database contents.

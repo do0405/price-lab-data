@@ -23,7 +23,7 @@ from .ingestion import (MANAGED_ROOT,atomic_json,canonical,managed_lock,resolve_
 MAGIC=b'PLDATA01'
 MAX_HEADER=4*1024*1024
 BLOCK=4*1024*1024
-MANIFEST_FIELDS=('schema_version','key_version','sequence','database','sha256','parent_sha256','ancestors','includes_supplement','markets','created_at','validation')
+MANIFEST_FIELDS=('schema_version','key_version','sequence','database','sha256','parent_sha256','ancestors','includes_supplement','markets','calendar_evidence','created_at','validation')
 
 
 def _key(value):

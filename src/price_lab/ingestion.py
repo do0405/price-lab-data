@@ -28,6 +28,7 @@ from .providers import BENCHMARKS as REQUIRED_BENCHMARKS,MarketBatch,ProviderErr
 SCHEMA_VERSION=1
 KEY_VERSION=1
 MANAGED_ROOT=ROOT/'data'/'market'
+MAX_PART_SESSIONS=20
 BAR_COLUMNS=['market','symbol','session_date','open','high','low','close','volume','turnover','vwap','raw_open','raw_close','raw_volume','split_price_factor','split_share_factor','currency']
 RAW_COLUMNS=['market','symbol','session_date','open','high','low','close','volume','turnover','vwap','currency','source','reference_previous_close']
 _THREAD_LOCKS={};_THREAD_GUARD=threading.Lock()
@@ -109,6 +110,12 @@ def validate_manifest(manifest):
     for item in markets.values():
         if not isinstance(item,dict) or item.get('target')!=item.get('actual') or not re.fullmatch(r'\d{4}-\d{2}-\d{2}',str(item.get('actual',''))):raise IngestionError('Incomplete market watermark')
         pd.Timestamp(item['actual'])
+    evidence=manifest.get('calendar_evidence',{})
+    if not isinstance(evidence,dict) or not set(evidence)<={'us','kr','crypto'}:raise IngestionError('Invalid official calendar evidence')
+    for days in evidence.values():
+        if not isinstance(days,dict):raise IngestionError('Invalid official calendar evidence')
+        for day,item in days.items():
+            if not re.fullmatch(r'\d{4}-\d{2}-\d{2}',day) or not isinstance(item,dict) or not isinstance(item.get('open'),bool):raise IngestionError('Invalid official calendar evidence')
     return manifest
 
 
@@ -138,7 +145,10 @@ def validate_database(path,manifest=None):
                 for symbol in REQUIRED_BENCHMARKS[market]:
                     if not db.execute('SELECT count(*) FROM backtest_bars WHERE market=? AND symbol=? AND session_date=?',[market,symbol,item['actual']]).fetchone()[0]:
                         raise IngestionError('Required benchmark missing at watermark')
-        return {'valid':True,'markets':{m:{'rows':n,'first':_day(a),'last':_day(b)} for m,n,a,b in rows}}
+        pending={}
+        if 'ingest_pending_actions' in names:
+            pending={str(s or 'future_effective'):int(n) for s,n in db.execute("SELECT json_extract_string(payload,'$.pending_status'),count(*) FROM ingest_pending_actions GROUP BY 1").fetchall()}
+        return {'valid':True,'markets':{m:{'rows':n,'first':_day(a),'last':_day(b)} for m,n,a,b in rows},'pending_adjustments':pending}
 
 
 @lru_cache(maxsize=24)
@@ -154,6 +164,7 @@ def resolve_current(root=MANAGED_ROOT,verify=True):
     manifest=validate_manifest(json.loads(pointer.read_text(encoding='utf-8')))
     path=(root/manifest['database']).resolve()
     if not path.is_relative_to(root) or not path.is_file():raise IngestionError('Managed database path missing/outside root')
+    if Path(str(path)+'.wal').exists():raise IngestionError('Immutable checkpoint WAL present')
     if verify:
         stat=path.stat()
         _verified(str(path),stat.st_mtime_ns,stat.st_size,manifest['sha256'],canonical(manifest))
@@ -164,15 +175,37 @@ def status(root=MANAGED_ROOT):
     current=resolve_current(root);attempts=[];folder=Path(root)/'attempts'
     if folder.exists():
         for path in sorted(folder.glob('*/status.json'),key=lambda p:p.stat().st_mtime,reverse=True)[:10]:attempts.append(json.loads(path.read_text(encoding='utf-8')))
-    return {'status':'MANAGED' if current else 'SEED_ONLY','current':current,'attempts':attempts,'stale':bool(attempts and attempts[0].get('status')=='FAILED')}
+    pending=[]
+    if current:
+        with duckdb.connect(current['resolved_path'],read_only=True) as db:
+            if 'ingest_pending_actions' in {r[0] for r in db.execute('SHOW TABLES').fetchall()}:
+                fields=('market','symbol','provider','event_id','revision','effective_date','pending_status','missing_effective_date','halt_start','last_checked','zero_volume_sessions')
+                pending=[{k:v for k,v in json.loads(row[0]).items() if k in fields} for row in db.execute('SELECT payload FROM ingest_pending_actions ORDER BY market,event_id').fetchall()]
+    return {'status':'MANAGED' if current else 'SEED_ONLY','current':current,'attempts':attempts,'pending_actions':pending,'stale':bool(attempts and attempts[0].get('status')=='FAILED')}
 
 
 def _columns(db,name):return {r[0] for r in db.execute('DESCRIBE '+name).fetchall()}
 
 
+def _seed_raw_query(db):
+    if 'ohlcv' not in {r[0] for r in db.execute('SHOW TABLES').fetchall()}:return None
+    cols=_columns(db,'ohlcv');core=RAW_COLUMNS[:-2]
+    if not set(core)<=cols:return None
+    source="coalesce(source,'seed')" if 'source' in cols else "'seed'"
+    return 'SELECT '+','.join(core)+','+source+' AS source,NULL::DOUBLE AS reference_previous_close FROM ohlcv'
+
+
 def _initialize(db,supplement):
     db.execute('''CREATE TABLE IF NOT EXISTS ingest_pending_actions(provider VARCHAR,event_id VARCHAR,revision VARCHAR,market VARCHAR,payload VARCHAR,PRIMARY KEY(provider,event_id))''')
-    if 'managed_bars' in {r[0] for r in db.execute('SHOW TABLES').fetchall()}:return
+    if 'managed_bars' in {r[0] for r in db.execute('SHOW TABLES').fetchall()}:
+        if 'is_supplement' not in _columns(db,'managed_bars'):
+            db.execute('ALTER TABLE managed_bars ADD COLUMN is_supplement BOOLEAN DEFAULT false')
+            db.execute("UPDATE managed_bars SET is_supplement=true WHERE market='kr' AND symbol IN('069500','229200')")
+            db.execute('CREATE OR REPLACE VIEW backtest_bars AS SELECT '+','.join(BAR_COLUMNS+['raw_high','raw_low','raw_vwap','raw_turnover','is_supplement'])+' FROM managed_bars')
+        raw_source=_seed_raw_query(db)
+        if raw_source:
+            db.execute('INSERT INTO ingest_raw_bars SELECT r.* FROM ('+raw_source+') r WHERE NOT EXISTS(SELECT 1 FROM ingest_raw_bars i WHERE i.market=r.market AND i.symbol=r.symbol AND i.session_date=r.session_date)')
+        return
     cols=_columns(db,'backtest_bars')
     extra=[]
     for name,fallback in [('raw_high','high/split_price_factor'),('raw_low','low/split_price_factor'),('raw_vwap','vwap/split_price_factor'),('raw_turnover','turnover')]:extra.append((name if name in cols else fallback)+' AS '+name)
@@ -180,22 +213,26 @@ def _initialize(db,supplement):
     bad+=' OR NOT coalesce((isfinite(open) AND isfinite(high) AND isfinite(low) AND isfinite(close) AND open>0 AND low>0 AND close>0 AND high>=greatest(open,close,low) AND low<=least(open,close) AND isfinite(volume) AND volume>=0 AND isfinite(turnover) AND turnover>=0),false)'
     db.execute('CREATE TABLE ingest_seed_quarantine AS SELECT market,symbol,session_date FROM backtest_bars WHERE '+bad)
     ready=' WHERE NOT ('+bad+')'
-    db.execute('CREATE TABLE managed_bars AS SELECT '+','.join(BAR_COLUMNS+extra)+',split_price_factor base_price_factor,split_share_factor base_share_factor FROM backtest_bars'+ready)
+    lineage='coalesce(is_supplement,false)' if 'is_supplement' in cols else 'false'
+    db.execute('CREATE TABLE managed_bars AS SELECT '+','.join(BAR_COLUMNS+extra)+',split_price_factor base_price_factor,split_share_factor base_share_factor,'+lineage+' AS is_supplement FROM backtest_bars'+ready)
     # Seed source tables (including quarantined ohlcv and event evidence) remain untouched.
     kind=db.execute("SELECT table_type FROM information_schema.tables WHERE table_name='backtest_bars'").fetchone()[0]
     db.execute(('ALTER VIEW ' if kind=='VIEW' else 'ALTER TABLE ')+'backtest_bars RENAME TO seed_backtest_bars')
-    db.execute('CREATE VIEW backtest_bars AS SELECT '+','.join(BAR_COLUMNS+['raw_high','raw_low','raw_vwap','raw_turnover'])+' FROM managed_bars')
+    db.execute('CREATE VIEW backtest_bars AS SELECT '+','.join(BAR_COLUMNS+['raw_high','raw_low','raw_vwap','raw_turnover','is_supplement'])+' FROM managed_bars')
     if supplement is not None and Path(supplement).is_file():
         db.execute('ATTACH '+_literal(Path(supplement).resolve())+' AS incoming_supplement (READ_ONLY)')
         common=[c for c in BAR_COLUMNS if c in _columns(db,'incoming_supplement.backtest_bars')]
         if len(common)!=len(BAR_COLUMNS):raise IngestionError('Supplement schema mismatch')
         scols=_columns(db,'incoming_supplement.backtest_bars')
         extra=[name if name in scols else expression+' AS '+name for name,expression in [('raw_high','high/split_price_factor'),('raw_low','low/split_price_factor'),('raw_vwap','vwap/split_price_factor'),('raw_turnover','turnover')]]
-        db.execute('INSERT INTO managed_bars SELECT '+','.join(BAR_COLUMNS+extra)+',split_price_factor,split_share_factor FROM incoming_supplement.backtest_bars s WHERE NOT EXISTS(SELECT 1 FROM managed_bars m WHERE m.market=s.market AND m.symbol=s.symbol AND m.session_date=s.session_date)')
+        db.execute('INSERT INTO managed_bars SELECT '+','.join(BAR_COLUMNS+extra)+',split_price_factor,split_share_factor,true FROM incoming_supplement.backtest_bars s WHERE NOT EXISTS(SELECT 1 FROM managed_bars m WHERE m.market=s.market AND m.symbol=s.symbol AND m.session_date=s.session_date)')
         db.execute('INSERT INTO assets(market,symbol,name,exchange) SELECT market,symbol,name,exchange FROM incoming_supplement.assets s WHERE NOT EXISTS(SELECT 1 FROM assets a WHERE a.market=s.market AND a.symbol=s.symbol)')
-        db.execute('DETACH incoming_supplement')
-    db.execute('''CREATE TABLE ingest_raw_bars AS SELECT market,symbol,session_date,raw_open AS open,raw_high AS high,raw_low AS low,raw_close AS close,
-        raw_volume AS volume,raw_turnover AS turnover,raw_vwap AS vwap,currency,'seed'::VARCHAR AS source,NULL::DOUBLE AS reference_previous_close FROM managed_bars''')
+        # The owning connection closes before publication. Keeping this read-only
+        # attachment until then also permits an enclosing bootstrap transaction.
+    managed_raw='''SELECT market,symbol,session_date,raw_open AS open,raw_high AS high,raw_low AS low,raw_close AS close,
+        raw_volume AS volume,raw_turnover AS turnover,raw_vwap AS vwap,currency,'seed'::VARCHAR AS source,NULL::DOUBLE AS reference_previous_close FROM managed_bars'''
+    db.execute('CREATE TABLE ingest_raw_bars AS '+(_seed_raw_query(db) or managed_raw))
+    db.execute('INSERT INTO ingest_raw_bars SELECT r.* FROM ('+managed_raw+') r WHERE NOT EXISTS(SELECT 1 FROM ingest_raw_bars i WHERE i.market=r.market AND i.symbol=r.symbol AND i.session_date=r.session_date)')
     db.execute('''CREATE TABLE ingest_actions(provider VARCHAR,event_id VARCHAR,revision VARCHAR,market VARCHAR,symbol VARCHAR,effective_date DATE,
         price_factor DOUBLE,share_factor DOUBLE,seed_effective_date DATE,seed_price_factor DOUBLE,seed_share_factor DOUBLE,record_json VARCHAR,PRIMARY KEY(provider,event_id))''')
     if 'split_events' in {r[0] for r in db.execute('SHOW TABLES').fetchall()}:
@@ -235,14 +272,29 @@ def _normalize_batch(batch,market,sessions):
 def _upsert(db,frame,batch):
     db.register('incoming_raw',frame)
     changed=db.execute('SELECT count(*) FROM(SELECT * FROM incoming_raw EXCEPT SELECT * FROM ingest_raw_bars)').fetchone()[0]
+    # Preserved source raw can predate its first eligible managed row. Publishing
+    # that recovered history is a dataset change even if the raw payload matches.
+    changed+=db.execute('''SELECT count(*) FROM incoming_raw n
+        WHERE n.open>0 AND n.low>0 AND n.close>0 AND n.high>=greatest(n.open,n.close,n.low) AND n.low<=least(n.open,n.close)
+        AND NOT EXISTS(SELECT 1 FROM managed_bars m WHERE m.market=n.market AND m.symbol=n.symbol AND m.session_date=n.session_date)
+        AND NOT EXISTS(SELECT 1 FROM ingest_seed_quarantine q WHERE q.market=n.market AND q.symbol=n.symbol AND q.session_date=n.session_date)''').fetchone()[0]
     db.execute('DELETE FROM ingest_raw_bars r USING incoming_raw n WHERE r.market=n.market AND r.symbol=n.symbol AND r.session_date=n.session_date')
     db.execute('INSERT INTO ingest_raw_bars SELECT * FROM incoming_raw')
-    # Preserve seed baseline factors on corrections; new raw bars start at identity.
-    db.execute('''CREATE TEMP TABLE old_factors AS SELECT m.market,m.symbol,m.session_date,base_price_factor,base_share_factor FROM managed_bars m JOIN incoming_raw n USING(market,symbol,session_date)''')
+    # Preserve per-row audited/manual baselines. A historical raw hole has no
+    # existing row: reconstruct its baseline from audited SEED events only;
+    # post-seed action deltas are applied once by _actions after all parts.
+    db.execute('''CREATE TEMP TABLE old_factors AS SELECT m.market,m.symbol,m.session_date,base_price_factor,base_share_factor,is_supplement FROM managed_bars m JOIN incoming_raw n USING(market,symbol,session_date)''')
+    db.execute('''INSERT INTO old_factors
+        SELECT n.market,n.symbol,n.session_date,coalesce(product(a.seed_price_factor),1),coalesce(product(a.seed_share_factor),1),
+            n.market='kr' AND n.symbol IN('069500','229200')
+        FROM incoming_raw n LEFT JOIN ingest_actions a ON a.market=n.market AND a.symbol=n.symbol AND a.seed_effective_date>n.session_date
+        WHERE NOT EXISTS(SELECT 1 FROM old_factors f WHERE f.market=n.market AND f.symbol=n.symbol AND f.session_date=n.session_date)
+        GROUP BY n.market,n.symbol,n.session_date''')
     db.execute('DELETE FROM managed_bars m USING incoming_raw n WHERE m.market=n.market AND m.symbol=n.symbol AND m.session_date=n.session_date')
     db.execute('''INSERT INTO managed_bars SELECT n.market,n.symbol,n.session_date,n.open*coalesce(f.base_price_factor,1),n.high*coalesce(f.base_price_factor,1),n.low*coalesce(f.base_price_factor,1),
         n.close*coalesce(f.base_price_factor,1),n.volume*coalesce(f.base_share_factor,1),n.turnover,n.vwap*coalesce(f.base_price_factor,1),n.open,n.close,n.volume,
-        coalesce(f.base_price_factor,1),coalesce(f.base_share_factor,1),n.currency,n.high,n.low,n.vwap,n.turnover,coalesce(f.base_price_factor,1),coalesce(f.base_share_factor,1)
+        coalesce(f.base_price_factor,1),coalesce(f.base_share_factor,1),n.currency,n.high,n.low,n.vwap,n.turnover,coalesce(f.base_price_factor,1),coalesce(f.base_share_factor,1),
+        coalesce(f.is_supplement,n.market='kr' AND n.symbol IN('069500','229200'))
         FROM incoming_raw n LEFT JOIN old_factors f USING(market,symbol,session_date)
         WHERE n.open>0 AND n.low>0 AND n.close>0 AND n.high>=greatest(n.open,n.close,n.low) AND n.low<=least(n.open,n.close)
         AND NOT EXISTS(SELECT 1 FROM ingest_seed_quarantine q WHERE q.market=n.market AND q.symbol=n.symbol AND q.session_date=n.session_date)''')
@@ -281,10 +333,43 @@ def _confirm_ksd(db,action,target,old):
     return action
 
 
+def _defer_official_halt(db,action,target):
+    if action.get('provider')!='kis_ksd' or action.get('kind')!='split' or action.get('effective_date'):return None
+    text=str(action.get('raw',{}).get('td_stop_dt',''))
+    match=re.fullmatch(r'\s*(\d{4})[/.\-](\d{2})[/.\-](\d{2})\s*~\s*',text)
+    if not match:return None
+    try:start=pd.Timestamp('-'.join(match.groups()))
+    except ValueError:return None
+    first=db.execute("SELECT min(session_date) FROM trading_calendar WHERE market='kr'").fetchone()[0]
+    if first is None or start<pd.Timestamp(first) or start>target:return None
+    pf,sf=action.get('price_factor'),action.get('share_factor')
+    if any(isinstance(x,bool) or not isinstance(x,(int,float)) or not math.isfinite(x) or x<=0 for x in (pf,sf)) or not math.isclose(pf*sf,1,rel_tol=1e-8):return None
+    total,received,nonzero=db.execute('''SELECT count(*),count(r.session_date),count(*) FILTER(WHERE NOT coalesce(isfinite(r.volume) AND r.volume=0,false))
+        FROM trading_calendar c LEFT JOIN ingest_raw_bars r ON r.market=c.market AND r.session_date=c.session_date AND r.symbol=?
+        WHERE c.market='kr' AND c.session_date>=? AND c.session_date<=?''',[action['symbol'],_day(start),_day(target)]).fetchone()
+    if not total or received!=total or nonzero:return None
+    return {**action,'pending_status':'pending_unknown_effective','missing_effective_date':True,'halt_start':_day(start),
+            'zero_volume_sessions':int(total),'last_checked':_day(target),'confirmation':'official_KSD_halt_and_complete_zero_volume_raw'}
+
+
+def _store_pending(db,action):
+    serialized=canonical(action)
+    old=db.execute('SELECT payload FROM ingest_pending_actions WHERE provider=? AND event_id=?',[action['provider'],action['event_id']]).fetchone()
+    if old and old[0]==serialized:return 0
+    db.execute('INSERT OR REPLACE INTO ingest_pending_actions VALUES(?,?,?,?,?)',[action['provider'],action['event_id'],action['revision'],action['market'],serialized])
+    return 1
+
+
 def _actions(db,batch,target,attempt):
     changed=0;quarantine=[]
     pending={ (r[0],r[1]):json.loads(r[2]) for r in db.execute('SELECT provider,event_id,payload FROM ingest_pending_actions WHERE market=?',[batch.market]).fetchall()}
-    for incoming in batch.actions:pending[(incoming.get('provider'),incoming.get('event_id'))]=incoming
+    batch_seen={}
+    for incoming in batch.actions:
+        identity=(incoming.get('provider'),incoming.get('event_id'))
+        if identity in batch_seen and canonical(batch_seen[identity])!=canonical(incoming):
+            atomic_json(attempt/'quarantine.json',[batch_seen[identity],incoming])
+            raise IngestionError('Conflicting corporate action revisions in provider batch')
+        batch_seen[identity]=incoming;pending[identity]=incoming
     for action in pending.values():
         action=dict(action)
         if action.get('kind') in ('cash_distribution','no_change'):continue
@@ -295,12 +380,12 @@ def _actions(db,batch,target,attempt):
         if old and old[0]==action['revision']:continue
         effective=action.get('effective_date')
         if effective and pd.Timestamp(effective)>target:
-            serialized=canonical(action)
-            previous=db.execute('SELECT payload FROM ingest_pending_actions WHERE provider=? AND event_id=?',[action['provider'],action['event_id']]).fetchone()
-            if previous is None or previous[0]!=serialized:
-                db.execute('INSERT OR REPLACE INTO ingest_pending_actions VALUES(?,?,?,?,?)',[action['provider'],action['event_id'],action['revision'],batch.market,serialized]);changed+=1
+            changed+=_store_pending(db,{**action,'pending_status':'future_effective','missing_effective_date':False})
             continue
         action=_confirm_ksd(db,action,target,old);effective=action.get('effective_date')
+        halted=_defer_official_halt(db,action,target)
+        if halted:
+            changed+=_store_pending(db,halted);continue
         if action.get('market')!=batch.market or action.get('kind')!='split' or not action.get('confirmed') or not effective:
             quarantine.append(action);continue
         pf,sf=action.get('price_factor'),action.get('share_factor')
@@ -326,6 +411,46 @@ def _actions(db,batch,target,attempt):
     return changed
 
 
+def _part_batch(db,providers,market,dates,attempt,part_dir,plan,audit,action_start):
+    """Load/fetch just one bounded raw part; compatible failed work is reusable."""
+    labels=[_day(d) for d in dates];action_label=_day(action_start);batch_dir=part_dir;complete=batch_dir/'complete.json'
+    def compatible(meta):return meta.get('completed_sessions')==labels and meta.get('action_start',labels[0])==action_label
+    if not complete.exists():
+        for other in sorted((attempt.parent).glob('*'),key=lambda p:p.stat().st_mtime,reverse=True):
+            old_plan,old_status=other/'plan.json',other/'status.json'
+            if other==attempt or not old_plan.is_file() or not old_status.is_file():continue
+            note=json.loads(old_status.read_text(encoding='utf-8'));old=json.loads(old_plan.read_text(encoding='utf-8'))
+            if note.get('status')!='FAILED' or not note.get('retryable',True) or old.get('parent')!=plan['parent'] or old.get('audit')!=audit:continue
+            for candidate in (other/market,other/market/('part-'+labels[0]+'_'+labels[-1])):
+                meta_path=candidate/'complete.json'
+                if meta_path.is_file() and compatible(json.loads(meta_path.read_text(encoding='utf-8'))):
+                    batch_dir=candidate;complete=meta_path;break
+            if complete.exists():break
+    if complete.exists():
+        meta=json.loads(complete.read_text(encoding='utf-8'))
+        if not compatible(meta):raise IngestionError('Cached raw part session/action boundary mismatch')
+        for name in ('bars','assets'):
+            expected=meta.get(name+'_sha256')
+            if expected and sha256_file(batch_dir/(name+'.parquet'))!=expected:raise IngestionError('Cached raw part hash mismatch')
+        return MarketBatch(market,db.execute('SELECT * FROM read_parquet(?)',[str(batch_dir/'bars.parquet')]).df(),
+            db.execute('SELECT * FROM read_parquet(?)',[str(batch_dir/'assets.parquet')]).df(),meta['actions'],[pd.Timestamp(d) for d in labels],meta['provenance'])
+    assets=db.execute('SELECT market,symbol,name,exchange FROM assets WHERE market=?',[market]).df()
+    provider=providers[market] if isinstance(providers,dict) else providers
+    part_hook=getattr(provider,'fetch_market_part',None)
+    batch=part_hook(market,dates,assets,audit=audit,action_start=action_start) if callable(part_hook) else provider.fetch_market(market,dates,assets,audit=audit)
+    _normalize_batch(batch,market,dates)
+    batch_dir.mkdir(parents=True,exist_ok=True)
+    for name,frame in [('bars',batch.bars),('assets',batch.assets)]:
+        # An interrupted COPY is never a completed checkpoint. Replace only this
+        # attempt's known part file; completed immutable parts are read above.
+        path=batch_dir/(name+'.parquet')
+        if path.exists():path.unlink()
+        db.register('saved_part',frame);db.execute('COPY saved_part TO '+_literal(path)+' (FORMAT PARQUET)');db.unregister('saved_part')
+    atomic_json(complete,{'actions':batch.actions,'completed_sessions':labels,'action_start':action_label,'provenance':batch.provenance,
+                         'bars_sha256':sha256_file(batch_dir/'bars.parquet'),'assets_sha256':sha256_file(batch_dir/'assets.parquet')})
+    return batch
+
+
 def refresh(providers,*,seed_path=SOURCE,supplement_path=BENCHMARKS,root=MANAGED_ROOT,markets=('us','kr','crypto'),now=None,overlap_sessions=5,audit=False):
     if not markets or len(set(markets))!=len(markets) or not set(markets)<={'us','kr','crypto'}:raise IngestionError('Invalid required markets')
     if isinstance(overlap_sessions,bool) or not isinstance(overlap_sessions,int) or overlap_sessions<1:raise IngestionError('overlap_sessions must be positive')
@@ -337,14 +462,32 @@ def refresh(providers,*,seed_path=SOURCE,supplement_path=BENCHMARKS,root=MANAGED
             first={m:db.execute('SELECT min(session_date) FROM trading_calendar WHERE market=?',[m]).fetchone()[0] for m in markets}
             collected={m:{pd.Timestamp(r[0]) for r in db.execute('SELECT session_date FROM trading_calendar WHERE market=?',[m]).fetchall()} for m in markets}
         sessions={};targets={}
+        evidence=json.loads(canonical(current.get('calendar_evidence',{}) if current else {}));loaded=set()
         for market in markets:
             if first[market] is None:raise IngestionError('Seed market calendar missing')
             all_dates=completed_sessions(market,first[market],now)
+            provider=providers[market] if isinstance(providers,dict) else providers
+            if id(provider) not in loaded:
+                if callable(getattr(provider,'begin_refresh',None)):provider.begin_refresh()
+                if callable(getattr(provider,'load_session_evidence',None)):provider.load_session_evidence(evidence)
+                loaded.add(id(provider))
+            reconcile=getattr(provider,'reconcile_sessions',None)
+            if callable(reconcile):
+                try:
+                    reconciled=list(pd.DatetimeIndex(reconcile(market,all_dates,collected[market])).normalize())
+                    if reconciled!=sorted(set(reconciled)) or not set(reconciled)<=set(all_dates) or not (collected[market]&set(all_dates))<=set(reconciled):raise IngestionError('Invalid official calendar reconciliation')
+                    all_dates=reconciled
+                except Exception as exc:
+                    reason=str(exc) if isinstance(exc,(IngestionError,ProviderError)) else type(exc).__name__
+                    failed_id='calendar-'+uuid.uuid4().hex
+                    atomic_json(root/'attempts'/failed_id/'status.json',{'attempt_id':failed_id,'status':'FAILED','phase':'calendar','market':market,'reason':reason,'error_type':type(exc).__name__})
+                    return {'status':'FAILED','attempt_id':failed_id,'reason':reason,'previous_sequence':current['sequence'] if current else None}
+            for m,days in getattr(provider,'calendar_evidence',{}).items():evidence.setdefault(m,{}).update(days)
             if not all_dates:raise IngestionError('No completed target sessions')
             missing=[d for d in all_dates if d not in collected[market]]
             sessions[market]=all_dates if audit else sorted(set(all_dates[-overlap_sessions:])|set(missing))
             targets[market]=all_dates[-1]
-        plan={'parent':current['sha256'] if current else sha256_file(seed),'sessions':{m:[_day(d) for d in ds] for m,ds in sessions.items()},'audit':audit,'collector_version':1}
+        plan={'parent':current['sha256'] if current else sha256_file(seed),'sessions':{m:[_day(d) for d in ds] for m,ds in sessions.items()},'audit':audit,'collector_version':2,'calendar_evidence':evidence}
         identity=hashlib.sha256(canonical(plan).encode()).hexdigest()[:24]
         candidates=[]
         for p in (root/'attempts').glob(identity+'*'):
@@ -364,30 +507,32 @@ def refresh(providers,*,seed_path=SOURCE,supplement_path=BENCHMARKS,root=MANAGED
         attempt_status={'attempt_id':attempt_id,'status':'RUNNING','targets':{m:_day(d) for m,d in targets.items()},'started_at':datetime.now(timezone.utc).isoformat()}
         atomic_json(attempt/'status.json',attempt_status)
         try:
-            changed=0
+            changed=int(bool(current and canonical(current.get('calendar_evidence',{}))!=canonical(evidence)))
             with duckdb.connect(str(work)) as db:
                 db.execute("SET memory_limit='1GB'");db.execute('SET threads=4');_initialize(db,supplement_path if not current else None)
                 for market in markets:
-                    batch_dir=attempt/market;complete=batch_dir/'complete.json'
-                    if complete.exists():
-                        meta=json.loads(complete.read_text(encoding='utf-8'))
-                        batch=MarketBatch(market,db.execute('SELECT * FROM read_parquet(?)',[str(batch_dir/'bars.parquet')]).df(),db.execute('SELECT * FROM read_parquet(?)',[str(batch_dir/'assets.parquet')]).df(),meta['actions'],[pd.Timestamp(d) for d in meta['completed_sessions']],meta['provenance'])
-                    else:
-                        assets=db.execute('SELECT market,symbol,name,exchange FROM assets WHERE market=?',[market]).df()
-                        provider=providers[market] if isinstance(providers,dict) else providers
-                        batch=provider.fetch_market(market,sessions[market],assets,audit=audit)
-                        _normalize_batch(batch,market,sessions[market]);batch_dir.mkdir(parents=True,exist_ok=True)
-                        # DuckDB writes parquet without adding pyarrow as a dependency.
-                        db.register('saved_bars',batch.bars);db.execute('COPY saved_bars TO '+_literal(batch_dir/'bars.parquet')+' (FORMAT PARQUET)');db.unregister('saved_bars')
-                        db.register('saved_assets',batch.assets);db.execute('COPY saved_assets TO '+_literal(batch_dir/'assets.parquet')+' (FORMAT PARQUET)');db.unregister('saved_assets')
-                        atomic_json(complete,{'actions':batch.actions,'completed_sessions':[_day(d) for d in batch.completed_sessions],'provenance':batch.provenance})
-                    frame=_normalize_batch(batch,market,sessions[market]);changed+=_upsert(db,frame,batch);changed+=_actions(db,batch,targets[market],attempt)
+                    dates=sessions[market];actions=[];parts=[dates[start:start+MAX_PART_SESSIONS] for start in range(0,len(dates),MAX_PART_SESSIONS)]
+                    for number,part in enumerate(parts):
+                        directory=attempt/market if len(parts)==1 else attempt/market/('part-'+_day(part[0])+'_'+_day(part[-1]))
+                        action_start=part[0] if number==0 else parts[number-1][-1]+pd.Timedelta(days=1)
+                        batch=_part_batch(db,providers,market,part,attempt,directory,plan,audit,action_start)
+                        frame=_normalize_batch(batch,market,part);changed+=_upsert(db,frame,batch);actions.extend(batch.actions)
+                        attempt_status.setdefault('markets',{})[market]={'completed_parts':number+1,'total_parts':len(parts),'last_session':_day(part[-1])}
+                        atomic_json(attempt/'status.json',attempt_status)
+                        del batch,frame
+                    # KSD reference evidence can occur in a later part than its
+                    # record date. Resolve only after ALL market raw parts exist.
+                    action_batch=MarketBatch(market,pd.DataFrame(),pd.DataFrame(),actions,dates,{})
+                    changed+=_actions(db,action_batch,targets[market],attempt)
+                if changed or not current:
+                    db.execute('CREATE TABLE IF NOT EXISTS ingest_checkpoint_meta(sequence BIGINT,calendar_evidence VARCHAR)')
+                    db.execute('DELETE FROM ingest_checkpoint_meta');db.execute('INSERT INTO ingest_checkpoint_meta VALUES(?,?)',[current['sequence']+1 if current else 1,canonical(evidence)])
                 db.execute('CHECKPOINT')
             watermarks={m:{'target':_day(d),'actual':_day(d)} for m,d in targets.items()}
             sequence=current['sequence']+1 if current else 1
             manifest={'schema_version':SCHEMA_VERSION,'key_version':KEY_VERSION,'sequence':sequence,'database':f'checkpoints/{sequence:012d}.duckdb',
                 'sha256':sha256_file(work),'parent_sha256':current['sha256'] if current else None,'ancestors':[current['sha256'],*current['ancestors']] if current else [],
-                'includes_supplement':True,'markets':watermarks,'created_at':datetime.now(timezone.utc).isoformat()}
+                'includes_supplement':True,'markets':watermarks,'calendar_evidence':evidence,'created_at':datetime.now(timezone.utc).isoformat()}
             manifest['validation']=validate_database(work,manifest)
             if current and not changed:
                 attempt_status.update(status='UNCHANGED');atomic_json(attempt/'status.json',attempt_status)
@@ -404,5 +549,5 @@ def refresh(providers,*,seed_path=SOURCE,supplement_path=BENCHMARKS,root=MANAGED
         except Exception as exc:
             # Do not serialize arbitrary provider exception text: it may embed credentials.
             reason=str(exc) if isinstance(exc,(IngestionError,ProviderError)) else type(exc).__name__
-            attempt_status.update(status='FAILED',reason=reason,error_type=type(exc).__name__,retryable=not (attempt/'quarantine.json').exists());atomic_json(attempt/'status.json',attempt_status)
+            attempt_status.update(status='FAILED',reason=reason,error_type=type(exc).__name__,retryable=not isinstance(exc,ValueError) and not (attempt/'quarantine.json').exists());atomic_json(attempt/'status.json',attempt_status)
             return {'status':'FAILED','attempt_id':attempt_id,'reason':reason,'previous_sequence':current['sequence'] if current else None}

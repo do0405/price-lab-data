@@ -16,7 +16,7 @@ def main():
     args=parser.parse_args()
     from price_lab.ingestion import resolve_current,refresh
     from price_lab.providers import Providers
-    from price_lab.release_transport import pull_latest,publish_current
+    from price_lab.release_transport import pull_latest,publish_current,record_periodic_status
     root=ROOT/'data'/'market'
     if not args.publish_only:
         pull_latest(root)
@@ -28,6 +28,7 @@ def main():
     current=resolve_current(root)
     if current is None:raise ValueError('Checkpoint bootstrap required')
     result=publish_current(root)
+    result['periodic_status']=record_periodic_status(current)
     print(json.dumps({'stage':'release',**result,'sequence':current['sequence'],'markets':current['markets']}),flush=True)
 
 if __name__=='__main__':main()
