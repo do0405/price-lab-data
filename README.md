@@ -31,3 +31,12 @@ US/crypto turnover is provider VWAP times volume; Korean turnover is the provide
 A PC that was off catches up from retained encrypted packages when it next starts. Local-only unfinished backfills cannot be read while that PC is off. They are validated and merged locally on the next six-hour pass; complete candidate databases are never uploaded. Collection success and local application success are separate states.
 
 Existing full-checkpoint Releases belong to the retired transport and are removed only after local preservation and migration validation. There is no automatic fallback to them. Do not prune daily packages automatically: a missing package breaks catch-up for offline clients. A new device needs a locally preserved baseline; the cloud contains no baseline database. Protect the encryption key independently.
+
+
+## Continuous Korean reference and disclosure collection
+
+`reference-evidence.yml` continues bounded raw-source batches automatically. It uses the same existing Actions Secrets, an independent authenticated encrypted research delta stream, and a small HMAC/CAS request reservation journal. No DuckDB, database cache, full snapshot or backup is created in Actions. The encrypted bootstrap contains only portable acquisition tasks/control and source hashes.
+
+Each job runs at most seven minutes of production, publishing closed batches immediately and continuing the next batch. The ten-minute schedule resumes across hosted-runner shutdowns; GitHub schedules may be delayed. Actual-time price windows and shared queued concurrency protect the existing daily price jobs. KRX research requests are capped at 8,000/day to retain 2,000/day headroom. KIS/KIND caps and KST quota rollover are explicit operator policies. All HTTP sends, including OAuth, consume prior durable reservations; crashes never refund them.
+
+The local application authenticates contiguous packages, retains immutable source bytes, validates references and unknown lifecycle observations, and atomically updates its managed local database. Raw acquisition does not approve security identity, adjustment ratios, actual settlement amounts or publication-time validity. Local baseline data remains required; the cloud stream is not a full restoration backup.

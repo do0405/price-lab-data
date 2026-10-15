@@ -1,0 +1,51 @@
+name: Continuous Korean reference and disclosure deltas
+on:
+  schedule:
+    - cron: '3,13,23,33,43,53 * * * *'
+  workflow_dispatch:
+    inputs:
+      max_requests:
+        description: 'Maximum provider sends in each bounded batch'
+        type: choice
+        options: ['100', '6', '30']
+        default: '100'
+      max_batches:
+        description: 'Maximum batches in this job'
+        type: choice
+        options: ['100', '1']
+        default: '100'
+permissions:
+  contents: read
+concurrency:
+  group: durable-price-publication
+  queue: max
+  cancel-in-progress: false
+jobs:
+  collect:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: requirements-delta.txt
+      - run: python -m pip install -r requirements-delta.txt
+      - name: Validate independent encrypted stream and durable quota
+        run: python -m pytest tests/test_research_delta_codec.py tests/test_research_delta_transport.py tests/test_cloud_research_runtime.py tests/test_research_delta_collect.py -q
+      - name: Continue raw collection and publish additions or corrections
+        env:
+          KRX_API_KEY: ${{ secrets.KRX_API_KEY }}
+          KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          PRICE_DATA_KEY: ${{ secrets.PRICE_DATA_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          BATCH_REQUESTS: ${{ inputs.max_requests || '100' }}
+          JOB_BATCHES: ${{ inputs.max_batches || '100' }}
+        run: python scripts/reference_pipeline.py --max-requests "$BATCH_REQUESTS" --max-batches "$JOB_BATCHES"

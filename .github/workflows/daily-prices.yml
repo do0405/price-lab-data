@@ -26,6 +26,7 @@ permissions:
   contents: read
 concurrency:
   group: durable-price-publication
+  queue: max
   cancel-in-progress: false
 jobs:
   refresh:

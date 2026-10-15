@@ -11,3 +11,4 @@ __pycache__/
 *.wal
 *.pldata
 *.pldelta
+!config/research-bootstrap.pldelta
