@@ -189,3 +189,40 @@ def test_release_asset_listing_order_is_independent_of_authenticated_part_order(
     r,remote,_=multipart_release(monkeypatch,tmp_path);r.publish_current(tmp_path/'source',key=b'x'*32,token='fake-github-token')
     remote.release['assets'].reverse()
     assert r.pull_latest(tmp_path/'restored',key=b'x'*32)['downloaded']
+
+
+def test_large_asset_download_uses_verified_byte_ranges_without_tokens(monkeypatch,tmp_path):
+    from price_lab import release_transport as r
+    import hashlib
+    blob=b'abcdefghij';calls=[]
+    class Response:
+        status_code=206;url='https://release-assets.githubusercontent.com/file'
+        def __init__(self,start,end):self.start=start;self.end=end;self.headers={'Content-Range':f'bytes {start}-{end}/10'}
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+        def iter_content(self,*args):yield blob[self.start:self.end+1]
+    def get(url,**kwargs):
+        headers=kwargs.get('headers',{});assert set(headers)=={'Range'}
+        start,end=map(int,headers['Range'].removeprefix('bytes=').split('-'));calls.append((start,end))
+        return Response(start,end)
+    monkeypatch.setattr(r,'RANGE_THRESHOLD_BYTES',1,raising=False)
+    monkeypatch.setattr(r,'RANGE_CHUNK_BYTES',4,raising=False)
+    monkeypatch.setattr(r.requests,'get',get)
+    target=tmp_path/'download'
+    result=r._download_asset({'size':10,'browser_download_url':'https://github.com/do0405/price-lab-data/releases/download/data/checkpoint.pldata'},target)
+    assert target.read_bytes()==blob and result==hashlib.sha256(blob).hexdigest()
+    assert sorted(calls)==[(0,3),(4,7),(8,9)]
+
+
+def test_ranged_download_rejects_wrong_range_before_accepting_bytes(monkeypatch,tmp_path):
+    from price_lab import release_transport as r
+    class Response:
+        status_code=206;url='https://release-assets.githubusercontent.com/file';headers={'Content-Range':'bytes 0-1/10'}
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+        def iter_content(self,*args):raise AssertionError('wrong range reached body')
+    monkeypatch.setattr(r,'RANGE_THRESHOLD_BYTES',1,raising=False)
+    monkeypatch.setattr(r,'RANGE_CHUNK_BYTES',4,raising=False)
+    monkeypatch.setattr(r.requests,'get',lambda *a,**k:Response())
+    with pytest.raises(ValueError,match='range'):
+        r._download_asset({'size':10,'browser_download_url':'https://github.com/do0405/price-lab-data/releases/download/data/checkpoint.pldata'},tmp_path/'rejected')

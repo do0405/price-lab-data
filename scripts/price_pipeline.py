@@ -36,7 +36,7 @@ def run_pipeline(*,root=None,audit=False,publish_only=False,integration_only=Fal
     current=resolve_current(root)
     if current is None:raise ValueError('Checkpoint bootstrap required')
     result=publish_current(root)
-    if not publish_only and not integration_only:
+    if not publish_only:
         reference=refresh_recent_reference(root)
         # Every remote checkpoint must be the published latest's direct child.
         # Reference failure leaves the successful daily price publication intact.
@@ -46,6 +46,11 @@ def run_pipeline(*,root=None,audit=False,publish_only=False,integration_only=Fal
     candidates=process_pending(root)
     result['integration']=candidates
     current=resolve_current(root)
+    integrated=[c for c in candidates if c['status']=='INTEGRATED']
+    if integrated:
+        result.pop('ciphertext_sha256',None)
+        result.update(release_url=integrated[-1]['release_url'],
+            tag=f"data-{current['sequence']:08d}-{current['sha256'][:12]}",unchanged=False)
     result['periodic_status']=record_periodic_status(current)
     print(json.dumps({'stage':'release',**result,'sequence':current['sequence'],'markets':current['markets']}),flush=True)
     if any(c['status']=='FAILED' for c in candidates):raise SystemExit(1)

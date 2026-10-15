@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 import requests
 from .cloud_data import decrypt_checkpoint,encrypt_checkpoint
@@ -15,6 +16,8 @@ from .transport_parts import (INDEX_NAME as INDEX_ASSET,PART_BYTES,MAX_PARTS,
 REPOSITORY='do0405/price-lab-data'
 ASSET='checkpoint.pldata'
 SINGLE_MAX_BYTES=2*1024**3
+RANGE_THRESHOLD_BYTES=64*1024**2
+RANGE_CHUNK_BYTES=16*1024**2
 API='https://api.github.com/repos/'+REPOSITORY
 
 
@@ -140,6 +143,7 @@ def _validate_asset(asset,limit):
 
 def _download_asset(asset,target):
     """Stream public data without an API token or any provider credentials."""
+    if asset['size']>=RANGE_THRESHOLD_BYTES:return _download_ranged_asset(asset,target)
     import hashlib
     total=0;digest=hashlib.sha256()
     with requests.get(asset['browser_download_url'],stream=True,timeout=(20,180),allow_redirects=True) as response:
@@ -151,6 +155,47 @@ def _download_asset(asset,target):
                 if total>asset['size']:raise ValueError('Checkpoint exceeds declared size')
                 out.write(block);digest.update(block)
     if total!=asset['size']:raise ValueError('Incomplete checkpoint download')
+    return digest.hexdigest()
+
+
+def _download_ranged_asset(asset,target):
+    """Bounded parallel network reads, ordered writes and one full-file digest.
+
+    Large single responses can stall behind an intermediary. Every independent
+    range must declare the exact immutable asset size and contain exactly the
+    requested bytes. No token is sent; GCM/hash validation still follows this.
+    At most four 16 MiB chunks are buffered, irrespective of checkpoint size.
+    """
+    import hashlib
+    size=asset['size'];digest=hashlib.sha256()
+    ranges=iter((start,min(size-1,start+RANGE_CHUNK_BYTES-1)) for start in range(0,size,RANGE_CHUNK_BYTES))
+    def fetch(bounds):
+        start,end=bounds;expected=end-start+1
+        with requests.get(asset['browser_download_url'],headers={'Range':f'bytes={start}-{end}'},
+                stream=True,timeout=(20,120),allow_redirects=True) as response:
+            if response.status_code!=206:raise RuntimeError(f'Checkpoint range download failed: HTTP {response.status_code}')
+            if urlsplit(response.url).scheme!='https':raise ValueError('Insecure checkpoint redirect')
+            if response.headers.get('Content-Range')!=f'bytes {start}-{end}/{size}':
+                raise ValueError('Checkpoint range identity/size mismatch')
+            buffer=bytearray(expected);received=0
+            for block in response.iter_content(1024*1024):
+                end_offset=received+len(block)
+                if end_offset>expected:raise ValueError('Checkpoint range exceeds declared size')
+                buffer[received:end_offset]=block;received=end_offset
+            if received!=expected:raise ValueError('Incomplete checkpoint range')
+            return buffer
+    total=0
+    with ThreadPoolExecutor(max_workers=4) as pool,Path(target).open('wb') as out:
+        queue=[]
+        for _ in range(4):
+            bounds=next(ranges,None)
+            if bounds is not None:queue.append(pool.submit(fetch,bounds))
+        while queue:
+            block=queue.pop(0).result();out.write(block);digest.update(block);total+=len(block)
+            del block
+            bounds=next(ranges,None)
+            if bounds is not None:queue.append(pool.submit(fetch,bounds))
+    if total!=size:raise ValueError('Incomplete ranged checkpoint download')
     return digest.hexdigest()
 
 def publish_current(root,*,key=None,token=None):
