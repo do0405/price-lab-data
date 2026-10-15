@@ -45,7 +45,14 @@ def collect_observations(providers, batch, *, max_symbols=3):
         if batch.market=='us':
             evidence=providers.alpaca.fetch_bars('us',selected,days,adjustment='split')
         else:
-            evidence=providers.kis.fetch_stock_bars(selected,days)
+            import pandas as pd
+            samples=[]
+            for symbol in selected:
+                try:
+                    value=providers.kis.fetch_stock_bars([symbol],days)
+                    if not value.empty:samples.append(value)
+                except Exception:pass
+            evidence=pd.concat(samples,ignore_index=True) if samples else pd.DataFrame(columns=['symbol','session_date'])
         rows=[]
         for symbol in selected:
             sample=evidence[evidence.symbol==symbol].sort_values('session_date')
