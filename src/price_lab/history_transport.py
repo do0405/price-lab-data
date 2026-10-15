@@ -14,7 +14,7 @@ import requests
 from .cloud_data import encrypt_checkpoint, decrypt_checkpoint
 from .ingestion import resolve_current, sha256_file
 from .release_transport import (_request, _validate_asset, publish_current,
-    API, ASSET, SINGLE_MAX_BYTES)
+    API, ASSET, SINGLE_MAX_BYTES, release_manifest)
 from .transport_parts import (INDEX_NAME, MAX_INDEX_BYTES, MAX_PARTS,
     PART_BYTES, read_index, split_checkpoint, assemble_checkpoint)
 
@@ -73,7 +73,7 @@ def upload_candidate(root,*,key=None,token=None):
             part_dir=temp/'parts';index=split_checkpoint(encrypted,public,part_dir,key=key,part_size=PART_BYTES)
             paths=[part_dir/p['name'] for p in index['parts']]+[part_dir/INDEX_NAME]
         body={'purpose':'unified-history','schema_version':1,'ready':False,
-              'checkpoint':public,'ciphertext_sha256':envelope['ciphertext_sha256']}
+              'checkpoint':release_manifest(public),'ciphertext_sha256':envelope['ciphertext_sha256']}
         release=old or _request('POST','/releases',token=token,payload={
             'tag_name':tag,'name':tag,'draft':True,'prerelease':False,
             'target_commitish':'main','body':json.dumps(body,sort_keys=True)})

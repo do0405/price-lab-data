@@ -17,6 +17,24 @@ ASSET='checkpoint.pldata'
 SINGLE_MAX_BYTES=2*1024**3
 API='https://api.github.com/repos/'+REPOSITORY
 
+
+def release_manifest(manifest):
+    """Bound the human-readable release body; full evidence stays GCM-bound.
+
+    Daily reference coverage can exceed GitHub's release-description limit.
+    Its detailed rows are in the authenticated container and reference tables,
+    while release discovery needs only the dataset identity and price status.
+    """
+    public={k:v for k,v in manifest.items() if k!='resolved_path'}
+    validation=public.get('validation',{})
+    public['validation']={k:validation[k] for k in ('valid','markets','pending_adjustments','history') if k in validation}
+    reference=validation.get('kr_reference')
+    if isinstance(reference,dict):
+        public['validation']['kr_reference']={k:reference[k] for k in
+            ('status','observations','identity_status','capitalization_status','lifecycle_status',
+             'unknown_identity','unknown_settlements','publication_time_verified') if k in reference}
+    return public
+
 def _request(method,path,*,token=None,payload=None,stream=None):
     headers={'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}
     token=token or os.environ.get('GITHUB_TOKEN')
@@ -150,7 +168,7 @@ def publish_current(root,*,key=None,token=None):
             directory=Path(temporary)/'parts';index=split_checkpoint(asset,public,directory,key=key,part_size=PART_BYTES)
             if index['ciphertext_sha256']!=envelope['ciphertext_sha256']:raise ValueError('Encrypted checkpoint changed before upload')
             upload=[directory/p['name'] for p in index['parts']]+[directory/INDEX_ASSET]
-        body=json.dumps({'checkpoint':public,'ciphertext_sha256':envelope['ciphertext_sha256']},sort_keys=True,separators=(',',':'))
+        body=json.dumps({'checkpoint':release_manifest(public),'ciphertext_sha256':envelope['ciphertext_sha256']},sort_keys=True,separators=(',',':'))
         try:release=_request('GET','/releases/tags/'+tag,token=token)
         except RuntimeError as exc:
             if 'HTTP 404' not in str(exc):raise

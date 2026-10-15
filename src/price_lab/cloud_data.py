@@ -56,7 +56,7 @@ def encrypt_checkpoint(db_path,manifest,output,key=None):
     try:
         with temp.open('wb') as destination:
             destination.write(prefix);destination.write(nonce)
-            with db_path.open('rb') as source,gzip.GzipFile(fileobj=_EncryptWriter(destination,encryptor),mode='wb',mtime=0,filename='') as compressed:
+            with db_path.open('rb') as source,gzip.GzipFile(fileobj=_EncryptWriter(destination,encryptor),mode='wb',compresslevel=3,mtime=0,filename='') as compressed:
                 for block in iter(lambda:source.read(BLOCK),b''):compressed.write(block)
             destination.write(encryptor.finalize());destination.write(encryptor.tag);destination.flush();os.fsync(destination.fileno())
         os.replace(temp,output)

@@ -9,6 +9,15 @@ from test_history_integration import archive
 from test_history_promotion import managed
 
 
+def test_large_coverage_report_is_kept_out_of_release_body_without_mutation():
+    from price_lab.release_transport import release_manifest
+    source={'sha256':'a'*64,'validation':{'valid':True,'kr_reference':{'rows':[{'date':'2020-01-01','count':2500}]*10000}}}
+    result=release_manifest(source)
+    assert len(json.dumps(result))<10000
+    assert len(source['validation']['kr_reference']['rows'])==10000
+    assert result['sha256']==source['sha256'] and result['validation']['valid']
+
+
 def test_candidate_metadata_requires_ready_purpose_and_exact_hash():
     base={'draft':True,'tag_name':'candidate-unified-'+'a'*64,
           'body':json.dumps({'purpose':'unified-history','schema_version':1,'ready':True,
