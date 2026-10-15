@@ -148,7 +148,14 @@ def validate_database(path,manifest=None):
         pending={}
         if 'ingest_pending_actions' in names:
             pending={str(s or 'future_effective'):int(n) for s,n in db.execute("SELECT json_extract_string(payload,'$.pending_status'),count(*) FROM ingest_pending_actions GROUP BY 1").fetchall()}
-        return {'valid':True,'markets':{m:{'rows':n,'first':_day(a),'last':_day(b)} for m,n,a,b in rows},'pending_adjustments':pending}
+        additional={}
+        if 'history_archive_registry' in names:
+            from .history_integration import validate_integrated
+            additional['history']=validate_integrated(db)
+        if 'kr_source_manifest' in names:
+            from .kr_reference_validation import validate_reference
+            additional['kr_reference']=validate_reference(db)
+        return {'valid':True,'markets':{m:{'rows':n,'first':_day(a),'last':_day(b)} for m,n,a,b in rows},'pending_adjustments':pending,**additional}
 
 
 @lru_cache(maxsize=24)

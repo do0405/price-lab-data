@@ -7,10 +7,18 @@ on:
     # Post-Korea-close; weekends retained for crypto and revision checks.
     - cron: '37 20 * * *'
       timezone: Asia/Seoul
+    # Integration inbox check every six hours, alongside the two price runs.
+    - cron: '17 */6 * * *'
+      timezone: UTC
   workflow_dispatch:
     inputs:
       audit:
         description: 'Reconcile complete retained history'
+        required: false
+        type: boolean
+        default: false
+      integration_only:
+        description: 'Check completed encrypted history/reference candidates only'
         required: false
         type: boolean
         default: false
@@ -49,8 +57,11 @@ jobs:
           PRICE_DATA_KEY: ${{ secrets.PRICE_DATA_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
           FULL_AUDIT: ${{ inputs.audit && 'true' || 'false' }}
+          INTEGRATION_ONLY: ${{ (inputs.integration_only || github.event.schedule == '17 */6 * * *') && 'true' || 'false' }}
         run: |
-          if [ "$FULL_AUDIT" = "true" ]; then
+          if [ "$INTEGRATION_ONLY" = "true" ]; then
+            python scripts/price_pipeline.py --integration-only
+          elif [ "$FULL_AUDIT" = "true" ]; then
             python scripts/price_pipeline.py --audit
           else
             python scripts/price_pipeline.py
