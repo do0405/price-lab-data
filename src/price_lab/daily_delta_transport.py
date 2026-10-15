@@ -238,7 +238,7 @@ def publish_package(payload,*,key=None,token=None,work_root=None):
         'sequence':payload['sequence'],'package_sha256':digest,'ciphertext_bytes':uploaded['size']}
 
 
-def pull_latest(root,*,key=None):
+def pull_latest(root,*,key=None,token=None):
     """Local only: apply authenticated packages to the latest local DB parent."""
     import duckdb
     from .ingestion import resolve_current,managed_lock
@@ -252,7 +252,7 @@ def pull_latest(root,*,key=None):
             if 'daily_delta_receipts' in {r[0] for r in db.execute('SHOW TABLES').fetchall()}:
                 row=db.execute("SELECT sequence,package_sha256 FROM daily_delta_receipts WHERE stream_id='price-daily-v1' ORDER BY sequence DESC LIMIT 1").fetchone()
                 if row:after,cursor_hash=row
-        releases=list_packages(after_sequence=after,expected_cursor_hash=cursor_hash);applied=[]
+        releases=list_packages(after_sequence=after,expected_cursor_hash=cursor_hash,token=token);applied=[]
         if releases:
             # A later confirmation may resolve an earlier pending action.
             # Authenticate and stage the contiguous suffix, then validate actions
