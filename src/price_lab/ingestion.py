@@ -361,7 +361,7 @@ def _store_pending(db,action):
 
 
 def _actions(db,batch,target,attempt):
-    changed=0;quarantine=[]
+    changed=0;quarantine=[];dirty=set()
     pending={ (r[0],r[1]):json.loads(r[2]) for r in db.execute('SELECT provider,event_id,payload FROM ingest_pending_actions WHERE market=?',[batch.market]).fetchall()}
     batch_seen={}
     for incoming in batch.actions:
@@ -394,13 +394,14 @@ def _actions(db,batch,target,attempt):
         baseline=list(old[1:4]) if old else [None,1.,1.]
         db.execute('INSERT OR REPLACE INTO ingest_actions VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',[action['provider'],action['event_id'],action['revision'],batch.market,action['symbol'],_day(effective),pf,sf,*baseline,canonical(action)])
         db.execute('DELETE FROM ingest_pending_actions WHERE provider=? AND event_id=?',[action['provider'],action['event_id']])
+        dirty.add((batch.market,action['symbol']))
         changed+=1
     if quarantine:
         atomic_json(attempt/'quarantine.json',quarantine)
         raise IngestionError('Unconfirmed/unknown corporate actions quarantined; previous checkpoint retained')
     # Recompute deltas versus immutable seed factors, including changed ex-dates.
-    affected=db.execute('SELECT DISTINCT market,symbol FROM ingest_actions WHERE market=? AND (seed_effective_date IS NULL OR effective_date<>seed_effective_date OR price_factor<>seed_price_factor OR share_factor<>seed_share_factor)',[batch.market]).fetchall()
-    for market,symbol in affected:
+    affected=set(db.execute('SELECT DISTINCT market,symbol FROM ingest_actions WHERE market=? AND (seed_effective_date IS NULL OR effective_date<>seed_effective_date OR price_factor<>seed_price_factor OR share_factor<>seed_share_factor)',[batch.market]).fetchall())|dirty
+    for market,symbol in sorted(affected):
         db.execute('UPDATE managed_bars SET split_price_factor=base_price_factor,split_share_factor=base_share_factor WHERE market=? AND symbol=?',[market,symbol])
         events=db.execute('SELECT effective_date,price_factor,share_factor,seed_effective_date,seed_price_factor,seed_share_factor FROM ingest_actions WHERE market=? AND symbol=?',[market,symbol]).fetchall()
         for date,p,s,base_date,bp,bs in events:

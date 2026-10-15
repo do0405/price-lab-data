@@ -384,3 +384,17 @@ def test_audit_publishes_new_tradable_row_even_when_preserved_raw_is_identical(t
     assert audited['status']=='PUBLISHED' and audited['manifest']['sequence']==2
     with duckdb.connect(i.resolve_current(root)['resolved_path'],read_only=True) as db:
         assert db.execute("SELECT open FROM backtest_bars WHERE symbol='A' AND session_date='2024-01-02'").fetchone()==(100.,)
+def test_revision_returning_to_seed_factor_restores_all_old_prices(tmp_path):
+    i=module();source=seed(tmp_path/'seed.duckdb');root=tmp_path/'managed'
+    with duckdb.connect(str(source)) as db:
+        db.execute("UPDATE backtest_bars SET open=50,high=50.5,low=49.5,close=50,volume=2000,vwap=50,split_price_factor=.5,split_share_factor=2 WHERE symbol='A' AND session_date<'2024-01-04'")
+        db.execute('CREATE TABLE split_events(market VARCHAR,symbol VARCHAR,effective_date DATE,price_factor DOUBLE,new_shares_per_old_share DOUBLE,source VARCHAR,source_id VARCHAR,source_record_json VARCHAR)')
+        db.execute("INSERT INTO split_events VALUES('us','A','2024-01-04',.5,2,'alpaca','seed-event','{}')")
+    original=dict(provider='alpaca',event_id='seed-event',revision='original',market='us',symbol='A',effective_date='2024-01-04',price_factor=.5,share_factor=2.,kind='split',confirmed=True)
+    # One-session overlap deliberately leaves the first historical prices untouched by raw upsert.
+    for action,expected in [({**original,'revision':'correction','price_factor':.25,'share_factor':4.},25.),({**original,'revision':'restored'},50.)]:
+        out=i.refresh(FakeProvider(actions=[action]),seed_path=source,supplement_path=None,root=root,markets=('us',),now='2024-01-05T22:00Z',overlap_sessions=1)
+        assert out['status']=='PUBLISHED'
+        with duckdb.connect(i.resolve_current(root)['resolved_path'],read_only=True) as db:
+            assert db.execute("SELECT close FROM backtest_bars WHERE symbol='A' AND session_date='2024-01-02'").fetchone()[0]==expected
+
