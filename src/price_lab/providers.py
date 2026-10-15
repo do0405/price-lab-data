@@ -340,6 +340,7 @@ class KisProvider:
                     values={k:_number(r[v]) for k,v in [('open','stck_oprc'),('high','stck_hgpr'),('low','stck_lwpr'),('close','stck_clpr'),('volume','acml_vol'),('turnover','acml_tr_pbmn')]}
                     rows.append(dict(market='kr',symbol=symbol,session_date=day,**values,vwap=values['turnover']/values['volume'] if values['volume'] else None,currency='KRW',source='kis_stock_raw',
                         turnover_method='exact_kis_acml_tr_pbmn',vwap_method='turnover_div_volume',retrieved_at=datetime.now(timezone.utc).isoformat(),
+                        unit_change_code=r.get('flng_cls_code'),price_adjustment_rate=_number(r['prtt_rate']) if r.get('prtt_rate') not in (None,'') else None,
                         is_tradable_bar=bool(values['volume']>0 and all(values[c]>0 for c in ('open','high','low','close')))))
                 start=end+pd.Timedelta(days=1)
         frame=pd.DataFrame(rows)
