@@ -158,11 +158,12 @@ class AlpacaProvider:
             if not isinstance(token,str) or token in seen:raise ProviderError('Repeated or invalid page token')
             seen.add(token)
         raise ProviderError('Alpaca page limit exceeded')
-    def fetch_bars(self,market,symbols,sessions):
+    def fetch_bars(self,market,symbols,sessions,*,batch_size=100):
         if market not in ('us','crypto') or not sessions:raise ProviderError('Invalid Alpaca bar request')
+        if isinstance(batch_size,bool) or not isinstance(batch_size,int) or not 1<=batch_size<=500:raise ProviderError('Invalid Alpaca symbol batch size')
         wanted=set(pd.DatetimeIndex(sessions).normalize());rows=[]
-        for offset in range(0,len(symbols),100):
-            chunk=list(symbols[offset:offset+100]);params={'symbols':','.join(chunk),'timeframe':'1Day','start':_day(min(wanted)),
+        for offset in range(0,len(symbols),batch_size):
+            chunk=list(symbols[offset:offset+batch_size]);params={'symbols':','.join(chunk),'timeframe':'1Day','start':_day(min(wanted)),
                 'end':_day(max(wanted)+pd.Timedelta(days=1))+'T00:00:00Z','limit':10000,'sort':'asc'}
             if market=='us':params.update(feed=self.feed,adjustment='raw')
             path='/v2/stocks/bars' if market=='us' else '/v1beta3/crypto/us/bars'

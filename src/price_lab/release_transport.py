@@ -9,9 +9,12 @@ from urllib.parse import urlsplit
 import requests
 from .cloud_data import decrypt_checkpoint,encrypt_checkpoint
 from .ingestion import resolve_current,atomic_json,sha256_file,managed_lock
+from .transport_parts import (INDEX_NAME as INDEX_ASSET,PART_BYTES,MAX_PARTS,
+    MAX_INDEX_BYTES,read_index,split_checkpoint,assemble_checkpoint)
 
 REPOSITORY='do0405/price-lab-data'
 ASSET='checkpoint.pldata'
+SINGLE_MAX_BYTES=2*1024**3
 API='https://api.github.com/repos/'+REPOSITORY
 
 def _request(method,path,*,token=None,payload=None,stream=None):
@@ -57,33 +60,71 @@ def _pull_latest(root,*,key=None):
     root=Path(root);root.mkdir(parents=True,exist_ok=True)
     release=latest_release()
     if release.get('draft') or release.get('prerelease'):raise ValueError('Only published stable checkpoints are accepted')
-    assets=[a for a in release.get('assets',[]) if a['name']==ASSET]
-    if len(assets)!=1:raise ValueError('Release requires exactly one encrypted checkpoint')
-    asset=assets[0];url=asset['browser_download_url'];parsed=urlsplit(url)
-    if parsed.scheme!='https' or parsed.netloc!='github.com' or not parsed.path.startswith('/'+REPOSITORY+'/releases/download/'):
-        raise ValueError('Unexpected checkpoint download URL')
-    if not 0<asset['size']<=8*1024**3:raise ValueError('Checkpoint download size outside limit')
+    assets=release.get('assets',[])
+    if not isinstance(assets,list) or not 1<=len(assets)<=MAX_PARTS+1:raise ValueError('Invalid checkpoint release asset count')
+    if any(not isinstance(a,dict) or not isinstance(a.get('name'),str) for a in assets):raise ValueError('Invalid checkpoint asset metadata')
+    names=[a.get('name') for a in assets]
+    if len(names)!=len(set(names)):raise ValueError('Duplicate checkpoint release asset')
+    single=len(assets)==1 and names==[ASSET]
+    if not single and (INDEX_ASSET not in names or ASSET in names):raise ValueError('Invalid checkpoint release layout')
+    for item in assets:
+        limit=SINGLE_MAX_BYTES if single else MAX_INDEX_BYTES if item.get('name')==INDEX_ASSET else PART_BYTES
+        _validate_asset(item,limit)
+    asset=assets[0] if single else next(a for a in assets if a['name']==INDEX_ASSET)
     current=resolve_current(root)
     receipt_path=root/'cloud-receipt.json'
     try:receipt=json.loads(receipt_path.read_text(encoding='utf-8'))
     except (OSError,ValueError):receipt={}
-    if current and receipt.get('release_id')==release['id'] and receipt.get('asset_id')==asset['id'] and receipt.get('asset_size')==asset['size'] and receipt.get('sha256')==current['sha256']:
+    signature=[{k:a[k] for k in ('id','name','size')} for a in sorted(assets,key=lambda a:a['name'])]
+    legacy_match=single and receipt.get('asset_id')==asset['id'] and receipt.get('asset_size')==asset['size']
+    parts_match=not single and receipt.get('transport')=='multipart-v1' and receipt.get('assets')==signature
+    if current and receipt.get('release_id')==release['id'] and (legacy_match or parts_match) and receipt.get('sha256')==current['sha256']:
         return {'manifest':current,'release_url':release['html_url'],'release_tag':release['tag_name'],'unchanged':True,'downloaded':False}
     with tempfile.TemporaryDirectory(prefix='download-',dir=root) as temporary:
-        target=Path(temporary)/ASSET;total=0
-        # Public download: credentials are never sent to an asset/CDN endpoint.
-        with requests.get(url,stream=True,timeout=(20,180),allow_redirects=True) as response:
-            if response.status_code!=200:raise RuntimeError(f'Checkpoint download failed: HTTP {response.status_code}')
-            if urlsplit(response.url).scheme!='https':raise ValueError('Insecure checkpoint redirect')
-            with target.open('wb') as out:
-                for block in response.iter_content(4*1024*1024):
-                    total+=len(block)
-                    if total>asset['size']:raise ValueError('Checkpoint exceeds declared size')
-                    out.write(block)
-        if total!=asset['size']:raise ValueError('Incomplete checkpoint download')
+        temporary=Path(temporary);target=temporary/ASSET
+        if single:_download_asset(asset,target)
+        else:
+            index_path=temporary/INDEX_ASSET;_download_asset(asset,index_path)
+            index=read_index(index_path,key=key,current=current)
+            expected={p['name']:p for p in index['parts']}
+            if set(names)!={INDEX_ASSET,*expected}:raise ValueError('Missing/unexpected checkpoint part asset')
+            remote={a['name']:a for a in assets}
+            for part in index['parts']:
+                item=remote[part['name']]
+                if item['size']!=part['size']:raise ValueError('Remote checkpoint part size mismatch')
+                digest=_download_asset(item,temporary/part['name'])
+                if digest!=part['sha256']:raise ValueError('Downloaded checkpoint part hash mismatch')
+            assemble_checkpoint(index,temporary,target,key=key,current=current)
         manifest=decrypt_checkpoint(target,root,key=key)
-        atomic_json(receipt_path,{'release_id':release['id'],'asset_id':asset['id'],'asset_size':asset['size'],'sha256':manifest['sha256'],'ciphertext_sha256':sha256_file(target)})
+        receipt={'release_id':release['id'],'asset_id':asset['id'],'asset_size':asset['size'],'sha256':manifest['sha256'],'ciphertext_sha256':sha256_file(target)}
+        if not single:receipt.update(transport='multipart-v1',assets=signature,index_sha256=sha256_file(index_path))
+        atomic_json(receipt_path,receipt)
     return {'manifest':manifest,'release_url':release['html_url'],'release_tag':release['tag_name'],'downloaded':True}
+
+
+def _validate_asset(asset,limit):
+    if not isinstance(asset.get('name'),str) or '/' in asset['name'] or '\\' in asset['name'] or ':' in asset['name'] or asset['name'] in ('.','..'):
+        raise ValueError('Unsafe checkpoint asset name')
+    if type(asset.get('id')) is not int or asset['id']<1 or type(asset.get('size')) is not int or not 0<asset['size']<=limit:raise ValueError('Checkpoint download size/identity outside limit')
+    parsed=urlsplit(asset.get('browser_download_url',''))
+    if parsed.scheme!='https' or parsed.netloc!='github.com' or parsed.query or parsed.fragment or not parsed.path.startswith('/'+REPOSITORY+'/releases/download/') or not parsed.path.endswith('/'+asset['name']):
+        raise ValueError('Unexpected checkpoint download URL')
+
+
+def _download_asset(asset,target):
+    """Stream public data without an API token or any provider credentials."""
+    import hashlib
+    total=0;digest=hashlib.sha256()
+    with requests.get(asset['browser_download_url'],stream=True,timeout=(20,180),allow_redirects=True) as response:
+        if response.status_code!=200:raise RuntimeError(f'Checkpoint download failed: HTTP {response.status_code}')
+        if urlsplit(response.url).scheme!='https':raise ValueError('Insecure checkpoint redirect')
+        with Path(target).open('wb') as out:
+            for block in response.iter_content(4*1024*1024):
+                total+=len(block)
+                if total>asset['size']:raise ValueError('Checkpoint exceeds declared size')
+                out.write(block);digest.update(block)
+    if total!=asset['size']:raise ValueError('Incomplete checkpoint download')
+    return digest.hexdigest()
 
 def publish_current(root,*,key=None,token=None):
     current=resolve_current(root,verify=True)
@@ -104,6 +145,11 @@ def publish_current(root,*,key=None,token=None):
     with tempfile.TemporaryDirectory(prefix='publish-',dir=Path(root)) as temporary:
         asset=Path(temporary)/ASSET
         envelope=encrypt_checkpoint(current['resolved_path'],public,asset,key=key)
+        upload=[asset]
+        if asset.stat().st_size>=SINGLE_MAX_BYTES:
+            directory=Path(temporary)/'parts';index=split_checkpoint(asset,public,directory,key=key,part_size=PART_BYTES)
+            if index['ciphertext_sha256']!=envelope['ciphertext_sha256']:raise ValueError('Encrypted checkpoint changed before upload')
+            upload=[directory/p['name'] for p in index['parts']]+[directory/INDEX_ASSET]
         body=json.dumps({'checkpoint':public,'ciphertext_sha256':envelope['ciphertext_sha256']},sort_keys=True,separators=(',',':'))
         try:release=_request('GET','/releases/tags/'+tag,token=token)
         except RuntimeError as exc:
@@ -115,7 +161,8 @@ def publish_current(root,*,key=None,token=None):
         for old in release.get('assets',[]):
             _request('DELETE','/releases/assets/'+str(old['id']),token=token)
         _request('PATCH','/releases/'+str(release['id']),token=token,payload={'body':body,'tag_name':tag,'name':tag,'target_commitish':'main'})
-        with asset.open('rb') as stream:
-            _request('POST',release['upload_url'].split('{')[0]+'?name='+ASSET,token=token,stream=stream)
+        for path in upload:
+            with path.open('rb') as stream:
+                _request('POST',release['upload_url'].split('{')[0]+'?name='+path.name,token=token,stream=stream)
         published=_request('PATCH','/releases/'+str(release['id']),token=token,payload={'draft':False,'make_latest':'true','tag_name':tag,'name':tag,'target_commitish':'main'})
     return {'release_url':published['html_url'],'tag':tag,'unchanged':False,'ciphertext_sha256':envelope['ciphertext_sha256']}

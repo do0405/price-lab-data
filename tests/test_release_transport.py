@@ -59,3 +59,133 @@ def test_same_previously_authenticated_release_skips_large_download(monkeypatch,
     def forbidden(*args,**kwargs):raise AssertionError('large download repeated')
     monkeypatch.setattr(r.requests,'get',forbidden)
     assert r.pull_latest(tmp_path,key=b'x'*32)['downloaded'] is False
+
+
+class Github:
+    """In-memory remote: no real API, credentials or network are used."""
+    def __init__(self):self.release=None;self.blobs={};self.next_id=100;self.uploads=0;self.fail_upload=None;self.published=False;self.gets=[]
+    def latest(self):
+        if self.release is None or self.release['draft']:raise RuntimeError('GitHub GET failed: HTTP 404')
+        return self.release
+    def request(self,method,path,**kwargs):
+        if method=='GET':
+            if self.release is None:raise RuntimeError('GitHub GET failed: HTTP 404')
+            return self.release
+        if method=='POST' and path=='/releases':
+            assert self.release is None
+            self.release={'id':10,'draft':True,'tag_name':kwargs['payload']['tag_name'],'body':kwargs['payload']['body'],
+                          'html_url':'https://github.com/do0405/price-lab-data/releases/tag/test','upload_url':'https://uploads.github.com/repos/x/assets{?name}','assets':[]}
+            return self.release
+        if method=='DELETE':
+            self.release['assets']=[a for a in self.release['assets'] if a['id']!=int(path.rsplit('/',1)[-1])];return {}
+        if method=='PATCH':
+            self.release.update(kwargs['payload'])
+            if kwargs['payload'].get('draft') is False:self.published=True
+            return self.release
+        assert method=='POST' and kwargs.get('token')=='fake-github-token'
+        self.uploads+=1
+        if self.uploads==self.fail_upload:raise RuntimeError('upload interrupted')
+        name=path.split('?name=')[1];blob=kwargs['stream'].read();self.next_id+=1;self.blobs[name]=blob
+        self.release['assets'].append({'id':self.next_id,'name':name,'size':len(blob),
+            'browser_download_url':'https://github.com/do0405/price-lab-data/releases/download/test/'+name})
+        return self.release['assets'][-1]
+    def download(self,url,**kwargs):
+        assert 'headers' not in kwargs and 'auth' not in kwargs and 'params' not in kwargs
+        self.gets.append(url.rsplit('/',1)[-1]);blob=self.blobs[self.gets[-1]]
+        class Response:
+            status_code=200
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def iter_content(self,size):
+                for offset in range(0,len(blob),min(size,97)):yield blob[offset:offset+min(size,97)]
+        response=Response();response.url=url;return response
+
+
+def install_github(monkeypatch,remote):
+    from price_lab import release_transport as r
+    monkeypatch.setattr(r,'_request',remote.request);monkeypatch.setattr(r,'latest_release',remote.latest);monkeypatch.setattr(r.requests,'get',remote.download)
+    return r
+
+
+def multipart_release(monkeypatch,tmp_path):
+    from test_cloud_data import checkpoint
+    from price_lab import cloud_data
+    current=checkpoint(tmp_path);remote=Github();r=install_github(monkeypatch,remote)
+    monkeypatch.setattr(r,'SINGLE_MAX_BYTES',1)
+    encrypt=cloud_data.encrypt_checkpoint
+    def small_parts(*args,**kwargs):
+        result=encrypt(*args,**kwargs);monkeypatch.setattr(r,'PART_BYTES',max(1,args[2].stat().st_size//3));return result
+    monkeypatch.setattr(r,'encrypt_checkpoint',small_parts)
+    return r,remote,current
+
+
+def test_multipart_real_gcm_roundtrip_and_receipt_noop(monkeypatch,tmp_path):
+    r,remote,current=multipart_release(monkeypatch,tmp_path)
+    r.publish_current(tmp_path/'source',key=b'x'*32,token='fake-github-token')
+    names=[a['name'] for a in remote.release['assets']]
+    assert r.ASSET not in names and r.INDEX_ASSET in names and len(names)>3
+    restored=r.pull_latest(tmp_path/'restored',key=b'x'*32)
+    assert restored['manifest']['sha256']==current['sha256'] and restored['downloaded']
+    count=len(remote.gets)
+    assert r.pull_latest(tmp_path/'restored',key=b'x'*32)['downloaded'] is False and len(remote.gets)==count
+
+
+def test_multipart_failed_draft_is_replaced_before_publish(monkeypatch,tmp_path):
+    r,remote,_=multipart_release(monkeypatch,tmp_path);remote.fail_upload=2
+    with pytest.raises(RuntimeError,match='interrupted'):r.publish_current(tmp_path/'source',key=b'x'*32,token='fake-github-token')
+    assert remote.release['draft'] and not remote.published and len(remote.release['assets'])==1
+    remote.fail_upload=None
+    assert r.publish_current(tmp_path/'source',key=b'x'*32,token='fake-github-token')['unchanged'] is False
+    names=[a['name'] for a in remote.release['assets']]
+    assert len(names)==len(set(names)) and remote.published
+    assert r.pull_latest(tmp_path/'restored',key=b'x'*32)['downloaded']
+
+
+@pytest.mark.parametrize('mutation',['index','part','missing','duplicate','order','name','fork','rollback'])
+def test_multipart_rejects_invalid_release_before_decrypt_or_current_change(monkeypatch,tmp_path,mutation):
+    import copy
+    from test_transport_parts import resign
+    r,remote,_=multipart_release(monkeypatch,tmp_path);r.publish_current(tmp_path/'source',key=b'x'*32,token='fake-github-token')
+    parts=[a for a in remote.release['assets'] if a['name']!=r.INDEX_ASSET]
+    if mutation=='index':
+        value=json.loads(remote.blobs[r.INDEX_ASSET]);value['total_size']+=1;remote.blobs[r.INDEX_ASSET]=json.dumps(value).encode()
+    elif mutation=='part':
+        p=parts[-1];remote.blobs[p['name']]=b'z'*p['size']
+    elif mutation=='missing':remote.release['assets'].remove(parts[-1])
+    elif mutation=='duplicate':remote.release['assets'].append(copy.deepcopy(parts[0]))
+    elif mutation=='order':
+        value=json.loads(remote.blobs[r.INDEX_ASSET]);value['parts'].reverse();remote.blobs[r.INDEX_ASSET]=json.dumps(resign(value)).encode()
+    elif mutation=='name':parts[0]['name']='../outside'
+    elif mutation=='fork':monkeypatch.setattr(r,'resolve_current',lambda *args,**kwargs:{'sequence':1,'sha256':'c'*64})
+    elif mutation=='rollback':monkeypatch.setattr(r,'resolve_current',lambda *args,**kwargs:{'sequence':2,'sha256':'c'*64})
+    for asset in remote.release['assets']:
+        if asset['name'] in remote.blobs:asset['size']=len(remote.blobs[asset['name']])
+    def forbidden(*args,**kwargs):raise AssertionError('unverified multipart container reached decrypt')
+    monkeypatch.setattr(r,'decrypt_checkpoint',forbidden)
+    target=tmp_path/'rejected'
+    with pytest.raises(ValueError):r.pull_latest(target,key=b'x'*32)
+    assert not (target/'current.json').exists()
+    if mutation in ('index','order','fork','rollback'):assert len(remote.gets)==1
+
+
+def test_v1_single_roundtrip_remains_supported_and_downloads_without_secrets(monkeypatch,tmp_path):
+    from test_cloud_data import checkpoint
+    current=checkpoint(tmp_path);remote=Github();r=install_github(monkeypatch,remote)
+    r.publish_current(tmp_path/'source',key=b'x'*32,token='fake-github-token')
+    assert [a['name'] for a in remote.release['assets']]==[r.ASSET]
+    assert r.pull_latest(tmp_path/'legacy',key=b'x'*32)['manifest']['sha256']==current['sha256']
+
+
+@pytest.mark.parametrize('asset',[None,{'name':[]},{'name':'unrelated-file','id':1,'size':2,'browser_download_url':'https://github.com/do0405/price-lab-data/releases/download/x/unrelated-file'}])
+def test_malformed_asset_metadata_is_rejected_without_download(monkeypatch,tmp_path,asset):
+    from price_lab import release_transport as r
+    monkeypatch.setattr(r,'latest_release',lambda:{'assets':[asset],'draft':False})
+    def forbidden(*args,**kwargs):raise AssertionError('invalid metadata reached network')
+    monkeypatch.setattr(r.requests,'get',forbidden)
+    with pytest.raises(ValueError):r.pull_latest(tmp_path,key=b'x'*32)
+
+
+def test_release_asset_listing_order_is_independent_of_authenticated_part_order(monkeypatch,tmp_path):
+    r,remote,_=multipart_release(monkeypatch,tmp_path);r.publish_current(tmp_path/'source',key=b'x'*32,token='fake-github-token')
+    remote.release['assets'].reverse()
+    assert r.pull_latest(tmp_path/'restored',key=b'x'*32)['downloaded']
