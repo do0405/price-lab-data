@@ -127,6 +127,62 @@ def parse_ksd_action(record):
             'price_factor':after/before if before>0 and after>0 else None,'share_factor':before/after if before>0 and after>0 else None,'raw':record}
 
 
+def reconcile_ksd_actions(face_records,capital_records):
+    """Original share-unit equation, with components deduplicated economically.
+
+    Relisting dates are observations awaiting independent KRX confirmation.
+    Capital allocation rates are already multipliers, never percentages.
+    """
+    groups={};listings={}
+    for r in [*face_records,*capital_records]:
+        key=(str(r.get('sht_cd','')).zfill(6),str(r.get('record_date','')))
+        listing=''.join(c for c in str(r.get('list_dt','')) if c.isdigit())
+        if len(listing)==8:listings.setdefault(key,set()).add(listing)
+    for kind,records in [('face',face_records),('capital',capital_records)]:
+        for record in records:
+            symbol=str(record.get('sht_cd','')).zfill(6);record_date=str(record.get('record_date',''))
+            if len(record_date)!=8 or not record_date.isdigit():raise ProviderError('KSD record date invalid')
+            _day(pd.to_datetime(record_date,format='%Y%m%d'))
+            listing=''.join(c for c in str(record.get('list_dt','')) if c.isdigit())
+            known=listings.get((symbol,record_date),set())
+            if len(listing)!=8:listing=next(iter(known)) if len(known)==1 else None
+            effective=_day(pd.to_datetime(listing,format='%Y%m%d')) if listing else None
+            group=groups.setdefault((symbol,effective or 'record:'+record_date),{'face':[],'capital':[]})
+            if record not in group[kind]:group[kind].append(record)
+    result=[]
+    for (symbol,label),raw in sorted(groups.items()):
+        face=survival=1.;valid=True
+        seen=set()
+        for r in raw['face']:
+            try:
+                before,after=_number(r.get('inter_bf_face_amt')),_number(r.get('inter_af_face_amt'))
+                key=(before,after)
+                if key in seen:continue
+                seen.add(key)
+                if before<=0 or after<=0:valid=False
+                else:face*=after/before
+            except ProviderError:valid=False
+        seen=set()
+        for r in raw['capital']:
+            try:
+                rate=_number(r.get('reduce_cap_rate'));way=str(r.get('comp_way','')).strip();key=(way,rate)
+                if key in seen:continue
+                seen.add(key)
+                if rate<=0 or way not in ('곱하기','나누기'):valid=False
+                else:survival*=rate if way=='곱하기' else 1/rate
+            except ProviderError:valid=False
+        records=raw['face']+raw['capital'];dates=sorted({str(r['record_date']) for r in records})
+        halts={r.get('td_stop_dt') for r in records if r.get('td_stop_dt')}
+        if len(halts)==1:raw['td_stop_dt']=next(iter(halts))
+        factor=face/survival if valid and math.isfinite(face) and math.isfinite(survival) and face>0 and survival>0 else None
+        if factor is not None and (not math.isfinite(factor) or factor<=0 or not math.isfinite(1/factor)):factor=None
+        result.append(dict(provider='kis_ksd',event_id=f'{symbol}:{dates[0]}',revision=_revision(raw),market='kr',symbol=symbol,
+            record_date=_day(pd.to_datetime(dates[0],format='%Y%m%d')),effective_date=None if label.startswith('record:') else label,
+            kind='unknown' if factor is None else 'no_change' if factor==1 else 'split',confirmed=False,
+            price_factor=factor,share_factor=1/factor if factor else None,raw=raw))
+    return result
+
+
 class AlpacaProvider:
     def __init__(self,key=None,secret=None,client=None,feed='sip',trading_base='https://paper-api.alpaca.markets'):
         self._key=key if key is not None else os.environ.get('ALPACA_API_KEY')
@@ -141,7 +197,10 @@ class AlpacaProvider:
         values=self.client.request_json('GET',self.trading_base+'/v2/assets',headers=self._headers(),params={'status':'active','asset_class':'us_equity' if market=='us' else 'crypto'})
         if not isinstance(values,list) or not values:raise ProviderError('Alpaca empty active asset response')
         allowed={'NYSE','NASDAQ','AMEX','ARCA','NYSE_ARCA','BATS'}
-        rows=[{'market':market,'symbol':r['symbol'],'name':r.get('name') or r['symbol'],'exchange':r.get('exchange') or 'CRYPTO'} for r in values
+        observed=datetime.now(timezone.utc).isoformat()
+        rows=[{'market':market,'symbol':r['symbol'],'name':r.get('name') or r['symbol'],'exchange':r.get('exchange') or 'CRYPTO',
+               'provider_asset_id':r.get('id'),'provider_asset_class':r.get('class'),'active_at_collection':r.get('status')=='active',
+               'broker_tradable':r.get('tradable'),'universe_source':'alpaca_active_assets','observed_at':observed} for r in values
               if r.get('status')=='active' and (market=='crypto' or r.get('exchange') in allowed)]
         if not rows:raise ProviderError('Alpaca supported universe empty')
         frame=pd.DataFrame(rows);self._asset_cache[market]=frame
@@ -158,14 +217,15 @@ class AlpacaProvider:
             if not isinstance(token,str) or token in seen:raise ProviderError('Repeated or invalid page token')
             seen.add(token)
         raise ProviderError('Alpaca page limit exceeded')
-    def fetch_bars(self,market,symbols,sessions,*,batch_size=100):
+    def fetch_bars(self,market,symbols,sessions,*,batch_size=100,adjustment='raw'):
         if market not in ('us','crypto') or not sessions:raise ProviderError('Invalid Alpaca bar request')
+        if adjustment not in ('raw','split') or (market=='crypto' and adjustment!='raw'):raise ValueError('Unsupported Alpaca adjustment')
         if isinstance(batch_size,bool) or not isinstance(batch_size,int) or not 1<=batch_size<=500:raise ProviderError('Invalid Alpaca symbol batch size')
         wanted=set(pd.DatetimeIndex(sessions).normalize());rows=[]
         for offset in range(0,len(symbols),batch_size):
             chunk=list(symbols[offset:offset+batch_size]);params={'symbols':','.join(chunk),'timeframe':'1Day','start':_day(min(wanted)),
                 'end':_day(max(wanted)+pd.Timedelta(days=1))+'T00:00:00Z','limit':10000,'sort':'asc'}
-            if market=='us':params.update(feed=self.feed,adjustment='raw')
+            if market=='us':params.update(feed=self.feed,adjustment=adjustment)
             path='/v2/stocks/bars' if market=='us' else '/v1beta3/crypto/us/bars'
             for page in self._pages(path,params,'bars'):
                 if not isinstance(page,dict):raise ProviderError('Alpaca bars shape invalid')
@@ -176,12 +236,16 @@ class AlpacaProvider:
                         if stamp.tzinfo is None:raise ProviderError('Alpaca timestamp requires timezone')
                         date=stamp.tz_convert('America/New_York' if market=='us' else 'UTC').tz_localize(None).normalize()
                         if date not in wanted:continue
-                        volume=_number(record['v']);vwap=_number(record['vw'])
+                        volume=_number(record['v']);vwap=_number(record['vw']) if record.get('vw') is not None else None
+                        if volume>0 and vwap is None:raise ProviderError('Alpaca positive-volume VWAP missing')
                         rows.append(dict(market=market,symbol=symbol,session_date=date,**{k:_number(record[v]) for k,v in [('open','o'),('high','h'),('low','l'),('close','c')]},
-                                         volume=volume,turnover=volume*vwap,vwap=vwap,currency='USD' if market=='us' else symbol.rsplit('/',1)[-1],source='alpaca',turnover_method='provider_vwap_times_volume'))
+                                         volume=volume,turnover=volume*vwap if vwap is not None else 0.,vwap=vwap,currency='USD' if market=='us' else symbol.rsplit('/',1)[-1],source='alpaca',
+                                         trade_count=record.get('n'),feed=self.feed if market=='us' else 'us',turnover_method='provider_vwap_times_volume',vwap_method='provider',
+                                         retrieved_at=datetime.now(timezone.utc).isoformat(),is_tradable_bar=bool(volume>0 and all(_number(record[c])>0 for c in ('o','h','l','c')))))
         frame=pd.DataFrame(rows)
         if frame.empty:raise ProviderError('Alpaca empty completed-session bars')
         if frame.duplicated(['symbol','session_date']).any():raise ProviderError('Duplicate Alpaca bar key')
+        frame['trade_count']=pd.array(frame.trade_count,dtype='Int64')
         return frame
     def fetch_actions(self,start,end):
         result=[]
@@ -207,9 +271,11 @@ class KrxProvider:
                 symbol=str(record['ISU_CD']).zfill(6)
                 values={k:_number(record[v]) for k,v in [('open','TDD_OPNPRC'),('high','TDD_HGPRC'),('low','TDD_LWPRC'),('close','TDD_CLSPRC'),('volume','ACC_TRDVOL'),('turnover','ACC_TRDVAL')]}
                 # Suspended zero-price rows stay raw and are quarantined by ingestion.
-                rows.append(dict(market='kr',symbol=symbol,session_date=label,**values,vwap=values['turnover']/values['volume'] if values['volume'] else values['close'],currency='KRW',source='krx',
-                                 reference_previous_close=values['close']-_number(record.get('CMPPREVDD_PRC',0)),turnover_method='exact_krx_ACC_TRDVAL'))
-                assets.append(dict(market='kr',symbol=symbol,name=record.get('ISU_NM',symbol),exchange=board))
+                observed=datetime.now(timezone.utc).isoformat()
+                rows.append(dict(market='kr',symbol=symbol,session_date=label,**values,vwap=values['turnover']/values['volume'] if values['volume'] else None,currency='KRW',source='krx',
+                                 reference_previous_close=values['close']-_number(record.get('CMPPREVDD_PRC',0)),turnover_method='exact_krx_ACC_TRDVAL',vwap_method='turnover_div_volume',
+                                 exchange=board,retrieved_at=observed,is_tradable_bar=bool(values['volume']>0 and all(values[c]>0 for c in ('open','high','low','close')))))
+                assets.append(dict(market='kr',symbol=symbol,name=record.get('ISU_NM',symbol),exchange=board,universe_source='krx_daily_board',observed_at=observed))
         frame=pd.DataFrame(rows)
         if frame.duplicated(['symbol','session_date']).any():raise ProviderError('Duplicate KRX board key')
         return frame,pd.DataFrame(assets)
@@ -251,8 +317,14 @@ class KisProvider:
             self._calendar.update(received)
         return {day:self._calendar[day] for day in wanted}
     def fetch_benchmarks(self,sessions):
+        frame=self.fetch_stock_bars(BENCHMARKS['kr'],sessions)
+        if not frame.empty:frame['source']='kis_etf_raw';frame['is_supplement']=True
+        return frame
+    def fetch_stock_bars(self,symbols,sessions):
+        """Bounded raw KIS stock chart crosschecks, never adjusted by default."""
+        if not sessions:return pd.DataFrame()
         rows=[];wanted=set(pd.DatetimeIndex(sessions).normalize())
-        for symbol in BENCHMARKS['kr']:
+        for symbol in symbols:
             # The chart endpoint returns at most100 rows: bounded90-calendar-day windows.
             start=min(wanted);last=max(wanted)
             while start<=last:
@@ -260,31 +332,44 @@ class KisProvider:
                 response=self._get('/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice','FHKST03010100',{'FID_COND_MRKT_DIV_CODE':'J','FID_INPUT_ISCD':symbol,'FID_INPUT_DATE_1':start.strftime('%Y%m%d'),'FID_INPUT_DATE_2':end.strftime('%Y%m%d'),'FID_PERIOD_DIV_CODE':'D','FID_ORG_ADJ_PRC':'1'})
                 records=response.get('output2')
                 if not isinstance(records,list) or not records:raise ProviderError('KIS empty benchmark chart')
+                if len(records)>=100:raise ProviderError('KIS raw chart may be truncated')
                 for r in records:
                     day=pd.to_datetime(r.get('stck_bsop_date'),format='%Y%m%d',errors='raise')
-                    if day not in wanted or not start<=day<=end:continue
+                    if not start<=day<=end:raise ProviderError('KIS raw chart date outside request')
+                    if day not in wanted:continue
                     values={k:_number(r[v]) for k,v in [('open','stck_oprc'),('high','stck_hgpr'),('low','stck_lwpr'),('close','stck_clpr'),('volume','acml_vol'),('turnover','acml_tr_pbmn')]}
-                    rows.append(dict(market='kr',symbol=symbol,session_date=day,**values,vwap=values['turnover']/values['volume'] if values['volume'] else values['close'],currency='KRW',source='kis_etf_raw',is_supplement=True))
+                    rows.append(dict(market='kr',symbol=symbol,session_date=day,**values,vwap=values['turnover']/values['volume'] if values['volume'] else None,currency='KRW',source='kis_stock_raw',
+                        turnover_method='exact_kis_acml_tr_pbmn',vwap_method='turnover_div_volume',retrieved_at=datetime.now(timezone.utc).isoformat(),
+                        is_tradable_bar=bool(values['volume']>0 and all(values[c]>0 for c in ('open','high','low','close')))))
                 start=end+pd.Timedelta(days=1)
-        return pd.DataFrame(rows)
-    def fetch_actions(self,start,end):
-        first,last=pd.Timestamp(start),pd.Timestamp(end)
+        frame=pd.DataFrame(rows)
+        if not frame.empty and frame.duplicated(['symbol','session_date']).any():raise ProviderError('Duplicate KIS raw chart key')
+        return frame
+    def _fetch_ksd_records(self,start,end,path,tr_id,extra=None):
+        first,last=pd.Timestamp(start).normalize(),pd.Timestamp(end).normalize()
+        if first.tzinfo is not None or last.tzinfo is not None:raise ProviderError('KSD date boundary invalid')
         def interval(a,b):
-            value=self._get('/uapi/domestic-stock/v1/ksdinfo/rev-split','HHKDB669105C0',{'SHT_CD':'','CTS':'','F_DT':a.strftime('%Y%m%d'),'T_DT':b.strftime('%Y%m%d'),'MARKET_GB':'0'})
+            value=self._get(path,tr_id,{'SHT_CD':'','CTS':'','F_DT':a.strftime('%Y%m%d'),'T_DT':b.strftime('%Y%m%d'),**(extra or {})})
             records=value.get('output1')
             if isinstance(records,dict):records=[records] if records else []
             if not isinstance(records,list):raise ProviderError('KSD actions shape invalid')
             for r in records:
                 if not a.strftime('%Y%m%d')<=str(r.get('record_date',''))<=b.strftime('%Y%m%d'):raise ProviderError('KSD date boundary mismatch')
-            if len(records)>=100:
+            if len(records)>=100 or value.get('tr_cont')=='M' or value.get('cts'):
                 if a==b:raise ProviderError('KSD single day truncated')
-                middle=a+(b-a)//2
+                middle=a+pd.Timedelta(days=(b-a).days//2)
                 return interval(a,middle)+interval(middle+pd.Timedelta(days=1),b)
             return records
         actions=[]
         while first<=last:
-            end=min(last,first+pd.offsets.MonthEnd(0));actions.extend(parse_ksd_action(r) for r in interval(first,end));first=end+pd.Timedelta(days=1)
+            end=min(last,first+pd.offsets.MonthEnd(0));actions.extend(interval(first,end));first=end+pd.Timedelta(days=1)
         return actions
+    def fetch_capital_actions(self,start,end):
+        """Return original cap-dcrs records for persisted enrichment evidence."""
+        return self._fetch_ksd_records(start,end,'/uapi/domestic-stock/v1/ksdinfo/cap-dcrs','HHKDB669106C0')
+    def fetch_actions(self,start,end):
+        face=self._fetch_ksd_records(start,end,'/uapi/domestic-stock/v1/ksdinfo/rev-split','HHKDB669105C0',{'MARKET_GB':'0'})
+        return reconcile_ksd_actions(face,self.fetch_capital_actions(start,end))
 
 
 class Providers:
@@ -327,7 +412,7 @@ class Providers:
         if not sessions:raise ProviderError('No completed sessions requested')
         action_start=pd.Timestamp(action_start if action_start is not None else min(sessions)).normalize()
         if action_start.tzinfo is not None or action_start>min(sessions):raise ProviderError('Invalid corporate action collection boundary')
-        actions=[];universe=assets[['market','symbol','name','exchange']].copy()
+        actions=[];universe=assets.copy()
         if market in ('us','crypto'):
             active=self.alpaca.fetch_assets(market)
             universe=pd.concat([universe,active],ignore_index=True).drop_duplicates(['market','symbol'],keep='last')
@@ -342,5 +427,8 @@ class Providers:
             universe=pd.concat([universe,*universes],ignore_index=True).drop_duplicates(['market','symbol'],keep='last')
             actions=self.kis.fetch_actions(action_start,max(sessions))
         else:raise ProviderError('Unknown provider market')
-        return MarketBatch(market,bars,universe,actions,list(sessions),{'actions_complete':True,'benchmarks_complete':True,
-            'turnover':'KR exact provider value; US/crypto provider VWAP*volume','kr_actions':'KSD nominal changes require relisting/reference confirmation'})
+        batch=MarketBatch(market,bars,universe,actions,list(sessions),{'actions_complete':True,'benchmarks_complete':True,
+            'turnover':'KR exact provider value; US/crypto provider VWAP*volume','kr_actions':'KSD nominal/capital changes require relisting/reference confirmation'})
+        from .price_validation_collect import collect_observations
+        batch.provenance['validation_observations']=collect_observations(self,batch)
+        return batch

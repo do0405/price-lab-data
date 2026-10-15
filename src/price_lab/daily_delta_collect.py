@@ -15,6 +15,7 @@ import pandas as pd
 from .daily_delta_codec import (ASSET_COLUMNS,MARKETS,RAW_COLUMNS,MAX_RAW_BYTES,
                                _bootstrap_body,_canonical,_json_tree,package_digest,validate_payload)
 from .providers import BENCHMARKS,MarketBatch,completed_sessions
+from .price_contract import BAR_METADATA,ASSET_METADATA,metadata_columns,normalize_frame_metadata
 
 
 def _native(value):
@@ -39,13 +40,13 @@ def _days(values):
 
 def _asset_records(frame):
     if not isinstance(frame,pd.DataFrame) or not set(ASSET_COLUMNS)<=set(frame):raise ValueError('Incomplete asset observations')
-    return _native(frame.drop_duplicates(['market','symbol'],keep='last')[list(ASSET_COLUMNS)].to_dict('records'))
+    return _native(frame.drop_duplicates(['market','symbol'],keep='last')[metadata_columns(frame,ASSET_COLUMNS,ASSET_METADATA)].to_dict('records'))
 
 
 def _part(batch,market,days,action_start):
     if not isinstance(batch,MarketBatch) or batch.market!=market or _days(batch.completed_sessions)!=days:raise ValueError('Incomplete required market session coverage')
     if batch.provenance.get('actions_complete') is not True or batch.provenance.get('benchmarks_complete') is not True:raise ValueError('Incomplete required actions/benchmarks')
-    frame=batch.bars.copy()
+    frame=normalize_frame_metadata(batch.bars,BAR_METADATA)
     required=set(RAW_COLUMNS)-{'source','reference_previous_close'}
     if frame.empty or not required<=set(frame):raise ValueError('Incomplete raw bars')
     labels=[]
@@ -65,7 +66,7 @@ def _part(batch,market,days,action_start):
             raise ValueError('Invalid required benchmark OHLC')
     if 'source' not in frame:frame['source']='provider'
     if 'reference_previous_close' not in frame:frame['reference_previous_close']=None
-    rows=_native(frame[list(RAW_COLUMNS)].to_dict('records'))
+    rows=_native(frame[metadata_columns(frame,RAW_COLUMNS,BAR_METADATA)].to_dict('records'))
     supplements=frame.is_supplement.tolist() if 'is_supplement' in frame else [None]*len(rows)
     for row,supplementary in zip(rows,supplements):
         if supplementary is not None and not pd.isna(supplementary):
@@ -146,13 +147,15 @@ def collect_delta(providers,prior_payload=None,bootstrap=None,now=None,
             for days in _chunks(wanted,all_days):
                 position=positions[days[0]]
                 action_start=all_days[position-1]+pd.Timedelta(days=1) if position else days[0]
-                assets=pd.DataFrame([a for (m,_),a in universe.items() if m==market],columns=ASSET_COLUMNS)
+                assets=pd.DataFrame([a for (m,_),a in universe.items() if m==market])
                 batch=providers.fetch_market_part(market,list(days),assets,audit=audit,action_start=action_start)
                 part=_part(batch,market,days,action_start)
                 payload_bytes+=len(_canonical(part))
                 if payload_bytes>MAX_RAW_BYTES:raise ValueError('Package raw size limit exceeded')
                 parts.append(part)
-                for asset in part['assets']:universe[(asset['market'],asset['symbol'])]=asset
+                for asset in part['assets']:
+                    key=(asset['market'],asset['symbol'])
+                    universe[key]={**universe.get(key,{}),**{k:v for k,v in asset.items() if v is not None}}
             state['sessions'][market]=[str(d.date()) for d in all_days]
             state['watermarks'][market]=state['sessions'][market][-1]
     except Exception:

@@ -23,6 +23,7 @@ import tempfile
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from .price_contract import BAR_METADATA,ASSET_METADATA,validate_metadata
 
 MAGIC=b'PLDELTA1'
 MAX_HEADER_BYTES=4096
@@ -105,7 +106,8 @@ def _assets(values):
     if not isinstance(values,list):raise ValueError('Asset records required')
     seen=set()
     for row in values:
-        _fields(row,ASSET_COLUMNS)
+        _fields(row,ASSET_COLUMNS,ASSET_METADATA)
+        validate_metadata(row,ASSET_METADATA)
         if row['market'] not in MARKETS or not isinstance(row['symbol'],str) or not row['symbol'] or len(row['symbol'])>128:raise ValueError('Invalid asset identity')
         if any(row[k] is not None and not isinstance(row[k],str) for k in ('name','exchange')):raise ValueError('Invalid asset metadata')
         key=(row['market'],row['symbol'])
@@ -155,7 +157,8 @@ def validate_payload(payload):
         if not isinstance(part['bars'],list) or not isinstance(part['actions'],list) or not isinstance(part['provenance'],dict):raise ValueError('Invalid part records')
         covered=set()
         for row in part['bars']:
-            _fields(row,RAW_COLUMNS,('is_supplement',))
+            _fields(row,RAW_COLUMNS,('is_supplement',*BAR_METADATA))
+            validate_metadata(row,BAR_METADATA)
             if row['market']!=market or row['session_date'] not in days or not isinstance(row['symbol'],str) or not row['symbol']:raise ValueError('Bar identity/session mismatch')
             key=(market,row['symbol'],row['session_date'])
             if key in seen_rows:raise ValueError('Duplicate bar identity')
