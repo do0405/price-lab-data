@@ -1,0 +1,7 @@
+duckdb==1.5.3
+numpy==2.1.3
+pandas==2.3.3
+requests==2.34.2
+exchange-calendars==4.13.2
+cryptography==50.0.2
+pytest==8.4.2

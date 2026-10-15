@@ -1,0 +1,11 @@
+data/
+results/
+work/
+__pycache__/
+*.pyc
+.env
+.env.*
+*.dpapi
+*.duckdb
+*.wal
+*.pldata
