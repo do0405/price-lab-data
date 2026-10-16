@@ -29,13 +29,42 @@ def test_quota_is_durable_idempotent_and_does_not_reset_on_restart(monkeypatch):
     assert a['status']=='GRANTED'
     assert quota.reserve_requests({'krx':80},reservation_id='job1-0',initial=initial,now=now,key=key)['status']=='GRANTED'
     b=quota.reserve_requests({'krx':30},reservation_id='job2-0',initial=initial,now=now,key=key)
-    assert b['status']=='WAITING_QUOTA'
+    assert b['status']=='GRANTED'
+    assert b['quota_floor']['used']['krx']==8010
     with pytest.raises(ValueError):quota.reserve_requests({'krx':70},reservation_id='job1-0',initial=initial,now=now,key=key)
 
 
 def test_missing_quota_after_stream_initialization_is_not_reset(monkeypatch):
     monkeypatch.setattr(quota,'_api',lambda *a,**k:(_ for _ in ()).throw(RuntimeError('HTTP 404')))
     with pytest.raises(ValueError):quota.reserve_requests({'kind':1},reservation_id='later',initial=None,key=b'x'*32)
+
+
+def test_continuous_accounting_bounds_recent_retry_ids_without_erasing_totals(monkeypatch):
+    from price_lab.research_delta_codec import sign_control, _canonical, _loads, verify_control
+    key=b'x'*32
+    entries={f'old-{i:04d}':{'krx':0,'kis':0,'kind':1} for i in range(1100)}
+    body=dict(version='research-quota-v1',quota_day='2026-10-16',reserved={'krx':0,'kis':0,'kind':1100},
+        reservations=entries,next_retry_at=None,revision=1100)
+    stored={'sha':'old','content':base64.b64encode(_canonical(sign_control(body,key))).decode()}
+    def api(method,path,**kwargs):
+        if method=='GET':return dict(stored)
+        stored.update(sha='new',content=kwargs['payload']['content'])
+        return {}
+    monkeypatch.setattr(quota,'_api',api)
+    options=dict(reservation_id='current-uncertain-write',now=datetime(2026,10,16,2,tzinfo=timezone.utc),key=key)
+    first=quota.reserve_requests({'kind':1},**options)
+    journal=verify_control(_loads(base64.b64decode(stored['content'])),key)
+    assert len(journal['reservations'])<=1024
+    assert journal['reserved']['kind']==1101
+    assert options['reservation_id'] in journal['reservations']
+    assert len(stored['content'])<512*1024
+    assert quota.reserve_requests({'kind':1},**options)['quota_floor']==first['quota_floor']
+    assert 'old-0000' not in journal['reservations']
+    replay=quota.reserve_requests({'kind':1},**{**options,'reservation_id':'old-0000'})
+    assert replay['quota_floor']['used']['kind']==1102
+    latest=verify_control(_loads(base64.b64decode(stored['content'])),key)
+    assert latest['reservation_order'][-2:]==['current-uncertain-write','old-0000']
+    assert len(latest['reservations'])==1024
 
 
 def release(seq,digest,previous=None):

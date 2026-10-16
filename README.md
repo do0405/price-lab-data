@@ -37,9 +37,11 @@ Existing full-checkpoint Releases belong to the retired transport and are remove
 
 `reference-evidence.yml` continues bounded raw-source batches automatically. It uses the same existing Actions Secrets, an independent authenticated encrypted research delta stream, and a small HMAC/CAS request reservation journal. No DuckDB, database cache, full snapshot or backup is created in Actions. The encrypted bootstrap contains only portable acquisition tasks/control and source hashes.
 
-Each job runs at most seven minutes of production, publishing closed batches immediately and continuing the next batch. Eligible jobs request one successor; the ten-minute schedule is recovery, and GitHub schedules may be delayed. Actual-time price windows and shared queued concurrency protect the existing daily price jobs. KRX research requests are capped at 8,000/day to retain 2,000/day headroom. KIS/KIND caps and KST quota rollover are explicit operator policies. All HTTP sends, including OAuth, consume prior durable reservations; crashes never refund them.
+Each job runs at most seven minutes of production, publishing closed batches immediately and continuing the next batch. Eligible jobs request one successor; the ten-minute schedule is recovery, and GitHub schedules may be delayed. Actual-time price windows and shared queued concurrency protect the existing daily price jobs. The operator removed artificial daily request budgets on 2026-10-16. Collection continues while work remains, with per-provider spacing and persisted HTTP/Retry-After waits. All HTTP sends, including OAuth, retain prior durable accounting; crashes never erase request reservations. Bounded chunks limit memory and renew ownership, without imposing a daily collection allowance.
 
 The local application authenticates contiguous packages, retains immutable source bytes, validates references and unknown lifecycle observations, and atomically updates its managed local database. Raw acquisition does not approve security identity, adjustment ratios, actual settlement amounts or publication-time validity. Local baseline data remains required; the cloud stream is not a full restoration backup.
+
+Request totals remain durable. The journal retains the latest 1,024 request identities for immediate uncertain-write confirmation. Reusing an older evicted identity conservatively adds to accounting again; it never replays an HTTP request. Each actual source execution uses a fresh identity.
 
 ## Local-first historical acquisition
 

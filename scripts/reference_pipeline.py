@@ -20,15 +20,12 @@ def price_window(now):
 
 
 def continuation_ready(state,now):
-    from price_lab.research_quota import LIMITS,KST
     if price_window(now):return False
-    floor=state['discovery'].get('quota_floor',{})
-    today=now.astimezone(KST).date().isoformat()
-    used=floor.get('used',{}) if floor.get('quota_day')==today else {}
     for provider,tasks in state['pending'].items():
-        retry=state['cooldowns'].get(provider,{}).get('next_retry_at')
+        cooldown=state['cooldowns'].get(provider,{})
+        retry=cooldown.get('next_retry_at') if cooldown.get('reason')!='WAITING_QUOTA' else None
         if retry and datetime.fromisoformat(retry.replace('Z','+00:00'))>now:continue
-        if tasks and LIMITS[provider]-used.get(provider,0)>=(2 if provider=='kis' else 1):return True
+        if tasks:return True
     return False
 
 
@@ -61,6 +58,10 @@ def assert_database_free_runtime():
 
 def takeover_state(prior,owner,now):
     state=copy.deepcopy(prior['state'])
+    # The operator removed daily budgets. Only those obsolete waits are
+    # discarded; upstream HTTP and Retry-After controls remain authoritative.
+    for provider,value in list(state['cooldowns'].items()):
+        if value.get('reason')=='WAITING_QUOTA':state['cooldowns'].pop(provider)
     # A previous machine's plain connection failure is rechecked on this PC
     # after >=60s. Provider HTTP Retry-After and contract failures stay intact.
     observed=datetime.fromisoformat(prior['collected_at'].replace('Z','+00:00'))

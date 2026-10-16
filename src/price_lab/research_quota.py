@@ -1,4 +1,4 @@
-"""Small authenticated CAS request reservations; never a cloud database."""
+"""Authenticated CAS request accounting, without operator daily budgets."""
 import base64
 from datetime import datetime,timedelta,timezone
 import os
@@ -7,14 +7,15 @@ from .research_delta_codec import _canonical,_loads,_date,_instant,sign_control,
 
 PATH='/contents/.github/research-quota.json'
 PROVIDERS=('krx','kis','kind')
-# KRX leaves 2,000 of its 10,000/day quota to the existing daily pipeline.
-# KIS/KIND values are conservative operator policies, not published API limits.
-LIMITS={'krx':8000,'kis':6000,'kind':12000}
+# Integer validation is a wire bound, not a source request allowance. Provider
+# pacing and HTTP Retry-After are enforced by the source collector itself.
+_MAX_COUNT=2**63-1
+_RECENT_RESERVATIONS=1024
 KST=timezone(timedelta(hours=9))
 
 
 def _counts(value):
-    if not isinstance(value,dict) or set(value)-set(PROVIDERS) or any(type(v) is not int or not 0<=v<=LIMITS[k] for k,v in value.items()):raise ValueError('Invalid request reservation')
+    if not isinstance(value,dict) or set(value)-set(PROVIDERS) or any(type(v) is not int or not 0<=v<=_MAX_COUNT for v in value.values()):raise ValueError('Invalid request reservation')
     return {k:value.get(k,0) for k in PROVIDERS}
 
 
@@ -23,7 +24,6 @@ def reserve_requests(counts,*,reservation_id,initial=None,now=None,token=None,ke
     if not isinstance(reservation_id,str) or not 1<=len(reservation_id)<=160:raise ValueError('Invalid reservation identity')
     now=now or datetime.now(timezone.utc)
     now=_instant(now.isoformat() if isinstance(now,datetime) else now);today=now.astimezone(KST).date().isoformat()
-    retry=(datetime.combine(_date(today)+timedelta(days=1),datetime.min.time(),tzinfo=KST)).astimezone(timezone.utc).isoformat()
     for attempt in range(4):
         try:remote=_api('GET',PATH,token=token)
         except RuntimeError as exc:
@@ -43,7 +43,7 @@ def reserve_requests(counts,*,reservation_id,initial=None,now=None,token=None,ke
                     state['quota_day']==initial['quota_day'] and any(used[p]<floor[p] for p in PROVIDERS)):
                     raise ValueError('Authenticated quota regression')
             if state['quota_day']<today:
-                state={**state,'quota_day':today,'reserved':{p:0 for p in PROVIDERS},'reservations':{},'next_retry_at':None}
+                state={**state,'quota_day':today,'reserved':{p:0 for p in PROVIDERS},'reservations':{},'reservation_order':[],'next_retry_at':None}
         else:
             if not initial or initial.get('allow_initialize') is not True:raise ValueError('Missing initialized quota journal')
             history=_api('GET','/commits?path=.github%2Fresearch-quota.json&per_page=1',token=token)
@@ -59,10 +59,20 @@ def reserve_requests(counts,*,reservation_id,initial=None,now=None,token=None,ke
             return dict(status='GRANTED',reservation_id=reservation_id,ceilings=counts,quota_day=today,next_retry_at=None,quota_floor=floor)
         if state.get('next_retry_at') and _instant(state['next_retry_at'])>now:
             return dict(status='WAITING_RETRY',reservation_id=reservation_id,ceilings={},quota_day=today,next_retry_at=state['next_retry_at'],quota_floor=floor)
-        if any(state['reserved'][p]+counts[p]>LIMITS[p] for p in PROVIDERS):
-            return dict(status='WAITING_QUOTA',reservation_id=reservation_id,ceilings={},quota_day=today,next_retry_at=retry,quota_floor=floor)
+        if any(state['reserved'][p]+counts[p]>_MAX_COUNT for p in PROVIDERS):
+            raise ValueError('Request accounting overflow')
         state['reserved']={p:state['reserved'][p]+counts[p] for p in PROVIDERS}
+        # Accounting no longer gates sends. Bound recent uncertain-write
+        # identities without erasing totals. Old evicted IDs conservatively
+        # count again; callers use fresh UUIDs for every actual HTTP execution.
+        # Persist order explicitly because canonical JSON sorts object keys.
+        order=state.get('reservation_order',list(state['reservations']))
+        if (not isinstance(order,list) or any(not isinstance(rid,str) for rid in order)
+            or len(order)!=len(state['reservations']) or set(order)!=set(state['reservations'])):
+            raise ValueError('Invalid reservation ordering')
         state['reservations'][reservation_id]=counts;state['revision']+=1
+        state['reservation_order']=(order+[reservation_id])[-_RECENT_RESERVATIONS:]
+        state['reservations']={rid:state['reservations'][rid] for rid in state['reservation_order']}
         update=dict(message='Reserve bounded research requests',branch='main',
             content=base64.b64encode(_canonical(sign_control(state,key))).decode())
         if remote:update['sha']=remote['sha']

@@ -47,11 +47,12 @@ def test_continuation_requests_only_the_same_main_workflow_and_fails_safely(monk
     assert p.request_continuation()['status']=='WAITING_SCHEDULE_RECOVERY'
 
 
-def test_continuation_eligibility_respects_independent_quota_and_cooldown():
+def test_continuation_eligibility_respects_independent_provider_cooldown():
     p=script();now=datetime(2026,10,15,16,tzinfo=timezone.utc)
     state={'pending':{'krx':[{}],'kis':[],'kind':[]},'cooldowns':{},
         'discovery':{'quota_floor':{'quota_day':'2026-10-16','used':{'krx':8000,'kis':0,'kind':0}}}}
-    assert not p.continuation_ready(state,now)
+    assert p.continuation_ready(state,now)
+    state['cooldowns']['krx']={'next_retry_at':'2026-10-16T16:00:00Z'}
     state['pending']['kind']=[{}]
     assert p.continuation_ready(state,now)
     state['cooldowns']['kind']={'next_retry_at':'2026-10-16T16:00:00Z'}
