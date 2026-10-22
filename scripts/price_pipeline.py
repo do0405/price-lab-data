@@ -1,13 +1,64 @@
 """Cloud collector: publish encrypted daily additions/corrections only."""
 import argparse
 from datetime import datetime,timezone
+from functools import wraps
 import json
 import os
 from pathlib import Path
+import re
 import sys
+import time
+from urllib.parse import urlsplit
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'src'))
+
+class _TraceSession:
+    """Keep only safe request metadata; never log headers or response bodies."""
+    def __init__(self,session):self.session=session;self.last={}
+
+    def request(self,method,url,**kwargs):
+        self.last={'endpoint':urlsplit(url).path,'http_status':None}
+        response=self.session.request(method,url,**kwargs)
+        self.last['http_status']=response.status_code
+        # Large successful market-data responses need no extra JSON decoding.
+        if len(response.content)<=16384:
+            try:body=response.json()
+            except (ValueError,TypeError):body=None
+            if isinstance(body,dict):
+                for field in ('msg_cd','error_code'):
+                    code=body.get(field)
+                    if isinstance(code,str) and re.fullmatch(r'(?:EGW\d{5}|APBK\d{4}|OPSQ\d{4})',code):
+                        self.last['error_code']=code;break
+        return response
+
+
+def observe_provider(provider,name):
+    """Observe original calls without changing inputs, outputs or validation."""
+    from price_lab.providers import ProviderError
+    trace=_TraceSession(provider.client.session);provider.client.session=trace
+    class Observed:
+        def __getattr__(self,attribute):
+            value=getattr(provider,attribute)
+            if not callable(value) or attribute.startswith('_'):return value
+            @wraps(value)
+            def call(*args,**kwargs):
+                trace.last={}
+                try:return value(*args,**kwargs)
+                except ProviderError as exc:
+                    reason={
+                        'KRX empty or missing board response':'EMPTY_BOARD',
+                        'KIS empty benchmark chart':'EMPTY_CHART',
+                        'KIS unsuccessful response':'BUSINESS_ERROR',
+                        'KIS token unavailable':'TOKEN_MISSING',
+                        'Provider transport exhausted retries':'TRANSPORT_RETRIES_EXHAUSTED',
+                    }.get(str(exc),'PROVIDER_ERROR')
+                    print(json.dumps(dict(event='provider_call_failed',provider=name,
+                        operation=attribute,reason=reason,**trace.last)),flush=True)
+                    raise
+            return call
+    return Observed()
+
 
 def official_reference_fetch():
     from price_lab.providers import HttpClient
@@ -46,12 +97,23 @@ def run_pipeline(*,root=None,audit=False,publish_only=False,integration_only=Fal
     if providers is None:
         from price_lab.providers import Providers
         providers=Providers(raw_dir=None)
+        for name in ('alpaca','krx','kis'):
+            setattr(providers,name,observe_provider(getattr(providers,name),name))
     if reference_fetch is None:reference_fetch=official_reference_fetch()
     instant=now or datetime.now(timezone.utc)
     # Audit rechecks one bounded historical window, alongside recent overlap.
     audit=audit or instant.weekday()==6
-    payload=collect_delta(providers,prior_payload=prior,bootstrap=bootstrap,now=instant,
-        audit=audit,reference_fetch=reference_fetch)
+    for attempt in range(2):
+        try:
+            payload=collect_delta(providers,prior_payload=prior,bootstrap=bootstrap,now=instant,
+                audit=audit,reference_fetch=reference_fetch)
+            break
+        except ValueError as exc:
+            failure=re.fullmatch(r'Required market collection failed \(market=(us|kr|crypto|all); stage=(calendar|fetch); type=provider\)',str(exc))
+            if not failure or attempt:raise
+            print(json.dumps(dict(event='collection_retry',market=failure[1],stage=failure[2],
+                attempt=2,maximum_attempts=2,wait_seconds=65)),flush=True)
+            time.sleep(65)
     result=publish_package(payload,work_root=root,key=key)
     result.update(stage='daily_package',cloud_database=False,
         parts=len(payload['parts']),reference_errors=payload.get('reference_errors',[]))
