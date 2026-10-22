@@ -267,7 +267,7 @@ def test_cloud_publish_errors_other_than_exact_conflict_are_not_retried(monkeypa
 
 
 @pytest.mark.parametrize('reloaded',[None,{'sequence':6},{'sequence':5}])
-def test_cloud_publish_conflict_does_not_recollect_from_missing_or_stale_head(monkeypatch,tmp_path,reloaded):
+def test_cloud_publish_conflict_does_not_recollect_from_missing_stale_or_invalid_head(monkeypatch,tmp_path,capsys,reloaded):
     from price_lab import daily_delta_collect as c,daily_delta_transport as t
     heads=iter([{'sequence':6},reloaded]);selected=None;events=[]
     def discover():
@@ -282,6 +282,11 @@ def test_cloud_publish_conflict_does_not_recollect_from_missing_or_stale_head(mo
     with pytest.raises(ValueError,match='Daily log advanced'):
         pipeline_module().run_pipeline(root=tmp_path,providers=object(),reference_fetch=lambda *a:{})
     assert events==['discover','authenticate','collect','publish','discover']+(['authenticate'] if reloaded else [])
+    import json
+    records=[json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    reload=[record for record in records if record['event']=='publication_conflict_reload']
+    assert reload==[dict(event='publication_conflict_reload',previous_sequence=6,
+        latest_sequence=reloaded['sequence'] if reloaded else None,same_parent_digest_matches=False)]
 
 
 @pytest.mark.parametrize('failure_stage',['discover','authenticate'])
@@ -381,3 +386,75 @@ def test_cloud_conflict_recollection_refreshes_only_an_implicit_clock(monkeypatc
         assert provider.started==1 and clock_calls==[] and recorded==[] and len(published)==1
     assert published[0]['collected_at']==NOW.isoformat().replace('+00:00','Z')
     assert all(call[-1] is False for call in provider.calls)
+
+
+@pytest.mark.parametrize('scenario',['same_parent','different_parent','persistent_conflict'])
+def test_cloud_publish_conflict_retries_only_an_identical_authenticated_parent(monkeypatch,tmp_path,capsys,scenario):
+    import copy,json
+    from price_lab import daily_delta_collect as c,daily_delta_transport as t
+    from price_lab.daily_delta_codec import package_digest
+    from test_daily_delta_collect import NOW,Provider,bootstrap,calendar
+    calendar(monkeypatch)
+    original=c.collect_delta(Provider(),bootstrap=bootstrap(),now=NOW)
+    original['state']['assets'][0]['name']='PRIVATE'
+    reloaded=copy.deepcopy(original)
+    if scenario=='different_parent':reloaded['state']['assets'][0]['name']='PRIVATE changed'
+    heads=iter([original,reloaded]);selected=None;published=[];recorded=[];discoveries=[]
+    def discover():
+        nonlocal selected
+        discoveries.append(1);selected=next(heads);return {'id':selected['sequence']}
+    def publish(value,**kwargs):
+        published.append(value)
+        if len(published)==1 or scenario=='persistent_conflict':
+            error=ValueError('Daily log advanced; collect again from the authenticated latest state')
+            error.publication_conflict=dict(package_sequence=2,expected_parent_sequence=1,
+                discovered_head_sequence=None,predecessor_matches=False,unsafe='PRIVATE')
+            raise error
+        return {'sequence':value['sequence']}
+    monkeypatch.setattr(t,'newest_package',discover)
+    monkeypatch.setattr(t,'load_package',lambda *a,**k:selected)
+    monkeypatch.setattr(t,'publish_package',publish)
+    monkeypatch.setattr(t,'record_periodic_status',lambda value:recorded.append(value) or {})
+    provider=Provider();module=pipeline_module()
+    if scenario=='same_parent':
+        result=module.run_pipeline(root=tmp_path,providers=provider,reference_fetch=lambda *a:{},now=NOW)
+        assert result['sequence']==2 and recorded==[published[1]]
+        assert published[0] is not published[1] and published[0]==published[1]
+        assert published[1]['previous_package_sha256']==package_digest(original)
+    else:
+        with pytest.raises(ValueError,match='Daily log advanced'):
+            module.run_pipeline(root=tmp_path,providers=provider,reference_fetch=lambda *a:{},now=NOW)
+        assert recorded==[]
+    assert len(discoveries)==2 and provider.started==len(published)==(1 if scenario=='different_parent' else 2)
+    output=capsys.readouterr().out;records=[json.loads(line) for line in output.splitlines()]
+    conflicts=[record for record in records if record.get('event')=='publication_conflict']
+    assert len(conflicts)==(2 if scenario=='persistent_conflict' else 1)
+    assert conflicts[0]==dict(event='publication_conflict',attempt=1,maximum_attempts=2,
+        previous_sequence=1,payload_sequence=2,package_sequence=2,expected_parent_sequence=1,
+        discovered_head_sequence=None,predecessor_matches=False)
+    reload=[record for record in records if record.get('event')=='publication_conflict_reload']
+    assert reload==[dict(event='publication_conflict_reload',previous_sequence=1,latest_sequence=1,
+        same_parent_digest_matches=scenario!='different_parent')]
+    assert 'PRIVATE' not in output and package_digest(original) not in output
+
+
+def test_cloud_conflict_diagnostics_discard_wrong_types_and_private_fields(monkeypatch,tmp_path,capsys):
+    import json
+    from price_lab import daily_delta_collect as c,daily_delta_transport as t
+    heads=iter([{'sequence':6},None])
+    monkeypatch.setattr(t,'newest_package',lambda:next(heads))
+    monkeypatch.setattr(t,'load_package',lambda value,*a,**k:value)
+    monkeypatch.setattr(c,'collect_delta',lambda *a,**k:{'sequence':7,'parts':[]})
+    def publish(*a,**kwargs):
+        error=ValueError('Daily log advanced; collect again from the authenticated latest state')
+        error.publication_conflict=dict(package_sequence=True,expected_parent_sequence='PRIVATE',
+            discovered_head_sequence={'secret':'PRIVATE'},predecessor_matches=1,unsafe='PRIVATE')
+        raise error
+    monkeypatch.setattr(t,'publish_package',publish)
+    with pytest.raises(ValueError,match='Daily log advanced'):
+        pipeline_module().run_pipeline(root=tmp_path,providers=object(),reference_fetch=lambda *a:{})
+    output=capsys.readouterr().out;records=[json.loads(line) for line in output.splitlines()]
+    assert records
+    assert records[0]==dict(event='publication_conflict',attempt=1,maximum_attempts=2,
+        previous_sequence=6,payload_sequence=7)
+    assert 'PRIVATE' not in output

@@ -135,6 +135,31 @@ def test_stale_producer_is_rejected_before_encrypt_or_upload(monkeypatch,tmp_pat
         t.publish_package(payload(),key=b'x'*32,token='fake-token',work_root=tmp_path)
 
 
+@pytest.mark.parametrize('head_sequence,head_digest,predecessor_matches',[
+    (None,None,False),(17,'a'*64,True),(19,'b'*64,False),(18,'b'*64,False),
+])
+def test_daily_publication_conflict_exposes_only_safe_head_diagnostics(monkeypatch,tmp_path,
+        head_sequence,head_digest,predecessor_matches):
+    from price_lab import daily_delta_transport as t,daily_delta_codec as c
+    value={'sequence':19,'previous_package_sha256':'a'*64}
+    parent=metadata(head_sequence,head_digest,'e'*64) if head_sequence else None
+    def api(method,path,**kwargs):
+        assert method=='GET' and path.startswith('/releases/tags/')
+        raise RuntimeError('Daily package API failed: HTTP 404')
+    monkeypatch.setattr(t,'_api',api)
+    monkeypatch.setattr(t,'newest_package',lambda **kwargs:parent)
+    monkeypatch.setattr(c,'validate_payload',lambda value:value)
+    monkeypatch.setattr(c,'package_digest',lambda value:'c'*64)
+    monkeypatch.setattr(c,'seal_package',lambda *a,**k:pytest.fail('conflict encrypted/uploaded'))
+    with pytest.raises(ValueError) as failure:t.publish_package(value,work_root=tmp_path)
+    assert type(failure.value) is ValueError
+    assert str(failure.value)=='Daily log advanced; collect again from the authenticated latest state'
+    assert failure.value.publication_conflict==dict(package_sequence=19,expected_parent_sequence=18,
+        discovered_head_sequence=head_sequence,predecessor_matches=predecessor_matches)
+    assert set(json.loads(json.dumps(failure.value.publication_conflict)))=={
+        'package_sequence','expected_parent_sequence','discovered_head_sequence','predecessor_matches'}
+
+
 @pytest.mark.parametrize('kind',['gap','fork','same_position'])
 def test_missing_or_conflicting_log_entries_are_rejected(monkeypatch,kind):
     from price_lab import daily_delta_transport as t

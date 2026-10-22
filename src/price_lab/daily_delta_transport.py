@@ -246,7 +246,12 @@ def publish_package(payload,*,key=None,token=None,work_root=None):
     parent=package_metadata(latest) if latest else None
     if (payload['sequence']!=(parent['sequence']+1 if parent else 1) or
             payload.get('previous_package_sha256')!=(parent['package_sha256'] if parent else None)):
-        raise ValueError('Daily log advanced; collect again from the authenticated latest state')
+        conflict=ValueError('Daily log advanced; collect again from the authenticated latest state')
+        conflict.publication_conflict=dict(package_sequence=payload['sequence'],
+            expected_parent_sequence=payload['sequence']-1,
+            discovered_head_sequence=parent['sequence'] if parent else None,
+            predecessor_matches=payload.get('previous_package_sha256')==(parent['package_sha256'] if parent else None))
+        raise conflict
     Path(work_root or tempfile.gettempdir()).mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='daily-publish-',dir=work_root) as temporary:
         path=Path(temporary)/ASSET;sealed=seal_package(payload,path,key=key or os.environ.get('PRICE_DATA_KEY'))

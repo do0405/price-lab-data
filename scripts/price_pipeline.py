@@ -75,7 +75,7 @@ def official_reference_fetch():
 
 def run_pipeline(*,root=None,audit=False,publish_only=False,integration_only=False,
                  providers=None,reference_fetch=None,bootstrap_path=None,now=None):
-    from price_lab.daily_delta_codec import verify_bootstrap
+    from price_lab.daily_delta_codec import verify_bootstrap,package_digest
     from price_lab.daily_delta_collect import collect_delta
     from price_lab.daily_delta_transport import newest_package,load_package,publish_package,record_periodic_status
     root=Path(root or ROOT/'data'/'daily');root.mkdir(parents=True,exist_ok=True)
@@ -119,14 +119,33 @@ def run_pipeline(*,root=None,audit=False,publish_only=False,integration_only=Fal
             result=publish_package(payload,work_root=root,key=key)
             break
         except ValueError as exc:
-            if (str(exc)!='Daily log advanced; collect again from the authenticated latest state'
-                    or publication_attempt):raise
-            latest=newest_package()
-            if latest is None:raise
-            refreshed=load_package(latest,root,key=key)
+            if str(exc)!='Daily log advanced; collect again from the authenticated latest state':raise
             previous_sequence=prior['sequence'] if prior else 0
-            if refreshed['sequence']<=previous_sequence:raise
-            # The authenticated new state must drive a complete recollection.
+            diagnostic=dict(event='publication_conflict',attempt=publication_attempt+1,maximum_attempts=2,
+                previous_sequence=previous_sequence,payload_sequence=payload['sequence'])
+            details=getattr(exc,'publication_conflict',None)
+            if isinstance(details,dict):
+                for field in ('package_sequence','expected_parent_sequence','discovered_head_sequence'):
+                    value=details.get(field)
+                    if ((type(value) is int and value>=0) or
+                            (field=='discovered_head_sequence' and field in details and value is None)):
+                        diagnostic[field]=value
+                if type(details.get('predecessor_matches')) is bool:
+                    diagnostic['predecessor_matches']=details['predecessor_matches']
+            print(json.dumps(diagnostic),flush=True)
+            if publication_attempt:raise
+            latest=newest_package()
+            refreshed=load_package(latest,root,key=key) if latest else None
+            latest_sequence=refreshed['sequence'] if refreshed else None
+            same_parent=False
+            if refreshed is not None and latest_sequence==previous_sequence:
+                try:same_parent=package_digest(refreshed)==package_digest(prior)
+                except ValueError:pass
+            print(json.dumps(dict(event='publication_conflict_reload',previous_sequence=previous_sequence,
+                latest_sequence=latest_sequence,same_parent_digest_matches=same_parent)),flush=True)
+            if (refreshed is None or latest_sequence<previous_sequence or
+                    (latest_sequence==previous_sequence and not same_parent)):raise
+            # The authenticated current state must drive a complete recollection.
             # Never relabel the sequence or predecessor of the rejected payload.
             prior=refreshed
             if now is None:instant=datetime.now(timezone.utc)

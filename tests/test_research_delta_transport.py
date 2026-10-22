@@ -75,6 +75,31 @@ def release(seq,digest,previous=None):
         name=transport.ASSET,size=100,browser_download_url=f'https://github.com/{transport.REPOSITORY}/releases/download/{tag}/{transport.ASSET}')])
 
 
+@pytest.mark.parametrize('head_sequence,head_digest,predecessor_matches',[
+    (None,None,False),(17,'a'*64,True),(19,'b'*64,False),(18,'b'*64,False),
+])
+def test_research_publication_conflict_exposes_only_safe_head_diagnostics(monkeypatch,tmp_path,
+        head_sequence,head_digest,predecessor_matches):
+    from price_lab import research_delta_codec as codec
+    value={'sequence':19,'previous_package_sha256':'a'*64}
+    parent=release(head_sequence,head_digest,'e'*64) if head_sequence else None
+    def api(method,path,**kwargs):
+        assert method=='GET' and path.startswith('/releases/tags/')
+        raise RuntimeError('Research package API failed: HTTP 404')
+    monkeypatch.setattr(transport,'_api',api)
+    monkeypatch.setattr(transport,'newest_package',lambda **kwargs:parent)
+    monkeypatch.setattr(codec,'validate_payload',lambda value:value)
+    monkeypatch.setattr(codec,'package_digest',lambda value:'c'*64)
+    monkeypatch.setattr(codec,'seal_package',lambda *a,**k:pytest.fail('conflict encrypted/uploaded'))
+    with pytest.raises(ValueError) as failure:transport.publish_package(value,work_root=tmp_path)
+    assert type(failure.value) is ValueError
+    assert str(failure.value)=='Research log advanced; collect again from the authenticated latest state'
+    assert failure.value.publication_conflict==dict(package_sequence=19,expected_parent_sequence=18,
+        discovered_head_sequence=head_sequence,predecessor_matches=predecessor_matches)
+    assert set(json.loads(json.dumps(failure.value.publication_conflict)))=={
+        'package_sequence','expected_parent_sequence','discovered_head_sequence','predecessor_matches'}
+
+
 @pytest.mark.parametrize('rows,after,cursor',[
     ([release(1,'a'*64),release(3,'c'*64,'b'*64)],0,None),
     ([release(1,'a'*64),release(1,'b'*64)],0,None),
