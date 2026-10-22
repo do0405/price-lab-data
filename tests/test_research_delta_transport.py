@@ -93,6 +93,95 @@ def test_existing_daily_releases_are_ignored(monkeypatch):
     assert transport.list_packages()==[rows[1]]
 
 
+@pytest.mark.parametrize('discovery',['list','newest'])
+def test_transient_empty_research_listing_is_confirmed_before_rollback_or_bootstrap(monkeypatch,discovery):
+    first=release(1,'a'*64);second=release(2,'b'*64,'a'*64);calls=[]
+    def api(method,path,**kwargs):
+        calls.append(path)
+        if len(calls)==1:return []
+        if path.endswith('&page=1'):return [dict(tag_name='unrelated')]*100
+        return [second,first]
+    monkeypatch.setattr(transport,'_api',api)
+    if discovery=='list':
+        assert transport.list_packages(after_sequence=1,expected_cursor_hash='a'*64)==[second]
+    else:assert transport.newest_package()==second
+    assert calls==['/releases?per_page=100&page=1']*2+['/releases?per_page=100&page=2']
+
+
+@pytest.mark.parametrize('kind',['missing_cursor','gap'])
+def test_incomplete_research_listing_is_rechecked_without_combining_snapshots(monkeypatch,kind):
+    first=release(1,'a'*64);second=release(2,'b'*64,'a'*64);third=release(3,'c'*64,'b'*64)
+    calls=[]
+    def api(*args,**kwargs):
+        calls.append(1)
+        if len(calls)==1:return [third,first] if kind=='gap' else [third,second]
+        return [third,second,first]
+    monkeypatch.setattr(transport,'_api',api)
+    assert transport.list_packages(after_sequence=1,expected_cursor_hash='a'*64)==[second,third]
+    assert len(calls)==2
+
+
+def test_persistently_empty_research_log_rechecks_then_rejects_existing_cursor(monkeypatch):
+    calls=[]
+    monkeypatch.setattr(transport,'_api',lambda *a,**k:calls.append(1) or [])
+    with pytest.raises(ValueError,match='Research package catalog unavailable after repeated empty listings'):
+        transport.list_packages(after_sequence=1,expected_cursor_hash='a'*64)
+    assert len(calls)==3
+
+
+def test_research_confirmation_does_not_assemble_complementary_incomplete_snapshots(monkeypatch):
+    first=release(1,'a'*64);second=release(2,'b'*64,'a'*64);third=release(3,'c'*64,'b'*64);calls=[]
+    def api(*args,**kwargs):
+        calls.append(1)
+        return [third,first] if len(calls)==1 else [second]
+    monkeypatch.setattr(transport,'_api',api)
+    with pytest.raises(ValueError,match='sequence gap'):transport.list_packages()
+    assert len(calls)==3
+
+
+@pytest.mark.parametrize('after,blank_middle',[(0,False),(1,False),(1,True)])
+def test_research_confirmation_cannot_erase_observed_gap_with_empty_results(monkeypatch,after,blank_middle):
+    first=release(1,'a'*64);third=release(3,'c'*64,'b'*64);calls=[]
+    def api(*args,**kwargs):
+        calls.append(1)
+        if len(calls)==1:return [third,first]
+        if len(calls)==2 and blank_middle:return []
+        return [first] if after else []
+    monkeypatch.setattr(transport,'_api',api)
+    with pytest.raises(ValueError,match='Research package sequence gap'):
+        transport.list_packages(after_sequence=after,expected_cursor_hash='a'*64 if after else None)
+    assert len(calls)==3
+
+
+def test_empty_research_catalog_can_recover_an_exact_unchanged_cursor(monkeypatch):
+    calls=[]
+    def api(*args,**kwargs):
+        calls.append(1)
+        return [] if len(calls)==1 else [release(1,'a'*64)]
+    monkeypatch.setattr(transport,'_api',api)
+    assert transport.list_packages(after_sequence=1,expected_cursor_hash='a'*64)==[]
+    assert len(calls)==2
+
+
+def test_research_latest_confirmation_cannot_hide_invalid_metadata_as_empty_bootstrap(monkeypatch):
+    invalid=release(1,'a'*64);body=json.loads(invalid['body']);body['package_sha256']='f'*64
+    invalid['body']=json.dumps(body);calls=[]
+    def api(*args,**kwargs):
+        calls.append(1)
+        return [invalid] if len(calls)==2 else []
+    monkeypatch.setattr(transport,'_api',api)
+    with pytest.raises(ValueError,match='tag does not match'):transport.newest_package()
+    assert len(calls)==2
+
+
+@pytest.mark.parametrize('discovery',['list','newest'])
+def test_empty_research_bootstrap_requires_bounded_confirmation(monkeypatch,discovery):
+    calls=[]
+    monkeypatch.setattr(transport,'_api',lambda *a,**k:calls.append(1) or [])
+    assert (transport.list_packages() if discovery=='list' else transport.newest_package())==([] if discovery=='list' else None)
+    assert len(calls)==3
+
+
 def test_deleted_initialized_journal_is_not_recreated_before_first_package(monkeypatch):
     def api(method,path,**kwargs):
         if path.startswith('/commits?'):return [{'sha':'previous-initialization'}]

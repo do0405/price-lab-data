@@ -103,18 +103,35 @@ def run_pipeline(*,root=None,audit=False,publish_only=False,integration_only=Fal
     instant=now or datetime.now(timezone.utc)
     # Audit rechecks one bounded historical window, alongside recent overlap.
     audit=audit or instant.weekday()==6
-    for attempt in range(2):
+    for publication_attempt in range(2):
+        for attempt in range(2):
+            try:
+                payload=collect_delta(providers,prior_payload=prior,bootstrap=bootstrap,now=instant,
+                    audit=audit,reference_fetch=reference_fetch)
+                break
+            except ValueError as exc:
+                failure=re.fullmatch(r'Required market collection failed \(market=(us|kr|crypto|all); stage=(calendar|fetch); type=provider\)',str(exc))
+                if not failure or attempt:raise
+                print(json.dumps(dict(event='collection_retry',market=failure[1],stage=failure[2],
+                    attempt=2,maximum_attempts=2,wait_seconds=65)),flush=True)
+                time.sleep(65)
         try:
-            payload=collect_delta(providers,prior_payload=prior,bootstrap=bootstrap,now=instant,
-                audit=audit,reference_fetch=reference_fetch)
+            result=publish_package(payload,work_root=root,key=key)
             break
         except ValueError as exc:
-            failure=re.fullmatch(r'Required market collection failed \(market=(us|kr|crypto|all); stage=(calendar|fetch); type=provider\)',str(exc))
-            if not failure or attempt:raise
-            print(json.dumps(dict(event='collection_retry',market=failure[1],stage=failure[2],
-                attempt=2,maximum_attempts=2,wait_seconds=65)),flush=True)
-            time.sleep(65)
-    result=publish_package(payload,work_root=root,key=key)
+            if (str(exc)!='Daily log advanced; collect again from the authenticated latest state'
+                    or publication_attempt):raise
+            latest=newest_package()
+            if latest is None:raise
+            refreshed=load_package(latest,root,key=key)
+            previous_sequence=prior['sequence'] if prior else 0
+            if refreshed['sequence']<=previous_sequence:raise
+            # The authenticated new state must drive a complete recollection.
+            # Never relabel the sequence or predecessor of the rejected payload.
+            prior=refreshed
+            if now is None:instant=datetime.now(timezone.utc)
+            print(json.dumps(dict(event='publication_conflict_retry',attempt=2,maximum_attempts=2,
+                previous_sequence=previous_sequence,latest_sequence=prior['sequence'])),flush=True)
     result.update(stage='daily_package',cloud_database=False,
         parts=len(payload['parts']),reference_errors=payload.get('reference_errors',[]))
     result['periodic_status']=record_periodic_status(payload)

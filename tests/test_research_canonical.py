@@ -66,6 +66,64 @@ def test_canonical_ancestry_searches_later_listing_pages(monkeypatch):
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize('missing',['head','ancestor'])
+def test_canonical_ancestry_rechecks_transient_incomplete_listing(monkeypatch,missing):
+    first=release(1,'a'*64);second=release(2,'b'*64,'a'*64);calls=[]
+    def api(*args,**kwargs):
+        calls.append(1)
+        if len(calls)==1:return [] if missing=='head' else [second]
+        return [second,first]
+    monkeypatch.setattr(wire,'_api',api)
+    assert wire.canonical_packages(head(2,'b'*64),after_sequence=1,expected_cursor_hash='a'*64)==[second]
+    assert len(calls)==2
+
+
+def test_canonical_ancestry_persistent_empty_listing_fails_closed_after_confirmation(monkeypatch):
+    calls=[]
+    monkeypatch.setattr(wire,'_api',lambda *a,**k:calls.append(1) or [])
+    with pytest.raises(ValueError,match='Research package catalog unavailable after repeated empty listings'):
+        wire.canonical_packages(head(2,'b'*64),after_sequence=1,expected_cursor_hash='a'*64)
+    assert len(calls)==3
+
+
+def test_canonical_confirmation_restarts_after_an_empty_later_page(monkeypatch):
+    first=release(1,'a'*64);second=release(2,'b'*64,'a'*64);calls=[]
+    def api(method,path,**kwargs):
+        calls.append(path)
+        if path.endswith('&page=1'):return [second]+[dict(tag_name='unrelated')]*99
+        return [] if len(calls)==2 else [first]
+    monkeypatch.setattr(wire,'_api',api)
+    assert wire.canonical_packages(head(2,'b'*64),after_sequence=1,expected_cursor_hash='a'*64)==[second]
+    assert calls==['/releases?per_page=100&page=1','/releases?per_page=100&page=2']*2
+
+
+def test_canonical_confirmation_does_not_assemble_complementary_incomplete_snapshots(monkeypatch):
+    first=release(1,'a'*64);second=release(2,'b'*64,'a'*64);third=release(3,'c'*64,'b'*64);calls=[]
+    def api(*args,**kwargs):
+        calls.append(1)
+        return [third,first] if len(calls)==1 else [second,first]
+    monkeypatch.setattr(wire,'_api',api)
+    with pytest.raises(ValueError,match='missing; sequence gap'):
+        wire.canonical_packages(head(3,'c'*64),after_sequence=1,expected_cursor_hash='a'*64)
+    assert len(calls)==3
+
+
+@pytest.mark.parametrize('guard',['metadata','cursor'])
+def test_canonical_confirmation_preserves_metadata_and_cursor_guards(monkeypatch,guard):
+    calls=[]
+    def api(*args,**kwargs):
+        calls.append(1)
+        if len(calls)==1:return []
+        if guard=='cursor':return [release(2,'b'*64,'f'*64),release(1,'a'*64)]
+        row=release(2,'b'*64,'a'*64);other=copy.deepcopy(row)
+        body=json.loads(other['body']);body['ciphertext_sha256']='e'*64;other['body']=json.dumps(body)
+        return [row,other]
+    monkeypatch.setattr(wire,'_api',api)
+    with pytest.raises(ValueError,match='cursor mismatch' if guard=='cursor' else 'Conflicting canonical research package metadata'):
+        wire.canonical_packages(head(2,'b'*64),after_sequence=1,expected_cursor_hash='a'*64)
+    assert len(calls)==2
+
+
 def test_controlled_publish_preflight_uses_canonical_parent_only(tmp_path, monkeypatch):
     from price_lab import research_ownership as ownership
     from test_research_ownership import Clock, Contents, KEY

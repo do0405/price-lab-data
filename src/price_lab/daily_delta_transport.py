@@ -23,6 +23,33 @@ ASSET='daily.pldelta'
 MAX_ASSET_BYTES=513*1024**2
 MAX_PAGES=100
 _HEX=re.compile(r'[0-9a-f]{64}')
+_DISCOVERY_ATTEMPTS=3
+
+
+class _IncompleteDiscovery(ValueError):
+    def __init__(self,message,*,empty_catalog=False):
+        super().__init__(message)
+        self.empty_catalog=empty_catalog
+
+
+def _confirmed_discovery(discover,*,confirm_empty=False):
+    # A successful HTTP response can be a transient incomplete listing. Each
+    # confirmation starts over; never assemble a log from different snapshots.
+    all_empty=True;last_incomplete=None
+    for attempt in range(_DISCOVERY_ATTEMPTS):
+        try:result=discover()
+        except _IncompleteDiscovery as exc:
+            all_empty=all_empty and exc.empty_catalog
+            if not exc.empty_catalog:last_incomplete=exc
+            if attempt==_DISCOVERY_ATTEMPTS-1:
+                message='Daily package catalog unavailable after repeated empty listings' if all_empty else str(last_incomplete or exc)
+                raise ValueError(message) from None
+        else:
+            if result:return result
+            # Empty follow-up responses cannot erase an already observed gap.
+            if last_incomplete is not None:
+                if attempt==_DISCOVERY_ATTEMPTS-1:raise ValueError(str(last_incomplete)) from None
+            elif not confirm_empty or attempt==_DISCOVERY_ATTEMPTS-1:return result
 
 
 def package_tag(sequence,digest):
@@ -36,6 +63,7 @@ def _api(method,path,*,token=None,payload=None,stream=None):
     if urlsplit(url).hostname not in ('api.github.com','uploads.github.com'):
         raise ValueError('Invalid daily package API host')
     headers={'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}
+    if method=='GET' and path.startswith('/releases?'):headers['Cache-Control']='no-cache'
     token=token or os.environ.get('GITHUB_TOKEN')
     if token:headers['Authorization']='Bearer '+token
     if stream is not None:headers['Content-Type']='application/octet-stream'
@@ -89,14 +117,21 @@ def package_metadata(release):
 
 
 def list_packages(*,after_sequence=0,expected_cursor_hash=None,max_pages=MAX_PAGES,token=None):
+    return _confirmed_discovery(lambda:_list_packages(after_sequence=after_sequence,
+        expected_cursor_hash=expected_cursor_hash,max_pages=max_pages,token=token),
+        confirm_empty=not after_sequence)
+
+
+def _list_packages(*,after_sequence,expected_cursor_hash,max_pages,token):
     if type(after_sequence) is not int or after_sequence<0 or not 1<=max_pages<=MAX_PAGES:
         raise ValueError('Invalid daily package discovery bounds')
     if after_sequence and (not isinstance(expected_cursor_hash,str) or not _HEX.fullmatch(expected_cursor_hash)):
         raise ValueError('Applied daily cursor hash is required')
-    found={};seen_sequences={};reached_cursor=False;matched_cursor=False;latest_remote=0
+    found={};seen_sequences={};reached_cursor=False;matched_cursor=False;latest_remote=0;listed=False
     for page in range(1,max_pages+1):
         rows=_api('GET',f'/releases?per_page=100&page={page}',token=token)
         if not isinstance(rows,list) or len(rows)>100:raise ValueError('Invalid daily package listing')
+        listed=listed or bool(rows)
         for release in rows:
             if not isinstance(release,dict):raise ValueError('Invalid daily package listing')
             if not str(release.get('tag_name','')).startswith('delta-daily-'):continue
@@ -116,14 +151,15 @@ def list_packages(*,after_sequence=0,expected_cursor_hash=None,max_pages=MAX_PAG
         if len(rows)<100 or reached_cursor:break
     else:
         raise ValueError('Daily package discovery bound reached; earlier pages required')
-    if after_sequence and latest_remote<after_sequence:raise ValueError('Remote daily package rollback detected')
-    if after_sequence and not matched_cursor:raise ValueError('Applied daily cursor is missing from the remote log')
+    if after_sequence and latest_remote<after_sequence:
+        raise _IncompleteDiscovery('Remote daily package rollback detected',empty_catalog=not listed)
+    if after_sequence and not matched_cursor:raise _IncompleteDiscovery('Applied daily cursor is missing from the remote log')
     ordered=[found[k] for k in sorted(found)]
     expected=after_sequence+1
     previous=None
     for release in ordered:
         meta=package_metadata(release)
-        if meta['sequence']!=expected:raise ValueError('Daily package sequence gap')
+        if meta['sequence']!=expected:raise _IncompleteDiscovery('Daily package sequence gap')
         if previous and meta['previous_package_sha256']!=previous:
             raise ValueError('Daily package predecessor mismatch')
         previous=meta['package_sha256'];expected+=1
@@ -131,6 +167,10 @@ def list_packages(*,after_sequence=0,expected_cursor_hash=None,max_pages=MAX_PAG
 
 
 def newest_package(*,token=None):
+    return _confirmed_discovery(lambda:_newest_package(token=token),confirm_empty=True)
+
+
+def _newest_package(*,token):
     # A producer needs only the latest authenticated state, not the complete log.
     for page in range(1,MAX_PAGES+1):
         rows=_api('GET',f'/releases?per_page=100&page={page}',token=token)
@@ -241,30 +281,44 @@ def publish_package(payload,*,key=None,token=None,work_root=None):
 def pull_latest(root,*,key=None,token=None):
     """Local only: apply authenticated packages to the latest local DB parent."""
     import duckdb
-    from .ingestion import resolve_current,managed_lock
+    from .ingestion import resolve_current,managed_lock,current_reader
     from .daily_delta_apply import apply_packages
     root=Path(root);root.mkdir(parents=True,exist_ok=True)
     with managed_lock(root/'daily-transport'):
-        current=resolve_current(root)
-        if current is None:raise ValueError('A preserved local baseline is required; cloud contains no database')
         after=0;cursor_hash=None
-        with duckdb.connect(current['resolved_path'],read_only=True) as db:
-            if 'daily_delta_receipts' in {r[0] for r in db.execute('SHOW TABLES').fetchall()}:
-                row=db.execute("SELECT sequence,package_sha256 FROM daily_delta_receipts WHERE stream_id='price-daily-v1' ORDER BY sequence DESC LIMIT 1").fetchone()
-                if row:after,cursor_hash=row
+        with current_reader(root) as current:
+            if current is None:raise ValueError('A preserved local baseline is required; cloud contains no database')
+            with duckdb.connect(current['resolved_path'],read_only=True) as db:
+                if 'daily_delta_receipts' in {r[0] for r in db.execute('SHOW TABLES').fetchall()}:
+                    row=db.execute("SELECT sequence,package_sha256 FROM daily_delta_receipts WHERE stream_id='price-daily-v1' ORDER BY sequence DESC LIMIT 1").fetchone()
+                    if row:after,cursor_hash=row
         releases=list_packages(after_sequence=after,expected_cursor_hash=cursor_hash,token=token);applied=[]
         if releases:
+            from .price_remediation import held_daily
+            latest=package_metadata(releases[-1])
+            held=dict(sequence=latest['sequence'],package_sha256=latest['package_sha256'])
+            if held_daily(root,**held):
+                return dict(status='WAITING_VALIDATION',reason='UNCHANGED_AUTHENTICATED_VALIDATION_FAILURE',
+                    manifest=dict(current),transport='daily-delta-v1',applied_packages=[],
+                    downloaded=False,cloud_database=False)
             # A later confirmation may resolve an earlier pending action.
             # Authenticate and stage the contiguous suffix, then validate actions
             # once against all of its raw evidence before committing any receipt.
             payloads=(load_package(release,root/'daily-download',key=key) for release in releases)
             result=apply_packages(payloads,root)
-            if result['status'] not in ('PUBLISHED','UNCHANGED'):
+            if result['status']=='WAITING_VALIDATION':
+                held_daily(root,remember=True,diagnostic_sha256=result.get('diagnostic_sha256'),**held)
+                return {**result,'transport':'daily-delta-v1','applied_packages':[],
+                    'downloaded':True,'cloud_database':False}
+            if result['status'] not in ('PUBLISHED','UNCHANGED','COMMITTED_RECOVERY_PENDING'):
                 raise ValueError('Daily package local validation failed; previous database retained')
             applied=[{'sequence':package_metadata(release)['sequence'],'status':result['status'],
                 'package_sha256':package_metadata(release)['package_sha256']} for release in releases]
-        current=resolve_current(root)
-        return {'manifest':current,'transport':'daily-delta-v1','downloaded':bool(releases),
+        if releases:manifest=result['manifest']
+        else:
+            with current_reader(root) as current:manifest=dict(current)
+        return {'manifest':manifest,'transport':'daily-delta-v1','downloaded':bool(releases),
+            'status':result['status'] if releases else 'UNCHANGED',
             'unchanged':not releases,'applied_packages':applied,'cloud_database':False}
 
 

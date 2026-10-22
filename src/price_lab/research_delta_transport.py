@@ -5,6 +5,9 @@ Local synchronization imports the database applier inside pull_latest only.
 """
 import hashlib
 import base64
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import datetime,timezone
 import json
 import os
@@ -24,6 +27,33 @@ MAX_ASSET_BYTES=129*1024**2
 MAX_PAGES=100
 _HEX=re.compile(r'[0-9a-f]{64}')
 UNSET=object()
+_DISCOVERY_ATTEMPTS=3
+
+
+class _IncompleteDiscovery(ValueError):
+    def __init__(self,message,*,empty_catalog=False):
+        super().__init__(message)
+        self.empty_catalog=empty_catalog
+
+
+def _confirmed_discovery(discover,*,confirm_empty=False):
+    # A successful HTTP response can be a transient incomplete listing. Each
+    # confirmation starts over; never assemble a log from different snapshots.
+    all_empty=True;last_incomplete=None
+    for attempt in range(_DISCOVERY_ATTEMPTS):
+        try:result=discover()
+        except _IncompleteDiscovery as exc:
+            all_empty=all_empty and exc.empty_catalog
+            if not exc.empty_catalog:last_incomplete=exc
+            if attempt==_DISCOVERY_ATTEMPTS-1:
+                message='Research package catalog unavailable after repeated empty listings' if all_empty else str(last_incomplete or exc)
+                raise ValueError(message) from None
+        else:
+            if result:return result
+            # Empty follow-up responses cannot erase an already observed gap.
+            if last_incomplete is not None:
+                if attempt==_DISCOVERY_ATTEMPTS-1:raise ValueError(str(last_incomplete)) from None
+            elif not confirm_empty or attempt==_DISCOVERY_ATTEMPTS-1:return result
 
 
 def package_tag(sequence,digest):
@@ -37,6 +67,7 @@ def _api(method,path,*,token=None,payload=None,stream=None):
     if urlsplit(url).hostname not in ('api.github.com','uploads.github.com'):
         raise ValueError('Invalid research package API host')
     headers={'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}
+    if method=='GET' and path.startswith('/releases?'):headers['Cache-Control']='no-cache'
     token=token or os.environ.get('GITHUB_TOKEN')
     if token:headers['Authorization']='Bearer '+token
     if stream is not None:headers['Content-Type']='application/octet-stream'
@@ -90,14 +121,21 @@ def package_metadata(release):
 
 
 def list_packages(*,after_sequence=0,expected_cursor_hash=None,max_pages=MAX_PAGES,token=None):
+    return _confirmed_discovery(lambda:_list_packages(after_sequence=after_sequence,
+        expected_cursor_hash=expected_cursor_hash,max_pages=max_pages,token=token),
+        confirm_empty=not after_sequence)
+
+
+def _list_packages(*,after_sequence,expected_cursor_hash,max_pages,token):
     if type(after_sequence) is not int or after_sequence<0 or not 1<=max_pages<=MAX_PAGES:
         raise ValueError('Invalid research package discovery bounds')
     if after_sequence and (not isinstance(expected_cursor_hash,str) or not _HEX.fullmatch(expected_cursor_hash)):
         raise ValueError('Applied research cursor hash is required')
-    found={};seen_sequences={};reached_cursor=False;matched_cursor=False;latest_remote=0
+    found={};seen_sequences={};reached_cursor=False;matched_cursor=False;latest_remote=0;listed=False
     for page in range(1,max_pages+1):
         rows=_api('GET',f'/releases?per_page=100&page={page}',token=token)
         if not isinstance(rows,list) or len(rows)>100:raise ValueError('Invalid research package listing')
+        listed=listed or bool(rows)
         for release in rows:
             if not isinstance(release,dict):raise ValueError('Invalid research package listing')
             if not str(release.get('tag_name','')).startswith('delta-research-'):continue
@@ -117,14 +155,15 @@ def list_packages(*,after_sequence=0,expected_cursor_hash=None,max_pages=MAX_PAG
         if len(rows)<100 or reached_cursor:break
     else:
         raise ValueError('Research package discovery bound reached; earlier pages required')
-    if after_sequence and latest_remote<after_sequence:raise ValueError('Remote research package rollback detected')
-    if after_sequence and not matched_cursor:raise ValueError('Applied research cursor is missing from the remote log')
+    if after_sequence and latest_remote<after_sequence:
+        raise _IncompleteDiscovery('Remote research package rollback detected',empty_catalog=not listed)
+    if after_sequence and not matched_cursor:raise _IncompleteDiscovery('Applied research cursor is missing from the remote log')
     ordered=[found[k] for k in sorted(found)]
     expected=after_sequence+1
     previous=None
     for release in ordered:
         meta=package_metadata(release)
-        if meta['sequence']!=expected:raise ValueError('Research package sequence gap')
+        if meta['sequence']!=expected:raise _IncompleteDiscovery('Research package sequence gap')
         if previous and meta['previous_package_sha256']!=previous:
             raise ValueError('Research package predecessor mismatch')
         previous=meta['package_sha256'];expected+=1
@@ -132,6 +171,10 @@ def list_packages(*,after_sequence=0,expected_cursor_hash=None,max_pages=MAX_PAG
 
 
 def newest_package(*,token=None):
+    return _confirmed_discovery(lambda:_newest_package(token=token),confirm_empty=True)
+
+
+def _newest_package(*,token):
     # A producer needs only the latest authenticated state, not the complete log.
     for page in range(1,MAX_PAGES+1):
         rows=_api('GET',f'/releases?per_page=100&page={page}',token=token)
@@ -177,6 +220,11 @@ def canonical_newest(head,*,token=None):
 
 def canonical_packages(head,*,after_sequence=0,expected_cursor_hash=None,token=None):
     """Walk exact digest ancestry in bounded listings, ignoring orphan branches."""
+    return _confirmed_discovery(lambda:_canonical_packages(head,after_sequence=after_sequence,
+        expected_cursor_hash=expected_cursor_hash,token=token))
+
+
+def _canonical_packages(head,*,after_sequence,expected_cursor_hash,token):
     head=_canonical_head(head)
     if type(after_sequence) is not int or not 0<=after_sequence<2**63:
         raise ValueError('Invalid canonical research cursor')
@@ -187,10 +235,11 @@ def canonical_packages(head,*,after_sequence=0,expected_cursor_hash=None,token=N
         return []
     if after_sequence>head['sequence']:
         raise ValueError('Canonical research package rollback detected')
-    found={};selected=[];sequence=head['sequence'];digest=head['package_sha256']
+    found={};selected=[];sequence=head['sequence'];digest=head['package_sha256'];listed=False
     for page in range(1,MAX_PAGES+1):
         rows=_api('GET',f'/releases?per_page=100&page={page}',token=token)
         if not isinstance(rows,list) or len(rows)>100:raise ValueError('Invalid research package listing')
+        listed=listed or bool(rows)
         for release in rows:
             if not isinstance(release,dict):raise ValueError('Invalid research package listing')
             if not str(release.get('tag_name','')).startswith('delta-research-'):continue
@@ -213,7 +262,7 @@ def canonical_packages(head,*,after_sequence=0,expected_cursor_hash=None,token=N
             if sequence==after_sequence and digest!=expected_cursor_hash:
                 raise ValueError('Canonical research cursor mismatch')
         if len(rows)<100:
-            raise ValueError('Canonical research head or ancestor is missing; sequence gap')
+            raise _IncompleteDiscovery('Canonical research head or ancestor is missing; sequence gap',empty_catalog=not listed)
     raise ValueError('Canonical research package discovery bound reached')
 
 
@@ -256,6 +305,33 @@ def load_package(release,work_root,*,key=None):
             any(payload.get(k)!=meta.get(k) for k in ('sequence','stream_id','previous_package_sha256'))):
         raise ValueError('Authenticated research package metadata mismatch')
     return payload
+
+
+def ordered_packages(releases,work_root,*,key=None):
+    """Two local read-ahead jobs; only the caller applies in canonical order.
+
+    Each existing loader authenticates and owns its temporary directory. Closing
+    the iterator cancels queued jobs and joins running readers before returning.
+    Selection/byte limits remain the caller's responsibility; no DB work runs in
+    these threads. Including the applier's retained first and current values,
+    at most four payload generations can coexist during handoff. The existing
+    128MiB JSON-byte limit is not a bound on decoded Python objects or RSS.
+    """
+    iterator=iter(releases);pending=deque();end=object()
+    with ThreadPoolExecutor(max_workers=2,thread_name_prefix='research-read') as pool:
+        try:
+            for _ in range(2):
+                release=next(iterator,end)
+                if release is end:break
+                pending.append(pool.submit(load_package,release,work_root,key=key))
+            while pending:
+                future=pending.popleft()
+                yield future.result()
+                release=next(iterator,end)
+                if release is not end:
+                    pending.append(pool.submit(load_package,release,work_root,key=key))
+        finally:
+            for future in pending:future.cancel()
 
 
 def publish_package(payload,*,key=None,token=None,work_root=None,expected_head=UNSET):
@@ -314,20 +390,21 @@ def publish_package(payload,*,key=None,token=None,work_root=None,expected_head=U
 def pull_latest(root,*,key=None,max_packages=1,max_bytes=None,token=None):
     """Local only: bounded, contiguous research suffix; failures retain cursor."""
     import duckdb
-    from .ingestion import resolve_current,managed_lock
+    from .ingestion import resolve_current,managed_lock,current_reader
     from .research_delta_apply import apply_packages
     from .research_ownership import read_control
     if type(max_packages) is not int or not 1<=max_packages<=100:raise ValueError('Invalid research apply bound')
     if max_bytes is not None and (type(max_bytes) is not int or max_bytes<1):raise ValueError('Invalid research byte bound')
     root=Path(root);root.mkdir(parents=True,exist_ok=True)
     with managed_lock(root/'research-transport'):
-        current=resolve_current(root)
-        if current is None:raise ValueError('Preserved local baseline required')
         after=0;cursor_hash=None
-        with duckdb.connect(current['resolved_path'],read_only=True) as db:
-            if 'research_delta_receipts' in {r[0] for r in db.execute('SHOW TABLES').fetchall()}:
-                row=db.execute("SELECT sequence,package_sha256 FROM research_delta_receipts WHERE stream_id='kr-reference-evidence-v1' ORDER BY sequence DESC LIMIT 1").fetchone()
-                if row:after,cursor_hash=row
+        with current_reader(root) as current:
+            if current is None:raise ValueError('Preserved local baseline required')
+            with duckdb.connect(current['resolved_path'],read_only=True) as db:
+                if 'research_delta_receipts' in {r[0] for r in db.execute('SHOW TABLES').fetchall()}:
+                    row=db.execute("SELECT sequence,package_sha256 FROM research_delta_receipts WHERE stream_id='kr-reference-evidence-v1' ORDER BY sequence DESC LIMIT 1").fetchone()
+                    if row:after,cursor_hash=row
+            manifest=dict(current)
         def discover(sequence,digest):
             control=read_control(token=token,key=key)
             options=dict(after_sequence=sequence,expected_cursor_hash=digest,token=token)
@@ -341,12 +418,13 @@ def pull_latest(root,*,key=None,max_packages=1,max_bytes=None,token=None):
                 break
             selected.append(release);size+=amount
         if selected:
-            result=apply_packages((load_package(r,root/'research-download',key=key) for r in selected),root)
+            with closing(ordered_packages(selected,root/'research-download',key=key)) as payloads:
+                result=apply_packages(payloads,root)
             if result.get('error_code')=='RESEARCH_STORAGE_RESERVE_REQUIRED':
                 return {**result,'more_available':False,'downloaded':True,
                     'transport':'research-delta-v1','ciphertext_bytes':size,'cloud_database':False}
-            if result['status'] not in ('PUBLISHED','UNCHANGED'):raise ValueError('Research validation failed; previous cursor retained')
-        else:result={'status':'UNCHANGED','applied_packages':[],'manifest':current}
+            if result['status'] not in ('PUBLISHED','UNCHANGED','COMMITTED_RECOVERY_PENDING'):raise ValueError('Research validation failed; previous cursor retained')
+        else:result={'status':'UNCHANGED','applied_packages':[],'manifest':manifest}
         more=len(selected)<len(releases)
         if selected and not more:
             # A multi-GB local publication can overlap new ready cloud batches.
@@ -355,7 +433,7 @@ def pull_latest(root,*,key=None,max_packages=1,max_bytes=None,token=None):
             try:
                 more=bool(discover(result['applied_sequence'],result['package_sha256']))
             except Exception:result['warning_code']='RESEARCH_TIP_CHECK_UNAVAILABLE'
-        return {**result,'status':'MORE_AVAILABLE' if more else result['status'],
+        return {**result,'status':'MORE_AVAILABLE' if more and result['status']!='COMMITTED_RECOVERY_PENDING' else result['status'],
             'more_available':more,'downloaded':bool(selected),'transport':'research-delta-v1',
             'ciphertext_bytes':size,'cloud_database':False}
 

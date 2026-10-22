@@ -175,3 +175,209 @@ def test_cloud_validation_or_program_errors_are_never_retried(monkeypatch,tmp_pa
     with pytest.raises(ValueError,match=__import__('re').escape(reason)):
         module.run_pipeline(root=tmp_path,providers=object(),reference_fetch=lambda *a:{})
     assert calls==[1] and wait==[]
+
+
+@pytest.mark.parametrize('initial_package',[True,False])
+def test_cloud_publish_conflict_recollects_authenticated_latest_state(monkeypatch,tmp_path,capsys,initial_package):
+    import base64,copy,json
+    from price_lab import daily_delta_collect as c,daily_delta_transport as t
+    from price_lab.daily_delta_codec import package_digest,sign_bootstrap
+    from test_daily_delta_collect import NOW,Provider,bootstrap,calendar
+    calendar(monkeypatch)
+    first=c.collect_delta(Provider(),bootstrap=bootstrap(),now=NOW)
+    advanced=c.collect_delta(Provider(),prior_payload=first,now=NOW)
+    advanced['state']['assets'].append(dict(market='us',symbol='REMOTE',name='Remote discovery',exchange='NYSE'))
+    advanced['state']['calendar_evidence']={'kr':{'2024-01-03':{'open':False,'provider':'kis'}}}
+    before=copy.deepcopy(advanced);provider=Provider();events=[];published=[];recorded=[]
+    heads=iter([first if initial_package else None,advanced]);selected=None;reference_calls=[];wait=[]
+    key=base64.b64encode(b'x'*32).decode()
+    bootstrap_path=tmp_path/'bootstrap.json'
+    if not initial_package:bootstrap_path.write_text(json.dumps(sign_bootstrap(bootstrap(),b'x'*32)),encoding='utf-8')
+    def discover():
+        nonlocal selected
+        selected=next(heads);events.append('discover');return {'id':selected['sequence']} if selected else None
+    def load(release,root,**kwargs):
+        assert release['id']==selected['sequence'] and root==tmp_path and kwargs=={'key':key}
+        events.append('authenticate');return selected
+    def publish(value,**kwargs):
+        published.append(value);events.append('publish')
+        assert kwargs=={'work_root':tmp_path,'key':key}
+        if len(published)==1:raise ValueError('Daily log advanced; collect again from the authenticated latest state')
+        return {'sequence':value['sequence']}
+    def reference(*args):reference_calls.append(args);return {}
+    monkeypatch.setenv('PRICE_DATA_KEY',key)
+    monkeypatch.setattr(t,'newest_package',discover);monkeypatch.setattr(t,'load_package',load)
+    monkeypatch.setattr(t,'publish_package',publish)
+    monkeypatch.setattr(t,'record_periodic_status',lambda value:recorded.append(value) or {})
+    module=pipeline_module();monkeypatch.setattr(module.time,'sleep',wait.append)
+    result=module.run_pipeline(root=tmp_path,providers=provider,reference_fetch=reference,now=NOW,audit=True,
+        bootstrap_path=bootstrap_path)
+    assert events==['discover']+(['authenticate'] if initial_package else [])+['publish','discover','authenticate','publish']
+    assert provider.started==2 and all(call[-1] is True for call in provider.calls)
+    assert all('REMOTE' not in assets.symbol.values for market,_,assets,_,_ in provider.calls[:3] if market=='us')
+    assert all('REMOTE' in assets.symbol.values for market,_,assets,_,_ in provider.calls[3:] if market=='us')
+    assert published[0]['sequence']==(2 if initial_package else 1)
+    assert published[0]['previous_package_sha256']==(package_digest(first) if initial_package else None)
+    assert published[1]['sequence']==3 and published[1]['previous_package_sha256']==package_digest(advanced)
+    assert published[1]['state']['calendar_evidence']==advanced['state']['calendar_evidence']
+    assert published[0]['collected_at']==published[1]['collected_at']==NOW.isoformat().replace('+00:00','Z')
+    assert len(reference_calls)==32 and advanced==before and wait==[]
+    assert recorded==[published[1]] and result['sequence']==3 and result['cloud_database'] is False
+    assert key not in capsys.readouterr().out and not list(tmp_path.rglob('*.duckdb'))
+
+
+def test_cloud_publish_conflicts_exhaust_one_recollection_without_recording_status(monkeypatch,tmp_path):
+    from price_lab import daily_delta_collect as c,daily_delta_transport as t
+    priors=iter([{'sequence':6},{'sequence':7}]);events=[];wait=[]
+    monkeypatch.setattr(t,'newest_package',lambda:events.append('discover') or {'id':1})
+    monkeypatch.setattr(t,'load_package',lambda *a,**k:events.append('authenticate') or next(priors))
+    def collect(*a,**kwargs):
+        events.append('collect');return {'sequence':kwargs['prior_payload']['sequence']+1,'parts':[]}
+    def publish(*a,**kwargs):
+        events.append('publish');raise ValueError('Daily log advanced; collect again from the authenticated latest state')
+    monkeypatch.setattr(c,'collect_delta',collect);monkeypatch.setattr(t,'publish_package',publish)
+    monkeypatch.setattr(t,'record_periodic_status',lambda *a,**k:pytest.fail('Unpublished state was recorded'))
+    module=pipeline_module();monkeypatch.setattr(module.time,'sleep',wait.append)
+    with pytest.raises(ValueError,match='Daily log advanced'):
+        module.run_pipeline(root=tmp_path,providers=object(),reference_fetch=lambda *a:{})
+    assert events==['discover','authenticate','collect','publish','discover','authenticate','collect','publish']
+    assert wait==[]
+
+
+@pytest.mark.parametrize('error',[
+    ValueError('Authenticated daily package metadata mismatch'),
+    ValueError('Daily log advanced; collect again from the authenticated latest state extra'),
+    ValueError('Required market collection failed (market=kr; stage=fetch; type=provider)'),
+    RuntimeError('Daily log advanced; collect again from the authenticated latest state'),
+    RuntimeError('Daily package API transport failed'),
+])
+def test_cloud_publish_errors_other_than_exact_conflict_are_not_retried(monkeypatch,tmp_path,error):
+    from price_lab import daily_delta_collect as c,daily_delta_transport as t
+    events=[];wait=[]
+    monkeypatch.setattr(t,'newest_package',lambda:events.append('discover') or {'id':1})
+    monkeypatch.setattr(t,'load_package',lambda *a,**k:{'sequence':6})
+    monkeypatch.setattr(c,'collect_delta',lambda *a,**k:events.append('collect') or {'sequence':7,'parts':[]})
+    def publish(*a,**kwargs):events.append('publish');raise error
+    monkeypatch.setattr(t,'publish_package',publish)
+    monkeypatch.setattr(t,'record_periodic_status',lambda *a,**k:pytest.fail('Unpublished state was recorded'))
+    module=pipeline_module();monkeypatch.setattr(module.time,'sleep',wait.append)
+    with pytest.raises(type(error)) as caught:
+        module.run_pipeline(root=tmp_path,providers=object(),reference_fetch=lambda *a:{})
+    assert caught.value is error and events==['discover','collect','publish'] and wait==[]
+
+
+@pytest.mark.parametrize('reloaded',[None,{'sequence':6},{'sequence':5}])
+def test_cloud_publish_conflict_does_not_recollect_from_missing_or_stale_head(monkeypatch,tmp_path,reloaded):
+    from price_lab import daily_delta_collect as c,daily_delta_transport as t
+    heads=iter([{'sequence':6},reloaded]);selected=None;events=[]
+    def discover():
+        nonlocal selected
+        selected=next(heads);events.append('discover');return selected
+    monkeypatch.setattr(t,'newest_package',discover)
+    monkeypatch.setattr(t,'load_package',lambda *a,**k:events.append('authenticate') or selected)
+    monkeypatch.setattr(c,'collect_delta',lambda *a,**k:events.append('collect') or {'sequence':7,'parts':[]})
+    def publish(*a,**kwargs):events.append('publish');raise ValueError('Daily log advanced; collect again from the authenticated latest state')
+    monkeypatch.setattr(t,'publish_package',publish)
+    monkeypatch.setattr(t,'record_periodic_status',lambda *a,**k:pytest.fail('Unpublished state was recorded'))
+    with pytest.raises(ValueError,match='Daily log advanced'):
+        pipeline_module().run_pipeline(root=tmp_path,providers=object(),reference_fetch=lambda *a:{})
+    assert events==['discover','authenticate','collect','publish','discover']+(['authenticate'] if reloaded else [])
+
+
+@pytest.mark.parametrize('failure_stage',['discover','authenticate'])
+def test_cloud_publish_conflict_reload_failure_prevents_recollection(monkeypatch,tmp_path,failure_stage):
+    from price_lab import daily_delta_collect as c,daily_delta_transport as t
+    discoveries=[];loads=[];collected=[];published=[]
+    error=ValueError('Authenticated daily package metadata mismatch') if failure_stage=='authenticate' else RuntimeError('Daily package API transport failed')
+    def discover():
+        discoveries.append(1)
+        if len(discoveries)==2 and failure_stage=='discover':raise error
+        return {'id':len(discoveries)}
+    def load(*a,**kwargs):
+        loads.append(1)
+        if len(loads)==2:raise error
+        return {'sequence':6}
+    def publish(*a,**kwargs):
+        published.append(1);raise ValueError('Daily log advanced; collect again from the authenticated latest state')
+    monkeypatch.setattr(t,'newest_package',discover);monkeypatch.setattr(t,'load_package',load)
+    monkeypatch.setattr(c,'collect_delta',lambda *a,**k:collected.append(1) or {'sequence':7,'parts':[]})
+    monkeypatch.setattr(t,'publish_package',publish)
+    monkeypatch.setattr(t,'record_periodic_status',lambda *a,**k:pytest.fail('Unpublished state was recorded'))
+    with pytest.raises(type(error)) as caught:
+        pipeline_module().run_pipeline(root=tmp_path,providers=object(),reference_fetch=lambda *a:{})
+    assert caught.value is error and collected==published==[1]
+    assert len(discoveries)==2 and len(loads)==(2 if failure_stage=='authenticate' else 1)
+
+
+@pytest.mark.parametrize('failures',[1,2])
+def test_cloud_recollection_retains_bounded_provider_retry(monkeypatch,tmp_path,failures):
+    from datetime import datetime,timezone
+    from price_lab import daily_delta_collect as c,daily_delta_transport as t
+    priors=iter([{'sequence':6},{'sequence':7}]);calls=[];published=[];recorded=[];wait=[]
+    provider=object();reference=lambda *a:{};instant=datetime(2026,10,22,16,tzinfo=timezone.utc)
+    monkeypatch.setattr(t,'newest_package',lambda:{'id':1})
+    monkeypatch.setattr(t,'load_package',lambda *a,**k:next(priors))
+    def collect(selected,**kwargs):
+        assert selected is provider and kwargs['reference_fetch'] is reference
+        assert kwargs['now'] is instant and kwargs['audit'] is True
+        calls.append(kwargs['prior_payload']['sequence'])
+        if 2<=len(calls)<=failures+1:raise ValueError('Required market collection failed (market=kr; stage=fetch; type=provider)')
+        return {'sequence':calls[-1]+1,'parts':[]}
+    def publish(value,**kwargs):
+        published.append(value)
+        if len(published)==1:raise ValueError('Daily log advanced; collect again from the authenticated latest state')
+        return {'sequence':value['sequence']}
+    monkeypatch.setattr(c,'collect_delta',collect);monkeypatch.setattr(t,'publish_package',publish)
+    monkeypatch.setattr(t,'record_periodic_status',lambda value:recorded.append(value) or {})
+    module=pipeline_module();monkeypatch.setattr(module.time,'sleep',wait.append)
+    if failures==1:
+        assert module.run_pipeline(root=tmp_path,providers=provider,reference_fetch=reference,now=instant,audit=True)['sequence']==8
+        assert [value['sequence'] for value in published]==[7,8] and recorded==[published[-1]]
+    else:
+        with pytest.raises(ValueError,match='type=provider'):
+            module.run_pipeline(root=tmp_path,providers=provider,reference_fetch=reference,now=instant,audit=True)
+        assert len(published)==1 and recorded==[]
+    assert calls==[6,7,7] and wait==[65]
+
+
+@pytest.mark.parametrize('live_clock',[True,False])
+def test_cloud_conflict_recollection_refreshes_only_an_implicit_clock(monkeypatch,tmp_path,live_clock):
+    from datetime import timedelta,timezone
+    from price_lab import daily_delta_collect as c,daily_delta_transport as t
+    from price_lab.daily_delta_codec import package_digest
+    from test_daily_delta_collect import NOW,Provider,bootstrap,calendar
+    calendar(monkeypatch)
+    first=c.collect_delta(Provider(),bootstrap=bootstrap(),now=NOW-timedelta(minutes=1))
+    concurrent=c.collect_delta(Provider(),prior_payload=first,now=NOW+timedelta(minutes=1))
+    refreshed_now=NOW+timedelta(minutes=2)
+    heads=iter([first,concurrent]);selected=None;published=[];recorded=[];clock_calls=[]
+    class Clock:
+        @staticmethod
+        def now(zone):
+            assert zone is timezone.utc
+            clock_calls.append(zone)
+            return NOW if len(clock_calls)==1 else refreshed_now
+    def discover():
+        nonlocal selected
+        selected=next(heads);return {'id':selected['sequence']}
+    def publish(value,**kwargs):
+        published.append(value)
+        if len(published)==1:raise ValueError('Daily log advanced; collect again from the authenticated latest state')
+        return {'sequence':value['sequence']}
+    monkeypatch.setattr(t,'newest_package',discover)
+    monkeypatch.setattr(t,'load_package',lambda *a,**k:selected)
+    monkeypatch.setattr(t,'publish_package',publish)
+    monkeypatch.setattr(t,'record_periodic_status',lambda value:recorded.append(value) or {})
+    module=pipeline_module();monkeypatch.setattr(module,'datetime',Clock);provider=Provider()
+    if live_clock:
+        result=module.run_pipeline(root=tmp_path,providers=provider,reference_fetch=lambda *a:{})
+        assert result['sequence']==3 and provider.started==2 and len(clock_calls)==2
+        assert published[1]['previous_package_sha256']==package_digest(concurrent)
+        assert published[1]['collected_at']==refreshed_now.isoformat().replace('+00:00','Z')
+        assert recorded==[published[1]]
+    else:
+        with pytest.raises(ValueError,match='Prior package collection is in the future'):
+            module.run_pipeline(root=tmp_path,providers=provider,reference_fetch=lambda *a:{},now=NOW)
+        assert provider.started==1 and clock_calls==[] and recorded==[] and len(published)==1
+    assert published[0]['collected_at']==NOW.isoformat().replace('+00:00','Z')
+    assert all(call[-1] is False for call in provider.calls)

@@ -179,3 +179,139 @@ def test_unchanged_log_requires_the_exact_locally_applied_cursor_hash(monkeypatc
     from price_lab import daily_delta_transport as t
     monkeypatch.setattr(t,'_api',lambda *a,**k:[metadata(2,'c'*64,'a'*64),metadata()])
     assert t.list_packages(after_sequence=2,expected_cursor_hash='c'*64)==[]
+
+
+@pytest.mark.parametrize('discovery',['list','newest'])
+def test_transient_empty_listing_is_confirmed_before_rollback_or_bootstrap(monkeypatch,discovery):
+    from price_lab import daily_delta_transport as t
+    first=metadata();second=metadata(2,'c'*64,'a'*64);calls=[]
+    def api(method,path,**kwargs):
+        calls.append(path)
+        if len(calls)==1:return []
+        if path.endswith('&page=1'):return [dict(tag_name='unrelated')]*100
+        return [second,first]
+    monkeypatch.setattr(t,'_api',api)
+    if discovery=='list':
+        assert t.list_packages(after_sequence=1,expected_cursor_hash='a'*64)==[second]
+    else:assert t.newest_package()==second
+    assert calls==['/releases?per_page=100&page=1']*2+['/releases?per_page=100&page=2']
+
+
+@pytest.mark.parametrize('kind',['missing_cursor','gap'])
+def test_incomplete_daily_listing_is_rechecked_without_combining_snapshots(monkeypatch,kind):
+    from price_lab import daily_delta_transport as t
+    first=metadata();second=metadata(2,'c'*64,'a'*64);third=metadata(3,'d'*64,'c'*64)
+    attempts=[]
+    def api(*args,**kwargs):
+        attempts.append(1)
+        if len(attempts)==1:return [third,first] if kind=='gap' else [third,second]
+        return [third,second,first]
+    monkeypatch.setattr(t,'_api',api)
+    assert t.list_packages(after_sequence=1,expected_cursor_hash='a'*64)==[second,third]
+    assert len(attempts)==2
+
+
+def test_persistently_empty_daily_log_rechecks_then_rejects_existing_cursor(monkeypatch):
+    from price_lab import daily_delta_transport as t
+    calls=[]
+    monkeypatch.setattr(t,'_api',lambda *a,**k:calls.append(1) or [])
+    with pytest.raises(ValueError,match='Daily package catalog unavailable after repeated empty listings'):
+        t.list_packages(after_sequence=1,expected_cursor_hash='a'*64)
+    assert len(calls)==3
+
+
+def test_daily_confirmation_does_not_assemble_complementary_incomplete_snapshots(monkeypatch):
+    from price_lab import daily_delta_transport as t
+    first=metadata();second=metadata(2,'c'*64,'a'*64);third=metadata(3,'d'*64,'c'*64);calls=[]
+    def api(*args,**kwargs):
+        calls.append(1)
+        return [third,first] if len(calls)==1 else [second]
+    monkeypatch.setattr(t,'_api',api)
+    with pytest.raises(ValueError,match='sequence gap'):t.list_packages()
+    assert len(calls)==3
+
+
+@pytest.mark.parametrize('after,blank_middle',[(0,False),(1,False),(1,True)])
+def test_daily_confirmation_cannot_erase_observed_gap_with_empty_results(monkeypatch,after,blank_middle):
+    from price_lab import daily_delta_transport as t
+    first=metadata();third=metadata(3,'d'*64,'c'*64);calls=[]
+    def api(*args,**kwargs):
+        calls.append(1)
+        if len(calls)==1:return [third,first]
+        if len(calls)==2 and blank_middle:return []
+        return [first] if after else []
+    monkeypatch.setattr(t,'_api',api)
+    with pytest.raises(ValueError,match='Daily package sequence gap'):
+        t.list_packages(after_sequence=after,expected_cursor_hash='a'*64 if after else None)
+    assert len(calls)==3
+
+
+def test_empty_daily_catalog_can_recover_an_exact_unchanged_cursor(monkeypatch):
+    from price_lab import daily_delta_transport as t
+    calls=[]
+    def api(*args,**kwargs):
+        calls.append(1)
+        return [] if len(calls)==1 else [metadata()]
+    monkeypatch.setattr(t,'_api',api)
+    assert t.list_packages(after_sequence=1,expected_cursor_hash='a'*64)==[]
+    assert len(calls)==2
+
+
+def test_daily_latest_confirmation_cannot_hide_invalid_metadata_as_empty_bootstrap(monkeypatch):
+    from price_lab import daily_delta_transport as t
+    invalid=metadata();body=json.loads(invalid['body']);body['package_sha256']='f'*64
+    invalid['body']=json.dumps(body);calls=[]
+    def api(*args,**kwargs):
+        calls.append(1)
+        return [invalid] if len(calls)==2 else []
+    monkeypatch.setattr(t,'_api',api)
+    with pytest.raises(ValueError,match='tag does not match'):t.newest_package()
+    assert len(calls)==2
+
+
+def test_daily_confirmation_restarts_after_an_empty_later_page(monkeypatch):
+    from price_lab import daily_delta_transport as t
+    first=metadata();second=metadata(2,'c'*64,'a'*64);calls=[]
+    def api(method,path,**kwargs):
+        calls.append(path)
+        if path.endswith('&page=1'):return [second]+[dict(tag_name='unrelated')]*99
+        return [] if len(calls)==2 else [first]
+    monkeypatch.setattr(t,'_api',api)
+    assert t.list_packages(after_sequence=1,expected_cursor_hash='a'*64)==[second]
+    assert calls==['/releases?per_page=100&page=1','/releases?per_page=100&page=2']*2
+
+
+@pytest.mark.parametrize('discovery',['list','newest'])
+def test_empty_daily_bootstrap_requires_bounded_confirmation(monkeypatch,discovery):
+    from price_lab import daily_delta_transport as t
+    calls=[]
+    monkeypatch.setattr(t,'_api',lambda *a,**k:calls.append(1) or [])
+    assert (t.list_packages() if discovery=='list' else t.newest_package())==([] if discovery=='list' else None)
+    assert len(calls)==3
+
+
+def test_daily_confirmation_does_not_retry_conflicting_cursor(monkeypatch):
+    from price_lab import daily_delta_transport as t
+    calls=[]
+    def api(*args,**kwargs):
+        calls.append(1)
+        return [] if len(calls)==1 else [metadata(2,'f'*64,'a'*64),metadata()]
+    monkeypatch.setattr(t,'_api',api)
+    with pytest.raises(ValueError,match='conflicts'):
+        t.list_packages(after_sequence=2,expected_cursor_hash='c'*64)
+    assert len(calls)==2
+
+
+@pytest.mark.parametrize('module',['daily_delta_transport','research_delta_transport'])
+def test_listing_confirmation_requests_a_fresh_response(monkeypatch,module):
+    import importlib
+    wire=importlib.import_module('price_lab.'+module);headers=[]
+    class Response:
+        status_code=200;content=b'[]'
+        def json(self):return []
+    def request(method,url,**kwargs):
+        headers.append(kwargs['headers'])
+        return Response()
+    monkeypatch.setattr(wire.requests,'request',request)
+    assert wire._api('GET','/releases?per_page=100&page=1')==[]
+    assert headers[0]['Cache-Control']=='no-cache'
