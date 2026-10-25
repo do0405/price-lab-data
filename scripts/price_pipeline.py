@@ -14,27 +14,44 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'src'))
 
 class _TraceSession:
-    """Keep only safe request metadata; never log headers or response bodies."""
+    """Trace safe metadata and retry transient empty KRX daily-board responses."""
     def __init__(self,session):self.session=session;self.last={}
 
     def request(self,method,url,**kwargs):
-        self.last={'endpoint':urlsplit(url).path,'http_status':None}
-        response=self.session.request(method,url,**kwargs)
-        self.last['http_status']=response.status_code
-        # Large successful market-data responses need no extra JSON decoding.
-        if len(response.content)<=16384:
-            try:body=response.json()
-            except (ValueError,TypeError):body=None
-            if isinstance(body,dict):
-                for field in ('msg_cd','error_code'):
-                    code=body.get(field)
-                    if isinstance(code,str) and re.fullmatch(r'(?:EGW\d{5}|APBK\d{4}|OPSQ\d{4})',code):
-                        self.last['error_code']=code;break
-        return response
+        parsed=urlsplit(url)
+        self.last={'endpoint':parsed.path,'http_status':None}
+        params=kwargs.get('params');day=params.get('basDd') if isinstance(params,dict) else None
+        krx_board=(method=='GET' and parsed.scheme=='https' and parsed.hostname=='data-dbg.krx.co.kr'
+            and parsed.path in ('/svc/apis/sto/stk_bydd_trd','/svc/apis/sto/ksq_bydd_trd')
+            and isinstance(day,str) and re.fullmatch(r'[0-9]{8}',day) is not None)
+        if krx_board:self.last['requested_date']=f'{day[:4]}-{day[4:6]}-{day[6:]}'
+        delays=(5,20,60)
+        for attempt in range(len(delays)+1):
+            self.last['http_status']=None;self.last.pop('error_code',None)
+            response=self.session.request(method,url,**kwargs)
+            self.last['http_status']=response.status_code;body=None
+            # Large successful market-data responses need no extra JSON decoding.
+            if len(response.content)<=16384:
+                try:body=response.json()
+                except (ValueError,TypeError):pass
+                if isinstance(body,dict):
+                    for field in ('msg_cd','error_code'):
+                        code=body.get(field)
+                        if isinstance(code,str) and re.fullmatch(r'(?:EGW\d{5}|APBK\d{4}|OPSQ\d{4})',code):
+                            self.last['error_code']=code;break
+            # HTTP retries cannot detect this application-level failure. Keep
+            # the exact board/date request; never substitute data or closure.
+            if (not krx_board or response.status_code!=200 or not isinstance(body,dict)
+                    or body.get('OutBlock_1')!=[] or attempt==len(delays)):
+                return response
+            print(json.dumps(dict(event='provider_response_retry',provider='krx',reason='EMPTY_BOARD',
+                attempt=attempt+2,maximum_attempts=len(delays)+1,wait_seconds=delays[attempt],
+                **self.last)),flush=True)
+            time.sleep(delays[attempt])
 
 
 def observe_provider(provider,name):
-    """Observe original calls without changing inputs, outputs or validation."""
+    """Preserve provider inputs and validation while recovering empty boards."""
     from price_lab.providers import ProviderError
     trace=_TraceSession(provider.client.session);provider.client.session=trace
     class Observed:
