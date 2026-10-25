@@ -82,6 +82,45 @@ def test_action_query_starts_at_day_after_preceding_session(monkeypatch):
     assert all(str(start.date())=='2024-01-06' for _,_,_,start,_ in p.calls)
 
 
+@pytest.mark.parametrize('audit',[False,True])
+def test_known_unpublished_kr_session_is_preserved_but_not_refetched(monkeypatch,capsys,audit):
+    c=calendar(monkeypatch)
+    class PublicationCalendar(Provider):
+        def published_sessions(self,market,days,now=None):
+            return days[:-1] if market=='kr' and pd.Timestamp(now).hour<13 else days
+    initial=c.collect_delta(Provider(),bootstrap=bootstrap(),now=NOW)
+    before=copy.deepcopy(initial);provider=PublicationCalendar();references=[]
+    out=c.collect_delta(provider,prior_payload=initial,now=NOW,audit=audit,overlap_sessions=1,
+        reference_fetch=lambda board,day,kind:references.append(day) or {})
+    kr_calls=[call for call in provider.calls if call[0]=='kr']
+    assert all(pd.Timestamp('2024-01-05') not in call[1] for call in kr_calls)
+    assert out['state']['sessions']['kr']==initial['state']['sessions']['kr']
+    assert out['state']['watermarks']['kr']==initial['state']['watermarks']['kr']
+    assert initial==before
+    assert set(references)=={'2024-01-02','2024-01-03','2024-01-04'}
+    event=__import__('json').loads(capsys.readouterr().out)
+    assert event==dict(event='collection_deferred',market='kr',reason='PUBLICATION_WINDOW',
+        session_count=1,first_session='2024-01-05',last_session='2024-01-05')
+    assert all(str(row['session_date'])!='2024-01-05' for part in out['parts'] if part['market']=='kr' for row in part['bars'])
+    later=PublicationCalendar()
+    c.collect_delta(later,prior_payload=out,now=NOW+pd.Timedelta(hours=1),overlap_sessions=1)
+    assert any(pd.Timestamp('2024-01-05') in call[1] for call in later.calls if call[0]=='kr')
+    if audit:assert out['state']['audit_cursor']['kr']==3
+
+
+def test_pending_kr_session_does_not_prevent_other_markets_or_reference_filter(monkeypatch):
+    c=calendar(monkeypatch);references=[]
+    class PendingKorea(Provider):
+        def published_sessions(self,market,days,now=None):return [] if market=='kr' else days
+    provider=PendingKorea();initial=bootstrap()
+    out=c.collect_delta(provider,bootstrap=initial,now=NOW,audit=True,
+        reference_fetch=lambda board,day,kind:references.append(day) or {})
+    assert not any(call[0]=='kr' for call in provider.calls) and references==[]
+    assert {part['market'] for part in out['parts']}=={'us','crypto'}
+    assert out['state']['sessions']['kr']==initial['sessions']['kr']
+    assert out['state']['audit_cursor']['kr']==0
+
+
 @pytest.mark.parametrize('partial',[False,True])
 def test_any_required_market_failure_prevents_payload_and_state_advance(monkeypatch,partial):
     c=calendar(monkeypatch);p=Provider(fail=None if partial else 'kr',partial=partial);initial=bootstrap();before=copy.deepcopy(initial)
@@ -196,3 +235,39 @@ def test_invalid_required_benchmark_rejects_whole_collection(monkeypatch,market,
     assert initial==before
 
 
+
+
+@pytest.mark.parametrize('instant,ready',[
+    ('2026-10-24T10:00:00+09:00',False),
+    ('2026-10-25T20:37:00+09:00',False),
+    ('2026-10-26T00:00:58+09:00',False),
+    ('2026-10-26T08:14:59+09:00',False),
+    ('2026-10-26T08:15:00+09:00',True),
+    ('2026-10-25T23:15:00Z',True),
+])
+def test_kr_friday_collection_waits_for_monday_publication(instant,ready):
+    from price_lab import providers as p
+    provider=p.Providers(alpaca=object(),krx=object(),kis=object())
+    days=[pd.Timestamp('2026-10-22'),pd.Timestamp('2026-10-23')]
+    assert provider.published_sessions('kr',days,now=instant)==(days if ready else days[:1])
+
+
+@pytest.mark.parametrize('day,before,after',[
+    ('2026-10-08','2026-10-12T08:14:59+09:00','2026-10-12T08:15:00+09:00'),
+    ('2024-09-13','2024-09-19T08:14:59+09:00','2024-09-19T08:15:00+09:00'),
+    ('2026-12-30','2027-01-04T08:14:59+09:00','2027-01-04T08:15:00+09:00'),
+])
+def test_kr_publication_skips_holidays_and_year_end_closure(day,before,after):
+    from price_lab import providers as p
+    provider=p.Providers(alpaca=object(),krx=object(),kis=object());days=[pd.Timestamp(day)]
+    assert provider.published_sessions('kr',days,now=before)==[]
+    assert provider.published_sessions('kr',days,now=after)==days
+
+
+def test_kr_publication_respects_recorded_official_extra_closure():
+    from price_lab import providers as p
+    provider=p.Providers(alpaca=object(),krx=object(),kis=object())
+    provider.calendar_evidence={'kr':{'2026-10-26':{'open':False,'provider':'kis'}}}
+    days=[pd.Timestamp('2026-10-23')]
+    assert provider.published_sessions('kr',days,now='2026-10-26T20:37:00+09:00')==[]
+    assert provider.published_sessions('kr',days,now='2026-10-27T08:15:00+09:00')==days

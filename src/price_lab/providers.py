@@ -397,15 +397,34 @@ class Providers:
     def published_sessions(self,market,sessions,now=None):
         """Conservative KRX collection policy, distinct from exchange closure/SLA.
 
-        Collect a session's confirmed daily bulk data from the following
-        calendar day at 08:15 Seoul. Do not substitute unverified same-day bars.
-        Ingestion preserves already collected sessions and rejects old omissions.
+        Wait until 08:15 Seoul on a later Korean exchange business day,
+        including when rechecking already authenticated prices. Recorded KIS
+        holiday evidence overrides the library calendar without new API calls.
         """
         if market!='kr':return list(sessions)
         instant=pd.Timestamp(now if now is not None else datetime.now(timezone.utc))
         if instant.tzinfo is None:raise ValueError('now must be timezone-aware')
         instant=instant.tz_convert('Asia/Seoul')
-        return [d for d in sessions if (pd.Timestamp(d)+pd.Timedelta(days=1)).tz_localize('Asia/Seoul')+pd.Timedelta(hours=8,minutes=15)<=instant]
+        if not sessions:return []
+        first=min(pd.Timestamp(d) for d in sessions)
+        through=(instant-pd.Timedelta(hours=8,minutes=15)).tz_localize(None).normalize()
+        if first>through:return []
+        import exchange_calendars as xcals
+        calendar=xcals.get_calendar('XKRX',start=first-pd.Timedelta(days=7),end=through+pd.Timedelta(days=7))
+        labels=pd.DatetimeIndex(calendar.schedule.index).tz_localize(None).normalize()
+        publication_days=set(labels[(labels>=first)&(labels<=through)])
+        evidence={day:item['open'] for day,item in self.calendar_evidence.get('kr',{}).items()
+            if isinstance(item,dict) and type(item.get('open')) is bool}
+        cached=getattr(self.kis,'_calendar',{})
+        if isinstance(cached,dict):evidence.update({day:opened for day,opened in cached.items() if type(opened) is bool})
+        for day,opened in evidence.items():
+            label=pd.Timestamp(day)
+            if first<=label<=through:
+                if opened:publication_days.add(label)
+                else:publication_days.discard(label)
+        if not publication_days:return []
+        latest_publication=max(publication_days)
+        return [d for d in sessions if pd.Timestamp(d)<latest_publication]
     def fetch_market(self,market,sessions,assets,audit=False):
         return self.fetch_market_part(market,sessions,assets,audit=audit)
     def fetch_market_part(self,market,sessions,assets,audit=False,action_start=None):
