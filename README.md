@@ -20,7 +20,7 @@ Each immutable Release contains only daily.pldelta: canonical JSON records compr
 
 A package is made ready only after the encrypted asset is uploaded. A failed price/action/required-benchmark request does not advance collection state. Reference failures have a separate fixed status and do not erase successful price collection. Reference dates and retrieval times do not certify historical publication timing or complete security lifecycles.
 
-Korean KRX daily collection keeps the conservative next-calendar-day 08:15 Seoul eligibility policy. The Korean evening slot does not claim same-day KRX confirmation. Official holiday evidence is distinct from provider publication delay. Missing responses do not imply market closure, delisting, or a zero recovery amount.
+Korean KRX daily collection waits until 08:15 Seoul on a following Korean exchange business day for new sessions and every overlap, historical-audit and daily-reference request. XKRX skips weekends, exchange holidays and year-end closure; existing official KIS calendar evidence overrides it without new calendar API calls. Authenticated history and watermarks are preserved while a date is deferred, and the audit cursor does not advance over deferred dates. US/crypto collection continues. Deferred dates are logged as PUBLICATION_WINDOW and become eligible at the business-day cutoff. Missing eligible responses still fail required collection and never imply market closure, delisting or replacement prices.
 
 ## Local application
 

@@ -8,6 +8,7 @@ responses are independent raw evidence and never invent publication availability
 """
 import copy
 from datetime import date,datetime,timezone
+import json
 import math
 
 import pandas as pd
@@ -117,7 +118,7 @@ def collect_delta(providers,prior_payload=None,bootstrap=None,now=None,
     if any(pd.Timestamp(d)>instant.tz_localize(None).normalize() for days in state['sessions'].values() for d in days):raise ValueError('Future bootstrap session rejected')
     if hasattr(providers,'begin_refresh'):providers.begin_refresh()
     if hasattr(providers,'load_session_evidence'):providers.load_session_evidence(copy.deepcopy(state['calendar_evidence']))
-    universe={(a['market'],a['symbol']):a for a in state['assets']};parts=[];plans={}
+    universe={(a['market'],a['symbol']):a for a in state['assets']};parts=[];plans={};reference_days=[]
     state.setdefault('audit_cursor',{})
     stage='calendar';market='all'
     try:
@@ -136,11 +137,25 @@ def collect_delta(providers,prior_payload=None,bootstrap=None,now=None,
             if hasattr(providers,'published_sessions'):
                 published=_days(providers.published_sessions(market,list(actual),now=instant))
                 if not set(published)<=set(actual):raise ValueError('Publication policy added unexpected sessions')
-            all_days=sorted(known_set|set(published))
-            wanted=(set(all_days)-known_set)|set(all_days[-overlap_sessions:])
+            eligible=set(published)
+            all_days=sorted(known_set|eligible)
+            # Preserve authenticated history, but publication eligibility also
+            # applies to overlap, audit and reference requests for known dates.
+            wanted=(eligible-known_set)|set(published[-overlap_sessions:])
+            if market=='kr':
+                reference_days=[str(d.date()) for d in published[-reference_sessions:]]
+                deferred=sorted(set(actual)-eligible)
+                if deferred:
+                    print(json.dumps(dict(event='collection_deferred',market='kr',reason='PUBLICATION_WINDOW',
+                        session_count=len(deferred),first_session=str(deferred[0].date()),
+                        last_session=str(deferred[-1].date()))),flush=True)
             if audit:
                 cursor=state['audit_cursor'].get(market,0)%len(all_days)
-                audit_days=all_days[cursor:cursor+20];wanted.update(audit_days)
+                audit_days=[]
+                for day in all_days[cursor:cursor+20]:
+                    if day not in eligible:break
+                    audit_days.append(day)
+                wanted.update(audit_days)
                 state['audit_cursor'][market]=(cursor+len(audit_days))%len(all_days)
             plans[market]=(all_days,sorted(wanted))
         for market in MARKETS:
@@ -172,7 +187,7 @@ def collect_delta(providers,prior_payload=None,bootstrap=None,now=None,
     if payload_bytes>MAX_RAW_BYTES:raise ValueError('Required market collection failed')
     references=[];reference_errors=[]
     if reference_fetch is not None:
-        for day in state['sessions']['kr'][-reference_sessions:]:
+        for day in reference_days:
             for kind in ('daily','master'):
                 for board in ('KOSPI','KOSDAQ'):
                     try:

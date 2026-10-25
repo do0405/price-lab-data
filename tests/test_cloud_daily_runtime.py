@@ -77,22 +77,121 @@ def test_cloud_provider_failure_logs_endpoint_and_code_without_private_content(c
     assert event['error_code']=='EGW00133' and 'PRIVATE' not in output
 
 
-def test_cloud_provider_empty_board_keeps_failure_and_reports_http_200(capsys):
+def test_cloud_provider_empty_board_keeps_failure_and_reports_http_200(monkeypatch,capsys):
     from price_lab.providers import HttpClient, KrxProvider, ProviderError
-    module=pipeline_module()
+    module=pipeline_module();wait=[];calls=[]
+    monkeypatch.setattr(module.time,'sleep',wait.append)
     class Response:
         status_code=200
         headers={}
         content=b'{}'
         def json(self):return {'OutBlock_1':[],'msg1':'PRIVATE'}
     class Session:
-        def request(self,*a,**kw):return Response()
+        def request(self,*a,**kw):calls.append(kw);return Response()
     provider=module.observe_provider(KrxProvider('PRIVATE',HttpClient(Session(),retries=0,min_interval=0)),'krx')
     with pytest.raises(ProviderError,match='empty'):provider.fetch_day('2026-10-21')
     import json
-    output=capsys.readouterr().out;event=json.loads(output)
+    output=capsys.readouterr().out;events=[json.loads(line) for line in output.splitlines()]
+    event=events[-1]
     assert event['provider']=='krx' and event['operation']=='fetch_day' and event['http_status']==200
     assert event['endpoint'].endswith('/stk_bydd_trd') and event['reason']=='EMPTY_BOARD'
+    assert event['requested_date']=='2026-10-21'
+    assert wait==[5,20,60] and len(calls)==4
+    assert [e['attempt'] for e in events[:-1]]==[2,3,4]
+    assert 'PRIVATE' not in output
+
+
+@pytest.mark.parametrize('empty_responses',[1,2,3])
+def test_cloud_krx_retries_only_the_empty_board_with_identical_request(monkeypatch,capsys,empty_responses):
+    import json
+    from price_lab.providers import HttpClient,KrxProvider
+    module=pipeline_module();wait=[];calls=[]
+    monkeypatch.setattr(module.time,'sleep',wait.append)
+    row=dict(BAS_DD='20240102',ISU_CD='005930',TDD_OPNPRC='10',TDD_HGPRC='11',
+        TDD_LWPRC='9',TDD_CLSPRC='10',ACC_TRDVOL='100',ACC_TRDVAL='1000')
+    bodies=iter([{'OutBlock_1':[row]}]+[{'OutBlock_1':[]}]*empty_responses+
+        [{'OutBlock_1':[{**row,'ISU_CD':'000001'}]}])
+    class Response:
+        status_code=200;headers={}
+        def __init__(self,body):self.body=body;self.content=json.dumps(body).encode()
+        def json(self):return self.body
+    class Session:
+        def request(self,*args,**kwargs):
+            calls.append((args,kwargs));return Response(next(bodies))
+    provider=module.observe_provider(KrxProvider('PRIVATE',HttpClient(Session(),retries=0,min_interval=0)),'krx')
+    bars,assets=provider.fetch_day('2024-01-02')
+    assert set(bars.symbol)=={'005930','000001'} and len(assets)==2
+    assert len(calls)==empty_responses+2 and all(call==calls[1] for call in calls[1:])
+    assert calls[0][0][1].endswith('/stk_bydd_trd') and calls[1][0][1].endswith('/ksq_bydd_trd')
+    assert wait==[5,20,60][:empty_responses]
+    output=capsys.readouterr().out;events=[json.loads(line) for line in output.splitlines()]
+    assert [e['event'] for e in events]==['provider_response_retry']*empty_responses
+    assert all(e['requested_date']=='2024-01-02' and e['http_status']==200 for e in events)
+    assert 'PRIVATE' not in output
+
+
+@pytest.mark.parametrize('endpoint,status,body',[
+    ('/svc/apis/sto/stk_bydd_trd',200,{}),
+    ('/svc/apis/sto/stk_bydd_trd',200,{'OutBlock_1':'invalid'}),
+    ('/svc/apis/sto/stk_bydd_trd',403,{'OutBlock_1':[]}),
+    ('/svc/apis/sto/stk_isu_base_info',200,{'OutBlock_1':[]}),
+    ('/unrelated',200,{'OutBlock_1':[]}),
+])
+def test_cloud_empty_board_retry_excludes_other_responses(monkeypatch,capsys,endpoint,status,body):
+    import json
+    module=pipeline_module();wait=[];calls=[]
+    monkeypatch.setattr(module.time,'sleep',wait.append)
+    class Response:
+        status_code=status
+        def __init__(self):self.content=json.dumps(body).encode()
+        def json(self):return body
+    response=Response()
+    class Session:
+        def request(self,*args,**kwargs):calls.append(1);return response
+    assert module._TraceSession(Session()).request('GET','https://data-dbg.krx.co.kr'+endpoint,
+        params={'basDd':'20240102'}) is response
+    assert calls==[1] and wait==[] and capsys.readouterr().out==''
+
+
+@pytest.mark.parametrize('method,host,params',[
+    ('POST','data-dbg.krx.co.kr',{'basDd':'20240102'}),
+    ('GET','example.test',{'basDd':'20240102'}),
+    ('GET','data-dbg.krx.co.kr',{'basDd':'PRIVATE'}),
+    ('GET','data-dbg.krx.co.kr',{}),
+])
+def test_cloud_empty_board_retry_requires_exact_request_scope(monkeypatch,capsys,method,host,params):
+    module=pipeline_module();calls=[]
+    monkeypatch.setattr(module.time,'sleep',lambda seconds:pytest.fail('Unrelated request retried'))
+    class Response:
+        status_code=200;content=b'{"OutBlock_1":[]}'
+        def json(self):return {'OutBlock_1':[]}
+    response=Response()
+    class Session:
+        def request(self,*args,**kwargs):calls.append(1);return response
+    assert module._TraceSession(Session()).request(method,'https://'+host+'/svc/apis/sto/stk_bydd_trd',
+        params=params) is response
+    assert calls==[1] and capsys.readouterr().out==''
+
+
+def test_cloud_empty_board_retry_transport_failure_clears_stale_diagnostics(monkeypatch,capsys):
+    import json,requests
+    from price_lab.providers import HttpClient,KrxProvider,ProviderError
+    module=pipeline_module();calls=[];wait=[]
+    monkeypatch.setattr(module.time,'sleep',wait.append)
+    class Response:
+        status_code=200;content=b'{"OutBlock_1":[],"error_code":"EGW00133"}'
+        def json(self):return {'OutBlock_1':[],'error_code':'EGW00133'}
+    class Session:
+        def request(self,*args,**kwargs):
+            calls.append(1)
+            if len(calls)==1:return Response()
+            raise requests.ConnectionError('PRIVATE')
+    provider=module.observe_provider(KrxProvider('PRIVATE',HttpClient(Session(),retries=0,min_interval=0)),'krx')
+    with pytest.raises(ProviderError,match='transport'):provider.fetch_day('2024-01-02')
+    output=capsys.readouterr().out;events=[json.loads(line) for line in output.splitlines()]
+    assert calls==[1,1] and wait==[5] and len(events)==2
+    assert events[-1]['event']=='provider_call_failed' and events[-1]['http_status'] is None
+    assert events[-1]['requested_date']=='2024-01-02' and 'error_code' not in events[-1]
     assert 'PRIVATE' not in output
 
 
