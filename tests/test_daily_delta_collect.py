@@ -79,7 +79,20 @@ def test_holiday_reconciliation_and_kr_publication_delay_preserve_known_sessions
 def test_action_query_starts_at_day_after_preceding_session(monkeypatch):
     c=calendar(monkeypatch,['2024-01-05','2024-01-08']);p=Provider()
     c.collect_delta(p,bootstrap=bootstrap(['2024-01-05']),now=datetime(2024,1,9,12,tzinfo=timezone.utc),overlap_sessions=1)
-    assert all(str(start.date())=='2024-01-06' for _,_,_,start,_ in p.calls)
+    assert all(str(start.date())=='2024-01-06' for m,_,_,start,_ in p.calls if m!='kr')
+    assert all(start<=pd.Timestamp('2023-10-10') for m,_,_,start,_ in p.calls if m=='kr')
+
+
+def test_pending_kr_split_record_date_is_revisited_until_relisting_is_observed(monkeypatch):
+    c=calendar(monkeypatch)
+    first=c.collect_delta(Provider(),bootstrap=bootstrap(),now=NOW,overlap_sessions=1)
+    kr=next(part for part in first['parts'] if part['market']=='kr')
+    kr['actions']=[dict(provider='kis_ksd',event_id='005930:20230101',revision='old',
+        market='kr',symbol='005930',kind='split',record_date='2023-01-01',effective_date=None,
+        confirmed=False,price_factor=5.,share_factor=.2)]
+    provider=Provider()
+    c.collect_delta(provider,prior_payload=first,now=NOW,overlap_sessions=1)
+    assert all(start<=pd.Timestamp('2023-01-01') for m,_,_,start,_ in provider.calls if m=='kr')
 
 
 @pytest.mark.parametrize('audit',[False,True])

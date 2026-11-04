@@ -163,6 +163,21 @@ def collect_delta(providers,prior_payload=None,bootstrap=None,now=None,
             for days in _chunks(wanted,all_days):
                 position=positions[days[0]]
                 action_start=all_days[position-1]+pd.Timedelta(days=1) if position else days[0]
+                if market=='kr':
+                    # KSD is keyed by record date; a later list_dt correction
+                    # retains that old date even after daily bars move forward.
+                    # Revisit recent records and carry older unresolved splits
+                    # through the authenticated prior payload until relisting.
+                    action_start=min(action_start,days[-1]-pd.Timedelta(days=90))
+                    if prior_payload is not None:
+                        for part in prior_payload['parts']:
+                            if part['market']!='kr':continue
+                            for action in part['actions']:
+                                record=action.get('record_date')
+                                if (action.get('provider')=='kis_ksd' and action.get('kind')=='split'
+                                        and not action.get('effective_date') and record):
+                                    label=pd.Timestamp(record)
+                                    if label.tzinfo is None and label<=days[-1]:action_start=min(action_start,label)
                 assets=pd.DataFrame([a for (m,_),a in universe.items() if m==market])
                 stage='fetch'
                 batch=providers.fetch_market_part(market,list(days),assets,audit=audit,action_start=action_start)
