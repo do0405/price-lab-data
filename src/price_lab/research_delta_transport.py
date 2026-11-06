@@ -62,6 +62,16 @@ def package_tag(sequence,digest):
     return f'delta-research-{sequence:012d}-{digest}'
 
 
+class ResearchAPIHTTPError(RuntimeError):
+    def __init__(self, status_code):
+        self.status_code = status_code
+        super().__init__(f'Research package API failed: HTTP {status_code}')
+
+
+class ResearchAPITimeout(RuntimeError):
+    pass
+
+
 def _api(method,path,*,token=None,payload=None,stream=None):
     url=path if path.startswith('https://') else API+path
     if urlsplit(url).hostname not in ('api.github.com','uploads.github.com'):
@@ -75,10 +85,12 @@ def _api(method,path,*,token=None,payload=None,stream=None):
         response=requests.request(method,url,headers=headers,
             json=payload if stream is None else None,data=stream,
             timeout=(20,180),allow_redirects=False)
+    except requests.Timeout:
+        raise ResearchAPITimeout('Research package API timed out') from None
     except requests.RequestException:
         raise RuntimeError('Research package API transport failed') from None
     if response.status_code not in (200,201,204):
-        raise RuntimeError(f'Research package API failed: HTTP {response.status_code}')
+        raise ResearchAPIHTTPError(response.status_code)
     try:return response.json() if response.content else {}
     except (ValueError,TypeError):raise ValueError('Invalid research package API response') from None
 
@@ -334,6 +346,34 @@ def ordered_packages(releases,work_root,*,key=None):
             for future in pending:future.cancel()
 
 
+def _finalize_release(release, uploaded, body, *, token):
+    path = '/releases/' + str(release['id'])
+    tag = release['tag_name']
+    update = dict(tag_name=tag, name=tag, target_commitish='main',
+                  body=json.dumps(body, separators=(',', ':')), draft=False, make_latest='false')
+    draft_body = json.dumps({**body, 'ready': False}, separators=(',', ':'))
+    for delay in (2, 5, None):
+        try:
+            return _api('PATCH', path, token=token, payload=update)
+        except (ResearchAPIHTTPError, ResearchAPITimeout) as exc:
+            if isinstance(exc, ResearchAPIHTTPError) and exc.status_code not in (429, 500, 502, 503, 504):
+                raise
+            if delay is not None:
+                time.sleep(delay)
+            current = _api('GET', path, token=token)
+            assets = current.get('assets', [])
+            if (current.get('id') != release['id'] or current.get('tag_name') != tag
+                    or len(assets) != 1
+                    or any(assets[0].get(field) != uploaded[field] for field in ('id', 'name', 'size'))):
+                raise ValueError('Research release changed during finalization') from None
+            if current.get('draft') is False and package_metadata(current) == body:
+                return current
+            if current.get('draft') is not True or current.get('body') != draft_body:
+                raise ValueError('Research draft changed during finalization') from None
+            if delay is None:
+                raise
+
+
 def publish_package(payload,*,key=None,token=None,work_root=None,expected_head=UNSET):
     from .research_delta_codec import validate_payload,package_digest,seal_package
     validate_payload(payload);digest=package_digest(payload)
@@ -384,8 +424,7 @@ def publish_package(payload,*,key=None,token=None,work_root=None,expected_head=U
         if uploaded.get('name')!=ASSET or uploaded.get('size')!=path.stat().st_size:
             raise ValueError('Research package upload receipt mismatch')
         body['ready']=True
-        published=_api('PATCH','/releases/'+str(release['id']),token=token,payload={**common,
-            'body':json.dumps(body,separators=(',',':')),'draft':False,'make_latest':'false'})
+        published=_finalize_release(release,uploaded,body,token=token)
         meta=package_metadata(published)
         if meta['package_sha256']!=digest:raise ValueError('Published research package identity mismatch')
     return {'release_url':published['html_url'],'tag':tag,'unchanged':False,
