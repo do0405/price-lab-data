@@ -395,16 +395,20 @@ class Providers:
         for day,opened in states.items():proof[day]={'open':opened,'provider':'kis','tr_id':'CTCA0903R'}
         return [d for d in all_dates if _day(d) not in states or states[_day(d)]]
     def published_sessions(self,market,sessions,now=None):
-        """Conservative KRX collection policy, distinct from exchange closure/SLA.
+        """Return completed sessions eligible for daily price collection.
 
-        Wait until 08:15 Seoul on a later Korean exchange business day,
+        US sessions become eligible at 10:30 Seoul on the next calendar day.
+        KRX sessions wait until 08:15 Seoul on a later Korean exchange business day,
         including when rechecking already authenticated prices. Recorded KIS
         holiday evidence overrides the library calendar without new API calls.
         """
-        if market!='kr':return list(sessions)
+        if market not in ('us','kr'):return list(sessions)
         instant=pd.Timestamp(now if now is not None else datetime.now(timezone.utc))
         if instant.tzinfo is None:raise ValueError('now must be timezone-aware')
         instant=instant.tz_convert('Asia/Seoul')
+        if market=='us':
+            ready_before=(instant-pd.Timedelta(hours=10,minutes=30)).tz_localize(None).normalize()
+            return [day for day in sessions if pd.Timestamp(day)<ready_before]
         if not sessions:return []
         first=min(pd.Timestamp(d) for d in sessions)
         through=(instant-pd.Timedelta(hours=8,minutes=15)).tz_localize(None).normalize()

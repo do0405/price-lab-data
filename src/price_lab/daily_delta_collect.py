@@ -144,9 +144,10 @@ def collect_delta(providers,prior_payload=None,bootstrap=None,now=None,
             wanted=(eligible-known_set)|set(published[-overlap_sessions:])
             if market=='kr':
                 reference_days=[str(d.date()) for d in published[-reference_sessions:]]
+            if market in ('us','kr'):
                 deferred=sorted(set(actual)-eligible)
                 if deferred:
-                    print(json.dumps(dict(event='collection_deferred',market='kr',reason='PUBLICATION_WINDOW',
+                    print(json.dumps(dict(event='collection_deferred',market=market,reason='PUBLICATION_WINDOW',
                         session_count=len(deferred),first_session=str(deferred[0].date()),
                         last_session=str(deferred[-1].date()))),flush=True)
             if audit:

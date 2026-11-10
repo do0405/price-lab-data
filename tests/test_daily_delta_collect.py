@@ -61,6 +61,34 @@ def test_missing_sessions_overlap_assets_and_chain_are_db_free(monkeypatch):
     assert second['sequence']==2 and second['previous_package_sha256']==package_digest(first)
 
 
+@pytest.mark.parametrize('audit',[False,True])
+def test_us_collection_defers_latest_session_but_fills_older_gaps(monkeypatch,capsys,audit):
+    import json
+    from price_lab.providers import Providers
+
+    class PublicationCalendar(Provider):
+        def published_sessions(self,market,days,now=None):
+            return Providers.published_sessions(self,market,days,now=now) if market=='us' else days
+
+    c=calendar(monkeypatch)
+    provider=PublicationCalendar()
+    prior=c.collect_delta(provider,bootstrap=bootstrap(),now='2024-01-06T10:29:59+09:00',
+        audit=audit,overlap_sessions=1)
+    fetched={str(day.date()) for market,days,*_ in provider.calls if market=='us' for day in days}
+    assert '2024-01-03' in fetched
+    assert '2024-01-05' not in fetched
+    assert prior['state']['sessions']['us']==['2024-01-02','2024-01-03','2024-01-04']
+    assert prior['state']['watermarks']['us']=='2024-01-04'
+    assert json.loads(capsys.readouterr().out)==dict(event='collection_deferred',market='us',
+        reason='PUBLICATION_WINDOW',session_count=1,first_session='2024-01-05',last_session='2024-01-05')
+
+    provider=PublicationCalendar()
+    published=c.collect_delta(provider,prior_payload=prior,now='2024-01-06T10:30:00+09:00',
+        overlap_sessions=1)
+    assert any(pd.Timestamp('2024-01-05') in days for market,days,*_ in provider.calls if market=='us')
+    assert published['state']['watermarks']['us']=='2024-01-05'
+
+
 def test_holiday_reconciliation_and_kr_publication_delay_preserve_known_sessions(monkeypatch):
     c=calendar(monkeypatch)
     class OfficialCalendar(Provider):

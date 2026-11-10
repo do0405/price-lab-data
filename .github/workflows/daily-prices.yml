@@ -1,9 +1,9 @@
 name: Encrypted daily price changes
 on:
   schedule:
-    # Post-US-close; IANA timezone follows DST. 08:37/09:37 next day in Seoul.
-    - cron: '37 19 * * *'
-      timezone: America/New_York
+    # US daily bars become eligible at 10:30 Seoul time after the US session date.
+    - cron: '30 10 * * *'
+      timezone: Asia/Seoul
     # Post-Korea-close; weekends retained for crypto and revision checks.
     - cron: '37 20 * * *'
       timezone: Asia/Seoul
