@@ -3,8 +3,9 @@
 ``prior_payload`` must have come from open_package and ``bootstrap`` from
 verify_bootstrap. Validation here checks structure, not an external signature.
 No DB, filesystem cache, credentials or default provider is created. Failures of
-required price/action/benchmark collection produce no next payload. Reference
-responses are independent raw evidence and never invent publication availability.
+required price/action/benchmark collection produce no next payload, except
+explicitly deferred empty KRX boards. Reference responses are independent raw
+evidence and never invent publication availability.
 """
 import copy
 from datetime import date,datetime,timezone
@@ -159,6 +160,7 @@ def collect_delta(providers,prior_payload=None,bootstrap=None,now=None,
                 wanted.update(audit_days)
                 state['audit_cursor'][market]=(cursor+len(audit_days))%len(all_days)
             plans[market]=(all_days,sorted(wanted))
+        deferred_kr_days=set()
         for market in MARKETS:
             all_days,wanted=plans[market];positions={d:n for n,d in enumerate(all_days)}
             for days in _chunks(wanted,all_days):
@@ -183,6 +185,17 @@ def collect_delta(providers,prior_payload=None,bootstrap=None,now=None,
                 stage='fetch'
                 batch=providers.fetch_market_part(market,list(days),assets,audit=audit,action_start=action_start)
                 stage='normalize'
+                if isinstance(batch,MarketBatch) and batch.deferred_sessions:
+                    deferred=set(_days(batch.deferred_sessions))
+                    if market!='kr' or batch.market!=market or not deferred<=set(days):
+                        raise ValueError('Unexpected deferred market sessions')
+                    days=[day for day in days if day not in deferred]
+                    if _days(batch.completed_sessions)!=days:
+                        raise ValueError('Incomplete required market session coverage')
+                    deferred_kr_days.update(deferred)
+                    print(json.dumps(dict(event='collection_deferred',market=market,reason='KRX_EMPTY_BOARD',
+                        sessions=[str(day.date()) for day in sorted(deferred)])),flush=True)
+                    if not days:continue
                 part=_part(batch,market,days,action_start)
                 stage='encode'
                 payload_bytes+=len(_canonical(part))
@@ -191,6 +204,12 @@ def collect_delta(providers,prior_payload=None,bootstrap=None,now=None,
                 for asset in part['assets']:
                     key=(asset['market'],asset['symbol'])
                     universe[key]={**universe.get(key,{}),**{k:v for k,v in asset.items() if v is not None}}
+            if market=='kr' and deferred_kr_days:
+                # Keep already published history; absent new dates stay in the next run's gap set.
+                known=set(_days(state['sessions'][market]))
+                all_days=[day for day in all_days if day in known or day not in deferred_kr_days]
+                deferred_labels={str(day.date()) for day in deferred_kr_days}
+                reference_days=[day for day in reference_days if day not in deferred_labels]
             state['sessions'][market]=[str(d.date()) for d in all_days]
             state['watermarks'][market]=state['sessions'][market][-1]
     except Exception as exc:

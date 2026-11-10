@@ -130,6 +130,59 @@ def test_cloud_krx_retries_only_the_empty_board_with_identical_request(monkeypat
     assert 'PRIVATE' not in output
 
 
+@pytest.mark.parametrize('mode',['defer','strict','malformed'])
+def test_cloud_krx_defers_only_exhausted_explicit_empty_boards(monkeypatch,mode):
+    import pandas as pd
+    from price_lab.providers import HttpClient, KrxProvider, ProviderError, Providers
+
+    module=pipeline_module()
+    waits=[];requests=[];benchmarks=[]
+    monkeypatch.setattr(module.time,'sleep',waits.append)
+
+    class Response:
+        status_code=200;headers={}
+        def __init__(self,body):
+            self.body=body;self.content=b'fixture'
+        def json(self):
+            return self.body
+
+    class Session:
+        def request(self,method,url,params,**kwargs):
+            day=params['basDd'];kosdaq=url.endswith('ksq_bydd_trd')
+            requests.append((day,kosdaq))
+            if kosdaq and day=='20240103':
+                return Response({} if mode=='malformed' else {'OutBlock_1':[]})
+            row=dict(BAS_DD=day,ISU_CD='229200' if kosdaq else '069500',ISU_NM='ETF',
+                TDD_OPNPRC='10',TDD_HGPRC='11',TDD_LWPRC='9',TDD_CLSPRC='10',
+                ACC_TRDVOL='100',ACC_TRDVAL='1000')
+            return Response({'OutBlock_1':[row]})
+
+    class Kis:
+        def fetch_benchmarks(self,days):
+            benchmarks.extend(days)
+            return pd.DataFrame()
+        def fetch_actions(self,start,end):
+            return []
+
+    krx=module.observe_provider(KrxProvider('fixture',HttpClient(Session(),retries=0,min_interval=0)),'krx')
+    providers=Providers(alpaca=object(),krx=krx,kis=Kis(),defer_empty_krx=mode!='strict')
+    days=list(pd.to_datetime(['2024-01-03','2024-01-04']))
+    assets=pd.DataFrame(columns=['market','symbol'])
+    if mode=='defer':
+        batch=providers.fetch_market_part('kr',days,assets)
+        assert batch.completed_sessions==days[1:]
+        assert batch.deferred_sessions==(days[0],)
+        assert set(batch.bars.session_date)=={days[1]}
+        assert benchmarks==days[1:]
+        assert ('20240104',True) in requests
+    else:
+        with pytest.raises(ProviderError,match='empty or missing board'):
+            providers.fetch_market_part('kr',days,assets)
+        assert not benchmarks and ('20240104',True) not in requests
+    assert waits==([] if mode=='malformed' else [5,20,60])
+    assert requests.count(('20240103',True))==(1 if mode=='malformed' else 4)
+
+
 @pytest.mark.parametrize('endpoint,status,body',[
     ('/svc/apis/sto/stk_bydd_trd',200,{}),
     ('/svc/apis/sto/stk_bydd_trd',200,{'OutBlock_1':'invalid'}),

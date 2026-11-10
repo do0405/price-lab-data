@@ -113,7 +113,7 @@ def run_pipeline(*,root=None,audit=False,publish_only=False,integration_only=Fal
         bootstrap=verify_bootstrap(json.loads(path.read_text(encoding='utf-8')),key=key)
     if providers is None:
         from price_lab.providers import Providers
-        providers=Providers(raw_dir=None)
+        providers=Providers(raw_dir=None,defer_empty_krx=True)
         for name in ('alpaca','krx','kis'):
             setattr(providers,name,observe_provider(getattr(providers,name),name))
     if reference_fetch is None:reference_fetch=official_reference_fetch()
