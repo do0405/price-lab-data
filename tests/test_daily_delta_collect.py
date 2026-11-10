@@ -89,6 +89,40 @@ def test_us_collection_defers_latest_session_but_fills_older_gaps(monkeypatch,ca
     assert published['state']['watermarks']['us']=='2024-01-05'
 
 
+@pytest.mark.parametrize('defer_all',[False,True])
+def test_empty_krx_days_do_not_block_other_markets_and_are_recovered(monkeypatch,capsys,defer_all):
+    import json
+
+    class EmptyBoards(Provider):
+        def fetch_market_part(self,market,sessions,assets,**kwargs):
+            if market!='kr':
+                return super().fetch_market_part(market,sessions,assets,**kwargs)
+            deferred=tuple(day for day in sessions if defer_all or day==pd.Timestamp('2024-01-03'))
+            available=[day for day in sessions if day not in deferred]
+            batch=super().fetch_market_part(market,available,assets,**kwargs)
+            batch.deferred_sessions=deferred
+            return batch
+
+    c=calendar(monkeypatch)
+    references=[]
+    first=c.collect_delta(EmptyBoards(),bootstrap=bootstrap(),now=NOW,overlap_sessions=2,
+        reference_fetch=lambda board,day,kind:references.append(day) or {})
+    assert first['state']['sessions']['kr']==(['2024-01-02','2024-01-04'] if defer_all else
+        ['2024-01-02','2024-01-04','2024-01-05'])
+    assert first['state']['watermarks']['kr']==('2024-01-04' if defer_all else '2024-01-05')
+    assert {part['market'] for part in first['parts']}==({'us','crypto'} if defer_all else
+        {'us','kr','crypto'})
+    assert all('2024-01-03' not in part['sessions'] for part in first['parts'] if part['market']=='kr')
+    assert '2024-01-03' not in references
+    events=[json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert any(event['reason']=='KRX_EMPTY_BOARD' and '2024-01-03' in event['sessions'] for event in events)
+
+    later=c.collect_delta(Provider(),prior_payload=first,now='2024-01-07T12:00:00Z',overlap_sessions=1)
+    assert any('2024-01-03' in part['sessions'] for part in later['parts'] if part['market']=='kr')
+    assert later['state']['sessions']['kr']==['2024-01-02','2024-01-03','2024-01-04','2024-01-05']
+    assert later['state']['watermarks']['kr']=='2024-01-05'
+
+
 def test_holiday_reconciliation_and_kr_publication_delay_preserve_known_sessions(monkeypatch):
     c=calendar(monkeypatch)
     class OfficialCalendar(Provider):

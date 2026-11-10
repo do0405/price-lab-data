@@ -26,6 +26,9 @@ BENCHMARKS={'us':('SPY','QQQ'),'kr':('069500','229200'),'crypto':('BTC/USD',)}
 class ProviderError(RuntimeError):pass
 
 
+class KrxEmptyBoard(ProviderError):pass
+
+
 @dataclass
 class MarketBatch:
     market:str
@@ -34,6 +37,7 @@ class MarketBatch:
     actions:list
     completed_sessions:list
     provenance:dict
+    deferred_sessions:tuple=()
 
 
 def _canonical(value):return json.dumps(value,sort_keys=True,ensure_ascii=False,default=str,separators=(',',':'),allow_nan=False)
@@ -265,7 +269,8 @@ class KrxProvider:
         for board,endpoint in [('KOSPI','stk_bydd_trd'),('KOSDAQ','ksq_bydd_trd')]:
             payload=self.client.request_json('GET','https://data-dbg.krx.co.kr/svc/apis/sto/'+endpoint,headers={'AUTH_KEY':self._key},params={'basDd':day})
             records=payload.get('OutBlock_1')
-            if not isinstance(records,list) or not records:raise ProviderError('KRX empty or missing board response')
+            if not isinstance(records,list):raise ProviderError('KRX empty or missing board response')
+            if not records:raise KrxEmptyBoard('KRX empty or missing board response')
             for record in records:
                 if str(record.get('BAS_DD'))!=day:raise ProviderError('KRX requested date mismatch')
                 symbol=str(record['ISU_CD']).zfill(6)
@@ -375,7 +380,8 @@ class KisProvider:
 
 class Providers:
     """Composition used by ingestion; all required subproviders must succeed."""
-    def __init__(self,alpaca=None,krx=None,kis=None,raw_dir=None):
+    def __init__(self,alpaca=None,krx=None,kis=None,raw_dir=None,*,defer_empty_krx=False):
+        self.defer_empty_krx=defer_empty_krx
         self.alpaca=alpaca or AlpacaProvider(client=HttpClient(raw_dir=raw_dir))
         self.krx=krx or KrxProvider(client=HttpClient(min_interval=1.,raw_dir=raw_dir))
         self.kis=kis or KisProvider(client=HttpClient(min_interval=.2,raw_dir=raw_dir))
@@ -436,7 +442,7 @@ class Providers:
         if not sessions:raise ProviderError('No completed sessions requested')
         action_start=pd.Timestamp(action_start if action_start is not None else min(sessions)).normalize()
         if action_start.tzinfo is not None or action_start>min(sessions):raise ProviderError('Invalid corporate action collection boundary')
-        actions=[];universe=assets.copy()
+        actions=[];deferred=[];universe=assets.copy()
         if market in ('us','crypto'):
             active=self.alpaca.fetch_assets(market)
             universe=pd.concat([universe,active],ignore_index=True).drop_duplicates(['market','symbol'],keep='last')
@@ -446,13 +452,21 @@ class Providers:
         elif market=='kr':
             frames=[];universes=[]
             for date in sessions:
-                b,a=self.krx.fetch_day(date);frames.append(b);universes.append(a)
+                try:b,a=self.krx.fetch_day(date)
+                except KrxEmptyBoard:
+                    if not self.defer_empty_krx:raise
+                    deferred.append(date)
+                    continue
+                frames.append(b);universes.append(a)
+            if deferred:
+                sessions=[day for day in sessions if day not in deferred]
+                if not sessions:return MarketBatch(market,pd.DataFrame(),universe,[],[],{},tuple(deferred))
             frames.append(self.kis.fetch_benchmarks(sessions));bars=pd.concat(frames,ignore_index=True)
             universe=pd.concat([universe,*universes],ignore_index=True).drop_duplicates(['market','symbol'],keep='last')
             actions=self.kis.fetch_actions(action_start,max(sessions))
         else:raise ProviderError('Unknown provider market')
         batch=MarketBatch(market,bars,universe,actions,list(sessions),{'actions_complete':True,'benchmarks_complete':True,
-            'turnover':'KR exact provider value; US/crypto provider VWAP*volume','kr_actions':'KSD nominal/capital changes require relisting/reference confirmation'})
+            'turnover':'KR exact provider value; US/crypto provider VWAP*volume','kr_actions':'KSD nominal/capital changes require relisting/reference confirmation'},tuple(deferred))
         from .price_validation_collect import collect_observations
         batch.provenance['validation_observations']=collect_observations(self,batch)
         return batch
