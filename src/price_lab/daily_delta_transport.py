@@ -58,12 +58,12 @@ def package_tag(sequence,digest):
     return f'delta-daily-{sequence:012d}-{digest}'
 
 
-def _api(method,path,*,token=None,payload=None,stream=None):
+def _api(method,path,*,token=None,payload=None,stream=None,revalidate=False):
     url=path if path.startswith('https://') else API+path
     if urlsplit(url).hostname not in ('api.github.com','uploads.github.com'):
         raise ValueError('Invalid daily package API host')
     headers={'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}
-    if method=='GET' and path.startswith('/releases?'):headers['Cache-Control']='no-cache'
+    if method=='GET' and (revalidate or path.startswith('/releases?')):headers['Cache-Control']='no-cache'
     token=token or os.environ.get('GITHUB_TOKEN')
     if token:headers['Authorization']='Bearer '+token
     if stream is not None:headers['Content-Type']='application/octet-stream'
