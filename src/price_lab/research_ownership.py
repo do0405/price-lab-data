@@ -8,6 +8,7 @@ import copy
 from datetime import datetime, timedelta, timezone
 import os
 import re
+import time
 import uuid
 
 from .daily_delta_transport import _api
@@ -24,6 +25,8 @@ LEASE_SECONDS = 600
 LOCAL_PREFERENCE_SECONDS = 180
 GUARD_SECONDS = 60
 CAS_RETRIES = 4
+READ_DELAYS = (0, 0.25, 0.5, 1)
+_COMMIT_SHA = re.compile(r'[0-9a-f]{40}')
 _LIMIT = 2 ** 63
 _OWNER = re.compile(r'[A-Za-z0-9_-]{1,160}')
 
@@ -73,13 +76,14 @@ def _validate(body):
     return body
 
 
-def _read_remote(*, token, key):
+def _read_remote(*, token, key, ref=None):
+    path = PATH if ref is None else f'{PATH}?ref={ref}'
     try:
-        remote = _api('GET', PATH, token=token)
+        remote = _api('GET', path, token=token, revalidate=True)
     except RuntimeError as exc:
-        if 'HTTP 404' not in str(exc):
+        if ref is not None or 'HTTP 404' not in str(exc):
             raise
-        history = _api('GET', HISTORY, token=token)
+        history = _api('GET', HISTORY, token=token, revalidate=True)
         if not isinstance(history, list) or history:
             raise ValueError('Missing previously initialized ownership control') from None
         return None, None
@@ -156,9 +160,19 @@ class ResearchOwner:
         self._control = copy.deepcopy(body)
 
     def _read(self):
-        body, sha = _read_remote(token=self._token, key=self._key)
-        self._observe(body)
-        return body, sha
+        prior = self._control
+        for attempt, delay in enumerate(READ_DELAYS):
+            if delay:
+                time.sleep(delay)
+            body, sha = _read_remote(token=self._token, key=self._key)
+            # Only a signed older revision of the same control may be a
+            # lagging read. Never adopt it as the current lease or head.
+            if (attempt < len(READ_DELAYS) - 1 and prior and body
+                    and body['anchor_sha256'] == prior['anchor_sha256']
+                    and body['revision'] < prior['revision']):
+                continue
+            self._observe(body)
+            return body, sha
 
     def _update(self, change):
         # Each PUT is read back, including the last uncertain attempt. A CAS
@@ -180,9 +194,17 @@ class ResearchOwner:
             if sha is not None:
                 update['sha'] = sha
             try:
-                _api('PUT', PATH, token=self._token, payload=update)
+                written = _api('PUT', PATH, token=self._token, payload=update)
+                commit = (written.get('commit') or {}).get('sha')
+                if isinstance(commit, str) and _COMMIT_SHA.fullmatch(commit):
+                    confirmed, _ = _read_remote(token=self._token, key=self._key, ref=commit)
+                    if confirmed != proposed:
+                        raise ValueError('Committed ownership control differs from proposed state')
+                    self._observe(confirmed)
             except RuntimeError:
                 continue
+            # Resolve the operation against the current branch. Another
+            # owner may have advanced it after the acknowledged commit.
         raise ValueError('Ownership update could not be confirmed')
 
     def _matches(self, body, now):

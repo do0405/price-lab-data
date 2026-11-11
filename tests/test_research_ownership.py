@@ -295,3 +295,71 @@ def test_observed_head_cannot_regress_or_change_at_same_sequence(protocol):
     store.set_body(body)
     with pytest.raises(ValueError, match='regression|conflict'):
         local.guard(force=True)
+
+
+
+def test_cloud_can_yield_after_post_publish_branch_read_lags(protocol, monkeypatch):
+    mod, store, clock, owner = protocol
+    cloud = owner('cloud', 'cloud')
+    assert cloud.acquire(anchor_sha256=ANCHOR)
+    previous = store.api('GET', mod.PATH)
+    commit = 'c' * 40
+    paths = []
+    lagging = False
+    original = store.api
+
+    def api(method, path, **kwargs):
+        nonlocal lagging
+        if method == 'PUT':
+            original(method, path, **kwargs)
+            return {'commit': {'sha': commit}}
+        paths.append((path, kwargs.get('revalidate')))
+        if path == mod.PATH and lagging:
+            lagging = False
+            return previous
+        return original(method, path, **kwargs)
+
+    monkeypatch.setattr(mod, '_api', api)
+    assert cloud.commit_head(payload())['sequence'] == 1
+    assert cloud.head['sequence'] == 1
+    lagging = True
+    assert not cloud.should_yield()
+    assert (f'{mod.PATH}?ref={commit}', True) in paths
+    assert paths[-2:] == [(mod.PATH, True), (mod.PATH, True)]
+    assert cloud.head['sequence'] == 1
+
+
+def test_persistent_older_revision_cannot_refresh_ownership(protocol):
+    mod, store, clock, owner = protocol
+    cloud = owner('cloud', 'cloud')
+    assert cloud.acquire(anchor_sha256=ANCHOR)
+    previous = cloud.control
+    assert cloud.commit_head(payload())['sequence'] == 1
+    store.set_body(previous)
+    writes = store.puts
+    with pytest.raises(ValueError, match='Authenticated ownership control regression'):
+        cloud.guard(force=True)
+    assert store.puts == writes
+    assert cloud.head['sequence'] == 1
+
+
+def test_successful_write_cannot_be_confirmed_by_a_different_signed_commit(protocol, monkeypatch):
+    mod, store, clock, owner = protocol
+    cloud = owner('cloud', 'cloud')
+    assert cloud.acquire(anchor_sha256=ANCHOR)
+    previous = store.api('GET', mod.PATH)
+    commit = 'c' * 40
+    original = store.api
+
+    def api(method, path, **kwargs):
+        if method == 'PUT':
+            original(method, path, **kwargs)
+            return {'commit': {'sha': commit}}
+        if path == f'{mod.PATH}?ref={commit}':
+            return previous
+        return original(method, path, **kwargs)
+
+    monkeypatch.setattr(mod, '_api', api)
+    with pytest.raises(ValueError, match='Committed ownership control differs'):
+        cloud.commit_head(payload())
+    assert cloud.head is None
