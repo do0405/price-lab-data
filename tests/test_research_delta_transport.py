@@ -207,6 +207,52 @@ def test_empty_research_bootstrap_requires_bounded_confirmation(monkeypatch,disc
     assert len(calls)==3
 
 
+
+
+@pytest.mark.parametrize('stale_before_write', [False, True])
+def test_reservation_reads_back_the_written_commit_despite_a_stale_branch_read(monkeypatch, stale_before_write):
+    from price_lab.research_delta_codec import _canonical, sign_control
+
+    key = b'x' * 32
+    commit = 'a' * 40
+    day = '2026-11-11'
+    floor = {'quota_day': day, 'revision': 7989, 'used': {'krx': 1086}}
+    now = datetime(2026, 11, 11, 5, 12, 25, tzinfo=timezone.utc)
+
+    def snapshot(revision, used):
+        state = dict(version='research-quota-v1', quota_day=day, revision=revision,
+                     reserved={'krx': used, 'kis': 0, 'kind': 0}, reservations={},
+                     next_retry_at=None)
+        return {'sha': str(revision), 'content': base64.b64encode(_canonical(sign_control(state, key))).decode()}
+
+    stale = snapshot(7988, 1086)
+    current = snapshot(7989, 1086)
+    read_paths, writes = [], []
+    written = {}
+
+    def api(method, path, **kwargs):
+        if method == 'PUT':
+            writes.append(kwargs['payload'])
+            assert kwargs['payload']['sha'] == current['sha']
+            written.update(sha='7990', content=kwargs['payload']['content'])
+            return {'commit': {'sha': commit}, 'content': {'sha': written['sha']}}
+        read_paths.append(path)
+        if path == f'{quota.PATH}?ref={commit}':
+            return written
+        if writes or (stale_before_write and len(read_paths) == 1):
+            return stale
+        return current
+
+    monkeypatch.setattr(quota, '_api', api)
+    result = quota.reserve_requests({'krx': 34}, reservation_id='first-after-2920',
+                                    initial=floor, now=now, key=key)
+    assert len(writes) == 1
+    assert read_paths[-1] == f'{quota.PATH}?ref={commit}'
+    assert result['status'] == 'GRANTED'
+    assert result['quota_floor']['revision'] == 7990
+    assert result['quota_floor']['used']['krx'] == 1120
+
+
 def test_deleted_initialized_journal_is_not_recreated_before_first_package(monkeypatch):
     def api(method,path,**kwargs):
         if path.startswith('/commits?'):return [{'sha':'previous-initialization'}]
