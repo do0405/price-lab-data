@@ -92,7 +92,7 @@ def _chunks(wanted,all_days):
 
 
 def collect_delta(providers,prior_payload=None,bootstrap=None,now=None,
-                  overlap_sessions=5,audit=False,reference_fetch=None,reference_sessions=6):
+                  overlap_sessions=5,audit=False,reference_fetch=None,reference_sessions=6,kr_close=False):
     """Return the next uncommitted payload; callers publish ready before saving it.
 
     Recent overlap is 1..20 completed sessions. A weekly audit adds at most20
@@ -103,6 +103,7 @@ def collect_delta(providers,prior_payload=None,bootstrap=None,now=None,
     if type(overlap_sessions) is not int or not 1<=overlap_sessions<=20:raise ValueError('Overlap must be one to twenty sessions')
     if type(reference_sessions) is not int or not 1<=reference_sessions<=6:raise ValueError('Reference window must be one to six sessions')
     if type(audit) is not bool:raise ValueError('Audit flag must be boolean')
+    if type(kr_close) is not bool or (kr_close and audit):raise ValueError('Invalid close collection mode')
     instant=pd.Timestamp(now if now is not None else datetime.now(timezone.utc))
     if instant.tzinfo is None:raise ValueError('Collection requires timezone-aware now')
     instant=instant.tz_convert('UTC')
@@ -121,12 +122,13 @@ def collect_delta(providers,prior_payload=None,bootstrap=None,now=None,
     if hasattr(providers,'load_session_evidence'):providers.load_session_evidence(copy.deepcopy(state['calendar_evidence']))
     universe={(a['market'],a['symbol']):a for a in state['assets']};parts=[];plans={};reference_days=[]
     state.setdefault('audit_cursor',{})
+    markets=('kr',) if kr_close else MARKETS
     stage='calendar';market='all'
     try:
         original_state_bytes=len(_canonical(state));payload_bytes=original_state_bytes
         if payload_bytes>MAX_RAW_BYTES:raise ValueError('Package raw size limit exceeded')
         # Resolve all exchange/publication contracts before fetching any bars.
-        for market in MARKETS:
+        for market in markets:
             known=_days(state['sessions'][market]);known_set=set(known)
             actual=_days(completed_sessions(market,known[0],now=instant))
             if any(d>instant.tz_localize(None).normalize() for d in actual):raise ValueError('Future provider session rejected')
@@ -142,9 +144,11 @@ def collect_delta(providers,prior_payload=None,bootstrap=None,now=None,
             all_days=sorted(known_set|eligible)
             # Preserve authenticated history, but publication eligibility also
             # applies to overlap, audit and reference requests for known dates.
-            wanted=(eligible-known_set)|set(published[-overlap_sessions:])
+            wanted=eligible-known_set
+            if not kr_close:wanted.update(published[-overlap_sessions:])
             if market=='kr':
-                reference_days=[str(d.date()) for d in published[-reference_sessions:]]
+                reference_scope=sorted(wanted) if kr_close else published
+                reference_days=[str(d.date()) for d in reference_scope[-reference_sessions:]]
             if market in ('us','kr'):
                 deferred=sorted(set(actual)-eligible)
                 if deferred:
@@ -161,7 +165,7 @@ def collect_delta(providers,prior_payload=None,bootstrap=None,now=None,
                 state['audit_cursor'][market]=(cursor+len(audit_days))%len(all_days)
             plans[market]=(all_days,sorted(wanted))
         deferred_kr_days=set()
-        for market in MARKETS:
+        for market in markets:
             all_days,wanted=plans[market];positions={d:n for n,d in enumerate(all_days)}
             for days in _chunks(wanted,all_days):
                 position=positions[days[0]]

@@ -4,11 +4,13 @@ The cloud is a stateless collector. It does not create, restore, cache, publish,
 
 ## Schedule and access
 
-The main-branch workflow collects at 19:37 America/New_York (08:37/09:37 next day in Korea, following DST) and 20:37 Asia/Seoul. Weekends remain enabled for crypto. GitHub may delay scheduled runs. A serialized check at minute 17 every six hours UTC verifies the latest encrypted package without collecting prices or opening a database.
+The main-branch workflow collects all markets at 10:30 and 20:37 Asia/Seoul, including weekends for crypto. Korea-only availability checks run on weekdays at 15:37, 15:52, 16:07, 16:22, 17:07, 18:07 and 19:07 Seoul time. GitHub may delay scheduled runs. A serialized check at minute 17 every six hours UTC verifies the latest encrypted package without collecting prices or opening a database.
 
 Credentials belong only in existing Actions Secrets: ALPACA_API_KEY, ALPACA_API_SECRET, KRX_API_KEY, KIS_APP_KEY, KIS_APP_SECRET, PRICE_DATA_KEY. The data key is a random 32-byte URL-safe base64 key. No broker account identifier is needed. Trusted main-branch scheduled/manual runs alone receive secrets; checkout does not persist credentials.
 
 The cloud runtime and its CI use requirements-delta.txt, which contains no database engine. Database-based application regression tests run locally. CI uses only DB-free codec, collection, and entrypoint contract tests.
+
+After 25 days without main-branch activity, a successful trusted run may update `.github/price-pipeline-status.json` with package identity, watermarks and validation time. This is not an uptime guarantee.
 
 ## Collection and transfer
 
@@ -20,7 +22,7 @@ Each immutable Release contains only daily.pldelta: canonical JSON records compr
 
 A package is made ready only after the encrypted asset is uploaded. A failed price/action/required-benchmark request does not advance collection state. Reference failures have a separate fixed status and do not erase successful price collection. Reference dates and retrieval times do not certify historical publication timing or complete security lifecycles.
 
-Korean KRX daily collection waits until 08:15 Seoul on a following Korean exchange business day for new sessions and every overlap, historical-audit and daily-reference request. XKRX skips weekends, exchange holidays and year-end closure; existing official KIS calendar evidence overrides it without new calendar API calls. Authenticated history and watermarks are preserved while a date is deferred, and the audit cursor does not advance over deferred dates. US/crypto collection continues. Deferred dates are logged as PUBLICATION_WINDOW and become eligible at the business-day cutoff. Missing eligible responses still fail required collection and never imply market closure, delisting or replacement prices.
+Korean KRX daily collection becomes eligible at the exchange's scheduled session close. Both KOSPI and KOSDAQ must return nonempty rows for the requested date. An explicitly empty board is retried after 5, 20 and 60 seconds. If the board stays empty, the date remains pending for a later run and prior authenticated prices stay available. Weekday checks start at 15:37 Seoul time and retry during the evening. These checks only collect missing Korean sessions and publish a package when at least one is ready. Regular all-market runs continue overlap and historical corrections. The same encrypted package, ciphertext hash and predecessor verification apply throughout.
 
 ## Local application
 

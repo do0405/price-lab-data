@@ -14,7 +14,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'src'))
 
 class _TraceSession:
-    """Trace safe metadata and retry transient empty KRX daily-board responses."""
+    """Record bounded request metadata for provider diagnostics."""
     def __init__(self,session):self.session=session;self.last={}
 
     def request(self,method,url,**kwargs):
@@ -25,35 +25,29 @@ class _TraceSession:
             and parsed.path in ('/svc/apis/sto/stk_bydd_trd','/svc/apis/sto/ksq_bydd_trd')
             and isinstance(day,str) and re.fullmatch(r'[0-9]{8}',day) is not None)
         if krx_board:self.last['requested_date']=f'{day[:4]}-{day[4:6]}-{day[6:]}'
-        delays=(5,20,60)
-        for attempt in range(len(delays)+1):
-            self.last['http_status']=None;self.last.pop('error_code',None)
-            response=self.session.request(method,url,**kwargs)
-            self.last['http_status']=response.status_code;body=None
-            # Large successful market-data responses need no extra JSON decoding.
-            if len(response.content)<=16384:
-                try:body=response.json()
-                except (ValueError,TypeError):pass
-                if isinstance(body,dict):
-                    for field in ('msg_cd','error_code'):
-                        code=body.get(field)
-                        if isinstance(code,str) and re.fullmatch(r'(?:EGW\d{5}|APBK\d{4}|OPSQ\d{4})',code):
-                            self.last['error_code']=code;break
-            # HTTP retries cannot detect this application-level failure. Keep
-            # the exact board/date request; never substitute data or closure.
-            if (not krx_board or response.status_code!=200 or not isinstance(body,dict)
-                    or body.get('OutBlock_1')!=[] or attempt==len(delays)):
-                return response
-            print(json.dumps(dict(event='provider_response_retry',provider='krx',reason='EMPTY_BOARD',
-                attempt=attempt+2,maximum_attempts=len(delays)+1,wait_seconds=delays[attempt],
-                **self.last)),flush=True)
-            time.sleep(delays[attempt])
+        response=self.session.request(method,url,**kwargs)
+        self.last['http_status']=response.status_code;body=None
+        # Large successful market-data responses need no extra JSON decoding.
+        if len(response.content)<=16384:
+            try:body=response.json()
+            except (ValueError,TypeError):pass
+            if isinstance(body,dict):
+                for field in ('msg_cd','error_code'):
+                    code=body.get(field)
+                    if isinstance(code,str) and re.fullmatch(r'(?:EGW\d{5}|APBK\d{4}|OPSQ\d{4})',code):
+                        self.last['error_code']=code;break
+        return response
 
 
 def observe_provider(provider,name):
-    """Preserve provider inputs and validation while recovering empty boards."""
+    """Log provider failures and empty-board retries without private inputs."""
     from price_lab.providers import ProviderError
     trace=_TraceSession(provider.client.session);provider.client.session=trace
+    if name=='krx':
+        def log_retry(attempt,maximum_attempts,wait_seconds):
+            print(json.dumps(dict(event='provider_response_retry',provider='krx',reason='EMPTY_BOARD',
+                attempt=attempt,maximum_attempts=maximum_attempts,wait_seconds=wait_seconds,**trace.last)),flush=True)
+        provider.on_empty_board_retry=log_retry
     class Observed:
         def __getattr__(self,attribute):
             value=getattr(provider,attribute)
@@ -91,7 +85,7 @@ def official_reference_fetch():
 
 
 def run_pipeline(*,root=None,audit=False,publish_only=False,integration_only=False,
-                 providers=None,reference_fetch=None,bootstrap_path=None,now=None):
+                 kr_close=False,providers=None,reference_fetch=None,bootstrap_path=None,now=None):
     from price_lab.daily_delta_codec import verify_bootstrap,package_digest
     from price_lab.daily_delta_collect import collect_delta
     from price_lab.daily_delta_transport import newest_package,load_package,publish_package,record_periodic_status
@@ -119,12 +113,12 @@ def run_pipeline(*,root=None,audit=False,publish_only=False,integration_only=Fal
     if reference_fetch is None:reference_fetch=official_reference_fetch()
     instant=now or datetime.now(timezone.utc)
     # Audit rechecks one bounded historical window, alongside recent overlap.
-    audit=audit or instant.weekday()==6
+    audit=not kr_close and (audit or instant.weekday()==6)
     for publication_attempt in range(2):
         for attempt in range(2):
             try:
                 payload=collect_delta(providers,prior_payload=prior,bootstrap=bootstrap,now=instant,
-                    audit=audit,reference_fetch=reference_fetch)
+                    audit=audit,reference_fetch=reference_fetch,kr_close=kr_close)
                 break
             except ValueError as exc:
                 failure=re.fullmatch(r'Required market collection failed \(market=(us|kr|crypto|all); stage=(calendar|fetch); type=provider\)',str(exc))
@@ -132,6 +126,11 @@ def run_pipeline(*,root=None,audit=False,publish_only=False,integration_only=Fal
                 print(json.dumps(dict(event='collection_retry',market=failure[1],stage=failure[2],
                     attempt=2,maximum_attempts=2,wait_seconds=65)),flush=True)
                 time.sleep(65)
+        if kr_close and not payload['parts']:
+            result=dict(stage='kr_close',status='NO_NEW_KR_SESSION_READY',unchanged=True,
+                sequence=prior['sequence'] if prior else 0,cloud_database=False)
+            print(json.dumps(result),flush=True)
+            return result
         try:
             result=publish_package(payload,work_root=root,key=key)
             break
@@ -177,11 +176,13 @@ def run_pipeline(*,root=None,audit=False,publish_only=False,integration_only=Fal
 
 def main():
     parser=argparse.ArgumentParser()
-    parser.add_argument('--audit',action='store_true')
-    parser.add_argument('--integration-only',action='store_true')
+    mode=parser.add_mutually_exclusive_group()
+    mode.add_argument('--audit',action='store_true')
+    mode.add_argument('--integration-only',action='store_true')
+    mode.add_argument('--kr-close',action='store_true')
     args=parser.parse_args()
     assert_database_free_runtime()
-    run_pipeline(audit=args.audit,integration_only=args.integration_only)
+    run_pipeline(audit=args.audit,integration_only=args.integration_only,kr_close=args.kr_close)
     assert_database_free_runtime()
     print(json.dumps({'stage':'cloud_runtime_validation','database_engine_loaded':False,'database_files':0}),flush=True)
 

@@ -48,6 +48,21 @@ def test_retired_full_publication_cannot_be_requested(monkeypatch,tmp_path):
         pipeline_module().run_pipeline(root=tmp_path,publish_only=True)
 
 
+def test_kr_close_run_does_not_publish_empty_payload(monkeypatch,tmp_path):
+    from price_lab import daily_delta_collect as c,daily_delta_transport as t
+    monkeypatch.setattr(t,'newest_package',lambda:{'id':1})
+    monkeypatch.setattr(t,'load_package',lambda *a,**k:{'sequence':6})
+    def collect(*args,**kwargs):
+        assert kwargs['kr_close'] and kwargs['audit'] is False
+        return {'sequence':7,'parts':[]}
+    monkeypatch.setattr(c,'collect_delta',collect)
+    monkeypatch.setattr(t,'publish_package',lambda *a,**k:pytest.fail('Empty close check published a package'))
+    result=pipeline_module().run_pipeline(root=tmp_path,providers=object(),
+        reference_fetch=lambda *a:{},now=__import__('datetime').datetime.fromisoformat('2026-11-15T15:37:00+09:00'),
+        kr_close=True)
+    assert result['sequence']==6 and result['unchanged'] is True
+
+
 def test_production_collector_imports_no_database_runtime():
     root=Path(__file__).resolve().parents[1]
     for relative in ('scripts/price_pipeline.py','src/price_lab/daily_delta_collect.py','src/price_lab/daily_delta_codec.py'):
@@ -77,10 +92,9 @@ def test_cloud_provider_failure_logs_endpoint_and_code_without_private_content(c
     assert event['error_code']=='EGW00133' and 'PRIVATE' not in output
 
 
-def test_cloud_provider_empty_board_keeps_failure_and_reports_http_200(monkeypatch,capsys):
+def test_cloud_provider_empty_board_keeps_failure_and_reports_http_200(capsys):
     from price_lab.providers import HttpClient, KrxProvider, ProviderError
     module=pipeline_module();wait=[];calls=[]
-    monkeypatch.setattr(module.time,'sleep',wait.append)
     class Response:
         status_code=200
         headers={}
@@ -88,7 +102,7 @@ def test_cloud_provider_empty_board_keeps_failure_and_reports_http_200(monkeypat
         def json(self):return {'OutBlock_1':[],'msg1':'PRIVATE'}
     class Session:
         def request(self,*a,**kw):calls.append(kw);return Response()
-    provider=module.observe_provider(KrxProvider('PRIVATE',HttpClient(Session(),retries=0,min_interval=0)),'krx')
+    provider=module.observe_provider(KrxProvider('PRIVATE',HttpClient(Session(),retries=0,min_interval=0,sleep=wait.append)),'krx')
     with pytest.raises(ProviderError,match='empty'):provider.fetch_day('2026-10-21')
     import json
     output=capsys.readouterr().out;events=[json.loads(line) for line in output.splitlines()]
@@ -102,11 +116,10 @@ def test_cloud_provider_empty_board_keeps_failure_and_reports_http_200(monkeypat
 
 
 @pytest.mark.parametrize('empty_responses',[1,2,3])
-def test_cloud_krx_retries_only_the_empty_board_with_identical_request(monkeypatch,capsys,empty_responses):
+def test_cloud_krx_retries_only_the_empty_board_with_identical_request(capsys,empty_responses):
     import json
     from price_lab.providers import HttpClient,KrxProvider
     module=pipeline_module();wait=[];calls=[]
-    monkeypatch.setattr(module.time,'sleep',wait.append)
     row=dict(BAS_DD='20240102',ISU_CD='005930',TDD_OPNPRC='10',TDD_HGPRC='11',
         TDD_LWPRC='9',TDD_CLSPRC='10',ACC_TRDVOL='100',ACC_TRDVAL='1000')
     bodies=iter([{'OutBlock_1':[row]}]+[{'OutBlock_1':[]}]*empty_responses+
@@ -118,7 +131,7 @@ def test_cloud_krx_retries_only_the_empty_board_with_identical_request(monkeypat
     class Session:
         def request(self,*args,**kwargs):
             calls.append((args,kwargs));return Response(next(bodies))
-    provider=module.observe_provider(KrxProvider('PRIVATE',HttpClient(Session(),retries=0,min_interval=0)),'krx')
+    provider=module.observe_provider(KrxProvider('PRIVATE',HttpClient(Session(),retries=0,min_interval=0,sleep=wait.append)),'krx')
     bars,assets=provider.fetch_day('2024-01-02')
     assert set(bars.symbol)=={'005930','000001'} and len(assets)==2
     assert len(calls)==empty_responses+2 and all(call==calls[1] for call in calls[1:])
@@ -131,13 +144,12 @@ def test_cloud_krx_retries_only_the_empty_board_with_identical_request(monkeypat
 
 
 @pytest.mark.parametrize('mode',['defer','strict','malformed'])
-def test_cloud_krx_defers_only_exhausted_explicit_empty_boards(monkeypatch,mode):
+def test_cloud_krx_defers_only_exhausted_explicit_empty_boards(mode):
     import pandas as pd
     from price_lab.providers import HttpClient, KrxProvider, ProviderError, Providers
 
     module=pipeline_module()
     waits=[];requests=[];benchmarks=[]
-    monkeypatch.setattr(module.time,'sleep',waits.append)
 
     class Response:
         status_code=200;headers={}
@@ -164,10 +176,10 @@ def test_cloud_krx_defers_only_exhausted_explicit_empty_boards(monkeypatch,mode)
         def fetch_actions(self,start,end):
             return []
 
-    krx=module.observe_provider(KrxProvider('fixture',HttpClient(Session(),retries=0,min_interval=0)),'krx')
+    krx=module.observe_provider(KrxProvider('fixture',HttpClient(Session(),retries=0,min_interval=0,sleep=waits.append)),'krx')
     providers=Providers(alpaca=object(),krx=krx,kis=Kis(),defer_empty_krx=mode!='strict')
     days=list(pd.to_datetime(['2024-01-03','2024-01-04']))
-    assets=pd.DataFrame(columns=['market','symbol'])
+    assets=pd.DataFrame([{'market':'kr','symbol':'069500'}])
     if mode=='defer':
         batch=providers.fetch_market_part('kr',days,assets)
         assert batch.completed_sessions==days[1:]
@@ -226,11 +238,10 @@ def test_cloud_empty_board_retry_requires_exact_request_scope(monkeypatch,capsys
     assert calls==[1] and capsys.readouterr().out==''
 
 
-def test_cloud_empty_board_retry_transport_failure_clears_stale_diagnostics(monkeypatch,capsys):
+def test_cloud_empty_board_retry_transport_failure_clears_stale_diagnostics(capsys):
     import json,requests
     from price_lab.providers import HttpClient,KrxProvider,ProviderError
     module=pipeline_module();calls=[];wait=[]
-    monkeypatch.setattr(module.time,'sleep',wait.append)
     class Response:
         status_code=200;content=b'{"OutBlock_1":[],"error_code":"EGW00133"}'
         def json(self):return {'OutBlock_1':[],'error_code':'EGW00133'}
@@ -239,7 +250,7 @@ def test_cloud_empty_board_retry_transport_failure_clears_stale_diagnostics(monk
             calls.append(1)
             if len(calls)==1:return Response()
             raise requests.ConnectionError('PRIVATE')
-    provider=module.observe_provider(KrxProvider('PRIVATE',HttpClient(Session(),retries=0,min_interval=0)),'krx')
+    provider=module.observe_provider(KrxProvider('PRIVATE',HttpClient(Session(),retries=0,min_interval=0,sleep=wait.append)),'krx')
     with pytest.raises(ProviderError,match='transport'):provider.fetch_day('2024-01-02')
     output=capsys.readouterr().out;events=[json.loads(line) for line in output.splitlines()]
     assert calls==[1,1] and wait==[5] and len(events)==2

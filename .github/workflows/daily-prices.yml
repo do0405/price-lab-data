@@ -4,7 +4,14 @@ on:
     # US daily bars become eligible at 10:30 Seoul time after the US session date.
     - cron: '30 10 * * *'
       timezone: Asia/Seoul
-    # Post-Korea-close; weekends retained for crypto and revision checks.
+    # Korea-only readiness checks near the normal close and through the evening.
+    - cron: '37,52 15 * * 1-5'
+      timezone: Asia/Seoul
+    - cron: '7,22 16 * * 1-5'
+      timezone: Asia/Seoul
+    - cron: '7 17-19 * * 1-5'
+      timezone: Asia/Seoul
+    # All-market overlap/revisions; weekends retained for crypto.
     - cron: '37 20 * * *'
       timezone: Asia/Seoul
     # Verify the non-DB package log every six hours.
@@ -19,6 +26,11 @@ on:
         default: false
       integration_only:
         description: 'Verify the latest encrypted daily package only'
+        required: false
+        type: boolean
+        default: false
+      kr_close:
+        description: 'Check for uncollected Korean sessions only'
         required: false
         type: boolean
         default: false
@@ -59,11 +71,14 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           FULL_AUDIT: ${{ inputs.audit && 'true' || 'false' }}
           INTEGRATION_ONLY: ${{ (inputs.integration_only || github.event.schedule == '17 */6 * * *') && 'true' || 'false' }}
+          KR_CLOSE: ${{ (inputs.kr_close || github.event.schedule == '37,52 15 * * 1-5' || github.event.schedule == '7,22 16 * * 1-5' || github.event.schedule == '7 17-19 * * 1-5') && 'true' || 'false' }}
         run: |
           if [ "$INTEGRATION_ONLY" = "true" ]; then
             python scripts/price_pipeline.py --integration-only
           elif [ "$FULL_AUDIT" = "true" ]; then
             python scripts/price_pipeline.py --audit
+          elif [ "$KR_CLOSE" = "true" ]; then
+            python scripts/price_pipeline.py --kr-close
           else
             python scripts/price_pipeline.py
           fi

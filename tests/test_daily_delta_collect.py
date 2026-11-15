@@ -123,6 +123,28 @@ def test_empty_krx_days_do_not_block_other_markets_and_are_recovered(monkeypatch
     assert later['state']['watermarks']['kr']=='2024-01-05'
 
 
+def test_kr_close_collection_keeps_other_watermarks_and_retries_a_missing_day(monkeypatch):
+    c=calendar(monkeypatch)
+    prior=c.collect_delta(Provider(),bootstrap=bootstrap(),now=NOW)
+    calendar(monkeypatch,['2024-01-02','2024-01-03','2024-01-04','2024-01-05','2024-01-08'])
+    now='2024-01-08T15:37:00+09:00'
+
+    class EmptyBoard(Provider):
+        def fetch_market_part(self,market,days,assets,**kwargs):
+            self.calls.append((market,days))
+            return MarketBatch(market,pd.DataFrame(),assets,[],[],{},tuple(days))
+
+    pending=EmptyBoard()
+    deferred=c.collect_delta(pending,prior_payload=prior,now=now,kr_close=True)
+    assert pending.calls==[('kr',[pd.Timestamp('2024-01-08')])]
+    assert deferred['parts']==[] and deferred['state']['sessions']==prior['state']['sessions']
+    recovered=Provider()
+    published=c.collect_delta(recovered,prior_payload=prior,now=now,kr_close=True)
+    assert [(p['market'],p['sessions']) for p in published['parts']]==[('kr',['2024-01-08'])]
+    assert published['state']['watermarks']=={**prior['state']['watermarks'],'kr':'2024-01-08'}
+    assert c.collect_delta(Provider(),prior_payload=published,now=now,kr_close=True)['parts']==[]
+
+
 def test_holiday_reconciliation_and_kr_publication_delay_preserve_known_sessions(monkeypatch):
     c=calendar(monkeypatch)
     class OfficialCalendar(Provider):
@@ -155,6 +177,8 @@ def test_pending_kr_split_record_date_is_revisited_until_relisting_is_observed(m
     provider=Provider()
     c.collect_delta(provider,prior_payload=first,now=NOW,overlap_sessions=1)
     assert all(start<=pd.Timestamp('2023-01-01') for m,_,_,start,_ in provider.calls if m=='kr')
+
+
 
 
 @pytest.mark.parametrize('audit',[False,True])
@@ -313,36 +337,39 @@ def test_invalid_required_benchmark_rejects_whole_collection(monkeypatch,market,
 
 
 @pytest.mark.parametrize('instant,ready',[
-    ('2026-10-24T10:00:00+09:00',False),
-    ('2026-10-25T20:37:00+09:00',False),
-    ('2026-10-26T00:00:58+09:00',False),
-    ('2026-10-26T08:14:59+09:00',False),
-    ('2026-10-26T08:15:00+09:00',True),
-    ('2026-10-25T23:15:00Z',True),
+    ('2026-10-23T15:29:59+09:00',False),
+    ('2026-10-23T15:30:00+09:00',True),
+    ('2026-10-24T10:00:00+09:00',True),
+    ('2026-10-25T20:37:00+09:00',True),
+    ('2026-10-25T23:14:59Z',True),
 ])
-def test_kr_friday_collection_waits_for_monday_publication(instant,ready):
+def test_kr_friday_collection_is_eligible_at_friday_close(instant,ready):
     from price_lab import providers as p
     provider=p.Providers(alpaca=object(),krx=object(),kis=object())
-    days=[pd.Timestamp('2026-10-22'),pd.Timestamp('2026-10-23')]
-    assert provider.published_sessions('kr',days,now=instant)==(days if ready else days[:1])
+    days=p.completed_sessions('kr','2026-10-23',now=instant)
+    assert provider.published_sessions('kr',days,now=instant)==([pd.Timestamp('2026-10-23')] if ready else [])
 
 
-@pytest.mark.parametrize('day,before,after',[
-    ('2026-10-08','2026-10-12T08:14:59+09:00','2026-10-12T08:15:00+09:00'),
-    ('2024-09-13','2024-09-19T08:14:59+09:00','2024-09-19T08:15:00+09:00'),
-    ('2026-12-30','2027-01-04T08:14:59+09:00','2027-01-04T08:15:00+09:00'),
+@pytest.mark.parametrize('day,holiday',[
+    ('2026-10-08','2026-10-09T20:37:00+09:00'),
+    ('2024-09-13','2024-09-18T20:37:00+09:00'),
+    ('2026-12-30','2026-12-31T20:37:00+09:00'),
 ])
-def test_kr_publication_skips_holidays_and_year_end_closure(day,before,after):
+def test_kr_publication_preserves_exchange_holidays_and_year_end_closure(day,holiday):
     from price_lab import providers as p
     provider=p.Providers(alpaca=object(),krx=object(),kis=object());days=[pd.Timestamp(day)]
-    assert provider.published_sessions('kr',days,now=before)==[]
-    assert provider.published_sessions('kr',days,now=after)==days
+    completed=p.completed_sessions('kr',day,now=holiday)
+    assert provider.published_sessions('kr',completed,now=holiday)==days
 
 
-def test_kr_publication_respects_recorded_official_extra_closure():
+def test_kr_reconciliation_respects_official_extra_closure_without_delaying_earlier_prices():
     from price_lab import providers as p
-    provider=p.Providers(alpaca=object(),krx=object(),kis=object())
-    provider.calendar_evidence={'kr':{'2026-10-26':{'open':False,'provider':'kis'}}}
-    days=[pd.Timestamp('2026-10-23')]
-    assert provider.published_sessions('kr',days,now='2026-10-26T20:37:00+09:00')==[]
-    assert provider.published_sessions('kr',days,now='2026-10-27T08:15:00+09:00')==days
+    class Kis:
+        def session_status(self,days):
+            assert days==[pd.Timestamp('2026-10-26')]
+            return {'2026-10-26':False}
+    provider=p.Providers(alpaca=object(),krx=object(),kis=Kis())
+    days=list(pd.to_datetime(['2026-10-23','2026-10-26']))
+    resolved=provider.reconcile_sessions('kr',days,days[:1])
+    assert provider.published_sessions('kr',resolved,now='2026-10-26T20:37:00+09:00')==days[:1]
+    assert provider.calendar_evidence['kr']['2026-10-26']['open'] is False

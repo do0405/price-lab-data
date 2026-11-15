@@ -51,8 +51,8 @@ def _number(value):
     except (TypeError,ValueError,OverflowError):raise ProviderError('Invalid provider numeric field') from None
 
 
-def completed_sessions(market,start,now=None,close_delay_minutes=15):
-    """Exchange-calendar closes plus publication delay; crypto days are UTC."""
+def completed_sessions(market,start,now=None,close_delay_minutes=None):
+    """Use exchange closes for KRX and completed UTC days for crypto."""
     if market not in MARKETS:raise ValueError('Unknown market')
     instant=pd.Timestamp(now if now is not None else datetime.now(timezone.utc))
     if instant.tzinfo is None:raise ValueError('now must be timezone-aware')
@@ -64,6 +64,7 @@ def completed_sessions(market,start,now=None,close_delay_minutes=15):
     import exchange_calendars as xcals
     cal=xcals.get_calendar('XNYS' if market=='us' else 'XKRX',start=first-pd.Timedelta(days=7),end=instant.date()+pd.Timedelta(days=7))
     schedule=cal.schedule
+    if close_delay_minutes is None:close_delay_minutes=0 if market=='kr' else 15
     closes=pd.to_datetime(schedule['close'],utc=True)+pd.Timedelta(minutes=close_delay_minutes)
     labels=pd.DatetimeIndex(schedule.index).tz_localize(None).normalize()
     return list(labels[(labels>=first)&(closes<=instant).to_numpy()])
@@ -262,15 +263,29 @@ class AlpacaProvider:
 
 
 class KrxProvider:
-    def __init__(self,key=None,client=None):self._key=key if key is not None else os.environ.get('KRX_API_KEY');self.client=client or HttpClient(min_interval=1.)
+    def __init__(self,key=None,client=None):
+        self._key=key if key is not None else os.environ.get('KRX_API_KEY')
+        self.client=client or HttpClient(min_interval=1.)
+        self.on_empty_board_retry=None
+
+    def _daily_board(self,endpoint,day):
+        delays=(5,20,60)
+        for attempt in range(len(delays)+1):
+            payload=self.client.request_json('GET','https://data-dbg.krx.co.kr/svc/apis/sto/'+endpoint,
+                headers={'AUTH_KEY':self._key},params={'basDd':day})
+            records=payload.get('OutBlock_1') if isinstance(payload,dict) else None
+            if not isinstance(records,list):raise ProviderError('KRX empty or missing board response')
+            if records:return records
+            if attempt==len(delays):raise KrxEmptyBoard('KRX empty or missing board response')
+            if self.on_empty_board_retry is not None:
+                self.on_empty_board_retry(attempt+2,len(delays)+1,delays[attempt])
+            self.client.sleep(delays[attempt])
+
     def fetch_day(self,date):
         if not self._key:raise ProviderError('Missing KRX credentials')
         rows=[];assets=[];label=pd.Timestamp(date).normalize();day=label.strftime('%Y%m%d')
         for board,endpoint in [('KOSPI','stk_bydd_trd'),('KOSDAQ','ksq_bydd_trd')]:
-            payload=self.client.request_json('GET','https://data-dbg.krx.co.kr/svc/apis/sto/'+endpoint,headers={'AUTH_KEY':self._key},params={'basDd':day})
-            records=payload.get('OutBlock_1')
-            if not isinstance(records,list):raise ProviderError('KRX empty or missing board response')
-            if not records:raise KrxEmptyBoard('KRX empty or missing board response')
+            records=self._daily_board(endpoint,day)
             for record in records:
                 if str(record.get('BAS_DD'))!=day:raise ProviderError('KRX requested date mismatch')
                 symbol=str(record['ISU_CD']).zfill(6)
@@ -401,40 +416,14 @@ class Providers:
         for day,opened in states.items():proof[day]={'open':opened,'provider':'kis','tr_id':'CTCA0903R'}
         return [d for d in all_dates if _day(d) not in states or states[_day(d)]]
     def published_sessions(self,market,sessions,now=None):
-        """Return completed sessions eligible for daily price collection.
-
-        US sessions become eligible at 10:30 Seoul on the next calendar day.
-        KRX sessions wait until 08:15 Seoul on a later Korean exchange business day,
-        including when rechecking already authenticated prices. Recorded KIS
-        holiday evidence overrides the library calendar without new API calls.
-        """
+        """Apply the US publication cutoff to exchange-completed sessions."""
         if market not in ('us','kr'):return list(sessions)
         instant=pd.Timestamp(now if now is not None else datetime.now(timezone.utc))
         if instant.tzinfo is None:raise ValueError('now must be timezone-aware')
+        if market=='kr':return list(sessions)
         instant=instant.tz_convert('Asia/Seoul')
-        if market=='us':
-            ready_before=(instant-pd.Timedelta(hours=10,minutes=30)).tz_localize(None).normalize()
-            return [day for day in sessions if pd.Timestamp(day)<ready_before]
-        if not sessions:return []
-        first=min(pd.Timestamp(d) for d in sessions)
-        through=(instant-pd.Timedelta(hours=8,minutes=15)).tz_localize(None).normalize()
-        if first>through:return []
-        import exchange_calendars as xcals
-        calendar=xcals.get_calendar('XKRX',start=first-pd.Timedelta(days=7),end=through+pd.Timedelta(days=7))
-        labels=pd.DatetimeIndex(calendar.schedule.index).tz_localize(None).normalize()
-        publication_days=set(labels[(labels>=first)&(labels<=through)])
-        evidence={day:item['open'] for day,item in self.calendar_evidence.get('kr',{}).items()
-            if isinstance(item,dict) and type(item.get('open')) is bool}
-        cached=getattr(self.kis,'_calendar',{})
-        if isinstance(cached,dict):evidence.update({day:opened for day,opened in cached.items() if type(opened) is bool})
-        for day,opened in evidence.items():
-            label=pd.Timestamp(day)
-            if first<=label<=through:
-                if opened:publication_days.add(label)
-                else:publication_days.discard(label)
-        if not publication_days:return []
-        latest_publication=max(publication_days)
-        return [d for d in sessions if pd.Timestamp(d)<latest_publication]
+        ready_before=(instant-pd.Timedelta(hours=10,minutes=30)).tz_localize(None).normalize()
+        return [day for day in sessions if pd.Timestamp(day)<ready_before]
     def fetch_market(self,market,sessions,assets,audit=False):
         return self.fetch_market_part(market,sessions,assets,audit=audit)
     def fetch_market_part(self,market,sessions,assets,audit=False,action_start=None):
