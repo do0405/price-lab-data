@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'src'))
+MAX_COLLECTION_SECONDS=330*60
 
 
 def price_window(now):
@@ -77,7 +78,7 @@ def run_pipeline(*,seconds=420,max_requests=100,max_batches=100,work_root=None,o
     from price_lab.research_delta_collect import collect_batch,official_fetcher,extend_sessions
     from price_lab.research_quota import reserve_requests
     from price_lab import daily_delta_transport as daily
-    if not 60<=seconds<=420 or not 1<=max_requests<=200 or not 1<=max_batches<=100:raise ValueError('Invalid producer bounds')
+    if not 60<=seconds<=MAX_COLLECTION_SECONDS or not 1<=max_requests<=200 or not 1<=max_batches<=100:raise ValueError('Invalid producer bounds')
     clock=lambda:datetime.now(timezone.utc)
     if price_window(clock()):return {'status':'WAITING_PRICE_WINDOW','batches':0,'cloud_database':False}
     work=Path(work_root or ROOT/'data/research');work.mkdir(parents=True,exist_ok=True)

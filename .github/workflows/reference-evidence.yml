@@ -17,14 +17,13 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: durable-price-publication
-  queue: max
+  group: durable-research-publication
   cancel-in-progress: false
 jobs:
   collect:
     if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 350
     permissions:
       contents: write
       actions: write
@@ -49,4 +48,4 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           BATCH_REQUESTS: ${{ inputs.max_requests || '100' }}
           JOB_BATCHES: ${{ inputs.max_batches || '100' }}
-        run: python scripts/reference_pipeline.py --max-requests "$BATCH_REQUESTS" --max-batches "$JOB_BATCHES"
+        run: python scripts/reference_pipeline.py --seconds 19800 --max-requests "$BATCH_REQUESTS" --max-batches "$JOB_BATCHES"
