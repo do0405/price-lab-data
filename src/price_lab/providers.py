@@ -222,15 +222,24 @@ class AlpacaProvider:
             if not isinstance(token,str) or token in seen:raise ProviderError('Repeated or invalid page token')
             seen.add(token)
         raise ProviderError('Alpaca page limit exceeded')
-    def fetch_bars(self,market,symbols,sessions,*,batch_size=100,adjustment='raw'):
+    def fetch_bars(self,market,symbols,sessions,*,batch_size=100,adjustment='raw',asof=None):
         if market not in ('us','crypto') or not sessions:raise ProviderError('Invalid Alpaca bar request')
         if adjustment not in ('raw','split') or (market=='crypto' and adjustment!='raw'):raise ValueError('Unsupported Alpaca adjustment')
         if isinstance(batch_size,bool) or not isinstance(batch_size,int) or not 1<=batch_size<=500:raise ProviderError('Invalid Alpaca symbol batch size')
+        if market=='us':
+            # Pin Alpaca's default entity date across all request chunks/pages.
+            asof=datetime.now(timezone.utc).date().isoformat() if asof is None else asof
+            if asof!='-':
+                try:
+                    if not isinstance(asof,str) or pd.Timestamp(asof).date().isoformat()!=asof:raise ValueError()
+                except (TypeError,ValueError):raise ProviderError('Invalid Alpaca entity asof') from None
+        elif asof is not None:raise ValueError('Crypto bars do not support entity asof')
         wanted=set(pd.DatetimeIndex(sessions).normalize());rows=[]
+        start=_day(min(wanted));end=_day(max(wanted)+pd.Timedelta(days=1))+'T00:00:00Z'
         for offset in range(0,len(symbols),batch_size):
-            chunk=list(symbols[offset:offset+batch_size]);params={'symbols':','.join(chunk),'timeframe':'1Day','start':_day(min(wanted)),
-                'end':_day(max(wanted)+pd.Timedelta(days=1))+'T00:00:00Z','limit':10000,'sort':'asc'}
-            if market=='us':params.update(feed=self.feed,adjustment=adjustment)
+            chunk=list(symbols[offset:offset+batch_size]);params={'symbols':','.join(chunk),'timeframe':'1Day','start':start,
+                'end':end,'limit':10000,'sort':'asc'}
+            if market=='us':params.update(feed=self.feed,adjustment=adjustment,asof=asof)
             path='/v2/stocks/bars' if market=='us' else '/v1beta3/crypto/us/bars'
             for page in self._pages(path,params,'bars'):
                 if not isinstance(page,dict):raise ProviderError('Alpaca bars shape invalid')
@@ -251,6 +260,9 @@ class AlpacaProvider:
         if frame.empty:raise ProviderError('Alpaca empty completed-session bars')
         if frame.duplicated(['symbol','session_date']).any():raise ProviderError('Duplicate Alpaca bar key')
         frame['trade_count']=pd.array(frame.trade_count,dtype='Int64')
+        if market=='us':
+            frame.attrs['alpaca_query']=dict(symbols=list(symbols),timeframe='1Day',start=start,end=end,
+                feed=self.feed,asof=asof,adjustment=adjustment,batch_size=batch_size)
         return frame
     def fetch_actions(self,start,end):
         result=[]
@@ -456,6 +468,7 @@ class Providers:
         else:raise ProviderError('Unknown provider market')
         batch=MarketBatch(market,bars,universe,actions,list(sessions),{'actions_complete':True,'benchmarks_complete':True,
             'turnover':'KR exact provider value; US/crypto provider VWAP*volume','kr_actions':'KSD nominal/capital changes require relisting/reference confirmation'},tuple(deferred))
+        if 'alpaca_query' in bars.attrs:batch.provenance['alpaca_query']=dict(bars.attrs['alpaca_query'])
         from .price_validation_collect import collect_observations
         batch.provenance['validation_observations']=collect_observations(self,batch)
         return batch

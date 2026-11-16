@@ -41,6 +41,39 @@ def test_cloud_daily_collects_then_publishes_without_restoring_any_database(monk
     assert not list(tmp_path.rglob('*.duckdb'))
 
 
+def test_alpaca_raw_query_survives_authenticated_daily_publication(tmp_path,monkeypatch):
+    import pandas as pd
+    from price_lab.providers import AlpacaProvider,Providers
+    from price_lab.daily_delta_collect import _part
+    from price_lab.daily_delta_codec import seal_package,open_package,package_digest
+    from test_daily_delta_codec import payload
+
+    requests=[]
+    class Client:
+        def request_json(self,method,url,*,headers,params):
+            requests.append(dict(params))
+            return {'bars':{symbol:[dict(t='2024-01-04T05:00:00Z',o=10,h=11,l=9,c=10,v=100,vw=10,n=2)]
+                for symbol in params['symbols'].split(',')},'next_page_token':None}
+
+    assets=pd.DataFrame([dict(market='us',symbol=s,name=s,exchange='NYSE') for s in ('SPY','QQQ')])
+    alpaca=AlpacaProvider('fixture','fixture',Client())
+    monkeypatch.setattr(alpaca,'fetch_assets',lambda market:assets)
+    monkeypatch.setattr(alpaca,'fetch_actions',lambda start,end:[])
+    sessions=[pd.Timestamp('2024-01-04')]
+    batch=Providers(alpaca=alpaca).fetch_market_part('us',sessions,assets)
+    item=payload()
+    item['parts'][0]=_part(batch,'us',sessions,sessions[0])
+    path=tmp_path/'daily.pldelta'
+    sealed=seal_package(item,path,b'x'*32)
+    reopened=open_package(path,b'x'*32)
+    query=reopened['parts'][0]['provenance']['alpaca_query']
+    assert sealed['package_sha256']==package_digest(reopened)
+    raw=next(r for r in requests if r['adjustment']=='raw')
+    assert query['symbols']==raw['symbols'].split(',')
+    assert all(query[k]==raw[k] for k in ('timeframe','start','end','feed','asof','adjustment'))
+    assert all(r['asof']==query['asof'] for r in requests)
+
+
 def test_retired_full_publication_cannot_be_requested(monkeypatch,tmp_path):
     from price_lab import daily_delta_transport as t
     monkeypatch.setattr(t,'newest_package',lambda:None)

@@ -43,7 +43,9 @@ def collect_observations(providers, batch, *, max_symbols=3):
     observed=datetime.now(timezone.utc).isoformat()
     try:
         if batch.market=='us':
-            evidence=providers.alpaca.fetch_bars('us',selected,days,adjustment='split')
+            query=batch.provenance.get('alpaca_query')
+            scope={'asof':query['asof']} if query and query.get('asof') else {}
+            evidence=providers.alpaca.fetch_bars('us',selected,days,adjustment='split',**scope)
         else:
             import pandas as pd
             samples=[]
