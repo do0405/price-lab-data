@@ -68,6 +68,14 @@ def _part(batch,market,days,action_start):
             raise ValueError('Invalid required benchmark OHLC')
     if 'source' not in frame:frame['source']='provider'
     if 'reference_previous_close' not in frame:frame['reference_previous_close']=None
+    provenance=dict(batch.provenance)
+    if market=='us' and frame.source.eq('alpaca').any():
+        query=provenance.get('alpaca_query') or batch.bars.attrs.get('alpaca_query')
+        if (not isinstance(query,dict) or not {'symbols','start','end','asof'}<=query.keys()
+                or query.get('adjustment')!='raw' or query.get('timeframe')!='1Day'
+                or query.get('feed') not in ('sip','iex')):
+            raise ValueError('Alpaca raw query provenance required before daily publication')
+        provenance['alpaca_query']=query
     rows=_native(frame[metadata_columns(frame,RAW_COLUMNS,BAR_METADATA)].to_dict('records'))
     supplements=frame.is_supplement.tolist() if 'is_supplement' in frame else [None]*len(rows)
     for row,supplementary in zip(rows,supplements):
@@ -78,7 +86,7 @@ def _part(batch,market,days,action_start):
         elif row['source']=='kis_etf_raw':row['is_supplement']=True
     rows.sort(key=lambda r:(r['session_date'],r['symbol']))
     return dict(market=market,sessions=sorted(expected),action_start=str(action_start.date()),bars=rows,
-                assets=_asset_records(batch.assets),actions=_native(batch.actions),provenance=_native(batch.provenance))
+                assets=_asset_records(batch.assets),actions=_native(batch.actions),provenance=_native(provenance))
 
 
 def _chunks(wanted,all_days):

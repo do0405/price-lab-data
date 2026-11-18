@@ -61,8 +61,10 @@ def test_alpaca_raw_query_survives_authenticated_daily_publication(tmp_path,monk
     monkeypatch.setattr(alpaca,'fetch_actions',lambda start,end:[])
     sessions=[pd.Timestamp('2024-01-04')]
     batch=Providers(alpaca=alpaca).fetch_market_part('us',sessions,assets)
+    retained_query=batch.provenance.pop('alpaca_query')
     item=payload()
     item['parts'][0]=_part(batch,'us',sessions,sessions[0])
+    assert item['parts'][0]['provenance']['alpaca_query']==retained_query
     path=tmp_path/'daily.pldelta'
     sealed=seal_package(item,path,b'x'*32)
     reopened=open_package(path,b'x'*32)
@@ -72,6 +74,9 @@ def test_alpaca_raw_query_survives_authenticated_daily_publication(tmp_path,monk
     assert query['symbols']==raw['symbols'].split(',')
     assert all(query[k]==raw[k] for k in ('timeframe','start','end','feed','asof','adjustment'))
     assert all(r['asof']==query['asof'] for r in requests)
+    batch.bars.attrs.pop('alpaca_query')
+    with pytest.raises(ValueError,match='query provenance required'):
+        _part(batch,'us',sessions,sessions[0])
 
 
 def test_retired_full_publication_cannot_be_requested(monkeypatch,tmp_path):
