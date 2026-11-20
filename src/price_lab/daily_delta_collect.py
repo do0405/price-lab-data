@@ -130,6 +130,7 @@ def collect_delta(providers,prior_payload=None,bootstrap=None,now=None,
     if hasattr(providers,'load_session_evidence'):providers.load_session_evidence(copy.deepcopy(state['calendar_evidence']))
     universe={(a['market'],a['symbol']):a for a in state['assets']};parts=[];plans={};reference_days=[]
     state.setdefault('audit_cursor',{})
+    audit_before=copy.deepcopy(state['audit_cursor'])
     markets=('kr',) if kr_close else MARKETS
     stage='calendar';market='all'
     try:
@@ -141,7 +142,13 @@ def collect_delta(providers,prior_payload=None,bootstrap=None,now=None,
             actual=_days(completed_sessions(market,known[0],now=instant))
             if any(d>instant.tz_localize(None).normalize() for d in actual):raise ValueError('Future provider session rejected')
             if hasattr(providers,'reconcile_sessions'):
-                reconciled=_days(providers.reconcile_sessions(market,list(actual),list(known)))
+                from .providers import KisTemporaryError
+                try:reconciled=_days(providers.reconcile_sessions(market,list(actual),list(known)))
+                except KisTemporaryError:
+                    if market!='kr' or not getattr(providers,'defer_temporary_kis',False):raise
+                    plans[market]=(known,[])
+                    print(json.dumps(dict(event='collection_deferred',market=market,reason='KIS_CALENDAR_DEFERRED')),flush=True)
+                    continue
                 if not set(reconciled)<=set(actual):raise ValueError('Calendar reconciliation added unexpected sessions')
                 actual=reconciled
             published=actual
@@ -205,7 +212,8 @@ def collect_delta(providers,prior_payload=None,bootstrap=None,now=None,
                     if _days(batch.completed_sessions)!=days:
                         raise ValueError('Incomplete required market session coverage')
                     deferred_kr_days.update(deferred)
-                    print(json.dumps(dict(event='collection_deferred',market=market,reason='KRX_EMPTY_BOARD',
+                    reason='KIS_TEMPORARY_ERROR' if batch.provenance.get('deferred_reason')=='KIS_TEMPORARY_ERROR' else 'KRX_EMPTY_BOARD'
+                    print(json.dumps(dict(event='collection_deferred',market=market,reason=reason,
                         sessions=[str(day.date()) for day in sorted(deferred)])),flush=True)
                     if not days:continue
                 part=_part(batch,market,days,action_start)
@@ -217,6 +225,8 @@ def collect_delta(providers,prior_payload=None,bootstrap=None,now=None,
                     key=(asset['market'],asset['symbol'])
                     universe[key]={**universe.get(key,{}),**{k:v for k,v in asset.items() if v is not None}}
             if market=='kr' and deferred_kr_days:
+                if market in audit_before:state['audit_cursor'][market]=audit_before[market]
+                else:state['audit_cursor'].pop(market,None)
                 # Keep already published history; absent new dates stay in the next run's gap set.
                 known=set(_days(state['sessions'][market]))
                 all_days=[day for day in all_days if day in known or day not in deferred_kr_days]

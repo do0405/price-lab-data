@@ -29,6 +29,14 @@ class ProviderError(RuntimeError):pass
 class KrxEmptyBoard(ProviderError):pass
 
 
+class KisTemporaryError(ProviderError):
+    retryable=True
+    def __init__(self,code):
+        if code not in {'OPSQ0008','EGW00201'}:raise ValueError('Explicit temporary KIS code required')
+        self.code=code
+        super().__init__('KIS unsuccessful response')
+
+
 @dataclass
 class MarketBatch:
     market:str
@@ -318,6 +326,7 @@ class KisProvider:
     def __init__(self,key=None,secret=None,client=None):
         self._key=key if key is not None else os.environ.get('KIS_APP_KEY');self._secret=secret if secret is not None else os.environ.get('KIS_APP_SECRET')
         self.client=client or HttpClient(min_interval=.2);self._token=None;self._calendar={}
+        self.on_business_retry=None
     def _headers(self,tr_id):
         if not self._key or not self._secret:raise ProviderError('Missing KIS credentials')
         if self._token is None:
@@ -326,9 +335,16 @@ class KisProvider:
             if not isinstance(self._token,str):raise ProviderError('KIS token unavailable')
         return {'authorization':'Bearer '+self._token,'appkey':self._key,'appsecret':self._secret,'tr_id':tr_id,'custtype':'P'}
     def _get(self,path,tr_id,params):
-        value=self.client.request_json('GET',self.BASE+path,headers=self._headers(tr_id),params=params)
-        if value.get('rt_cd')!='0':raise ProviderError('KIS unsuccessful response')
-        return value
+        delays=(1,5,20)
+        for attempt in range(len(delays)+1):
+            value=self.client.request_json('GET',self.BASE+path,headers=self._headers(tr_id),params=params)
+            if value.get('rt_cd')=='0':return value
+            code=value.get('msg_cd')
+            if code not in {'OPSQ0008','EGW00201'}:raise ProviderError('KIS unsuccessful response')
+            if attempt==len(delays):raise KisTemporaryError(code)
+            if self.on_business_retry is not None:
+                self.on_business_retry(attempt+2,len(delays)+1,delays[attempt])
+            self.client.sleep(delays[attempt])
     def session_status(self,dates):
         """Reuse every returned day; never infer closure from an empty response."""
         wanted=sorted({_day(d) for d in dates})
@@ -407,8 +423,9 @@ class KisProvider:
 
 class Providers:
     """Composition used by ingestion; all required subproviders must succeed."""
-    def __init__(self,alpaca=None,krx=None,kis=None,raw_dir=None,*,defer_empty_krx=False):
+    def __init__(self,alpaca=None,krx=None,kis=None,raw_dir=None,*,defer_empty_krx=False,defer_temporary_kis=False):
         self.defer_empty_krx=defer_empty_krx
+        self.defer_temporary_kis=defer_temporary_kis
         self.alpaca=alpaca or AlpacaProvider(client=HttpClient(raw_dir=raw_dir))
         self.krx=krx or KrxProvider(client=HttpClient(min_interval=1.,raw_dir=raw_dir))
         self.kis=kis or KisProvider(client=HttpClient(min_interval=.2,raw_dir=raw_dir))
@@ -451,6 +468,7 @@ class Providers:
             bars=self.alpaca.fetch_bars(market,symbols,sessions)
             if market=='us':actions=self.alpaca.fetch_actions(action_start,max(sessions))
         elif market=='kr':
+            requested_sessions=tuple(sessions)
             frames=[];universes=[]
             for date in sessions:
                 try:b,a=self.krx.fetch_day(date)
@@ -462,9 +480,14 @@ class Providers:
             if deferred:
                 sessions=[day for day in sessions if day not in deferred]
                 if not sessions:return MarketBatch(market,pd.DataFrame(),universe,[],[],{},tuple(deferred))
-            frames.append(self.kis.fetch_benchmarks(sessions));bars=pd.concat(frames,ignore_index=True)
-            universe=pd.concat([universe,*universes],ignore_index=True).drop_duplicates(['market','symbol'],keep='last')
-            actions=self.kis.fetch_actions(action_start,max(sessions))
+            try:
+                frames.append(self.kis.fetch_benchmarks(sessions));bars=pd.concat(frames,ignore_index=True)
+                universe=pd.concat([universe,*universes],ignore_index=True).drop_duplicates(['market','symbol'],keep='last')
+                actions=self.kis.fetch_actions(action_start,max(sessions))
+            except KisTemporaryError:
+                if not self.defer_temporary_kis:raise
+                return MarketBatch(market,pd.DataFrame(),universe,[],[],
+                    {'deferred_reason':'KIS_TEMPORARY_ERROR'},requested_sessions)
         else:raise ProviderError('Unknown provider market')
         batch=MarketBatch(market,bars,universe,actions,list(sessions),{'actions_complete':True,'benchmarks_complete':True,
             'turnover':'KR exact provider value; US/crypto provider VWAP*volume','kr_actions':'KSD nominal/capital changes require relisting/reference confirmation'},tuple(deferred))

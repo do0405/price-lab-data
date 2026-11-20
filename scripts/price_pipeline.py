@@ -48,6 +48,11 @@ def observe_provider(provider,name):
             print(json.dumps(dict(event='provider_response_retry',provider='krx',reason='EMPTY_BOARD',
                 attempt=attempt,maximum_attempts=maximum_attempts,wait_seconds=wait_seconds,**trace.last)),flush=True)
         provider.on_empty_board_retry=log_retry
+    if name=='kis':
+        def log_business_retry(attempt,maximum_attempts,wait_seconds):
+            print(json.dumps(dict(event='provider_response_retry',provider='kis',reason='BUSINESS_ERROR',
+                attempt=attempt,maximum_attempts=maximum_attempts,wait_seconds=wait_seconds,**trace.last)),flush=True)
+        provider.on_business_retry=log_business_retry
     class Observed:
         def __getattr__(self,attribute):
             value=getattr(provider,attribute)
@@ -107,7 +112,7 @@ def run_pipeline(*,root=None,audit=False,publish_only=False,integration_only=Fal
         bootstrap=verify_bootstrap(json.loads(path.read_text(encoding='utf-8')),key=key)
     if providers is None:
         from price_lab.providers import Providers
-        providers=Providers(raw_dir=None,defer_empty_krx=True)
+        providers=Providers(raw_dir=None,defer_empty_krx=True,defer_temporary_kis=True)
         for name in ('alpaca','krx','kis'):
             setattr(providers,name,observe_provider(getattr(providers,name),name))
     if reference_fetch is None:reference_fetch=official_reference_fetch()

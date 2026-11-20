@@ -130,6 +130,68 @@ def test_cloud_provider_failure_logs_endpoint_and_code_without_private_content(c
     assert event['error_code']=='EGW00133' and 'PRIVATE' not in output
 
 
+@pytest.mark.parametrize('failures',[1,3,4])
+def test_kis_http_200_business_error_retries_exact_read_and_retains_safe_code(capsys,failures):
+    import json
+    from price_lab.providers import HttpClient,KisProvider,ProviderError
+    module=pipeline_module();calls=[];waits=[]
+    class Response:
+        status_code=200;headers={};content=b'fixture'
+        def __init__(self,failed):self.failed=failed
+        def json(self):
+            return {'rt_cd':'1','msg_cd':'OPSQ0008','msg1':'PRIVATE'} if self.failed else {'rt_cd':'0','output':[]}
+    class Session:
+        def request(self,method,url,**kwargs):
+            calls.append((method,url,kwargs['params']))
+            return Response(len(calls)<=failures)
+    client=HttpClient(Session(),retries=0,min_interval=0,sleep=waits.append)
+    provider=KisProvider('PRIVATE','PRIVATE',client);provider._token='PRIVATE'
+    provider=module.observe_provider(provider,'kis')
+    if failures==4:
+        with pytest.raises(ProviderError) as caught:provider._get('/read','TR',{'scope':'same'})
+        assert caught.value.retryable and caught.value.code=='OPSQ0008'
+    else:assert provider._get('/read','TR',{'scope':'same'})['rt_cd']=='0'
+    assert len(calls)==min(failures+1,4)
+    assert all(call==calls[0] for call in calls)
+    assert waits==[1,5,20][:min(failures,3)]
+    output=capsys.readouterr().out
+    assert 'PRIVATE' not in output
+    events=[json.loads(line) for line in output.splitlines()]
+    assert len(events)==min(failures,3)
+    assert all(event['event']=='provider_response_retry' and event['error_code']=='OPSQ0008' for event in events)
+
+
+@pytest.mark.parametrize('failing_step',['fetch_benchmarks','fetch_actions'])
+def test_temporary_kis_failure_defers_kr_prices_without_approving_missing_actions(failing_step):
+    import pandas as pd
+    from price_lab.providers import Providers,KisTemporaryError
+    days=list(pd.to_datetime(['2024-01-03','2024-01-04']))
+    class Krx:
+        def fetch_day(self,day):return pd.DataFrame(),pd.DataFrame()
+    class Kis:
+        def fetch_benchmarks(self,days):
+            if failing_step=='fetch_benchmarks':raise KisTemporaryError('OPSQ0008')
+            return pd.DataFrame()
+        def fetch_actions(self,*args):raise KisTemporaryError('OPSQ0008')
+    provider=Providers(alpaca=object(),krx=Krx(),kis=Kis(),defer_empty_krx=True,defer_temporary_kis=True)
+    result=provider.fetch_market_part('kr',days,pd.DataFrame())
+    assert result.deferred_sessions==tuple(days) and result.completed_sessions==[]
+    assert result.bars.empty and result.actions==[]
+    assert result.provenance=={'deferred_reason':'KIS_TEMPORARY_ERROR'}
+
+
+def test_unclassified_kis_business_error_is_not_retried():
+    from price_lab.providers import KisProvider,ProviderError
+    calls=[]
+    class Client:
+        def request_json(self,*args,**kwargs):
+            calls.append(args)
+            return {'rt_cd':'1','msg_cd':'EGW00123','msg1':'PRIVATE'}
+    provider=KisProvider('PRIVATE','PRIVATE',Client());provider._token='PRIVATE'
+    with pytest.raises(ProviderError):provider._get('/read','TR',{})
+    assert len(calls)==1
+
+
 def test_cloud_provider_empty_board_keeps_failure_and_reports_http_200(capsys):
     from price_lab.providers import HttpClient, KrxProvider, ProviderError
     module=pipeline_module();wait=[];calls=[]

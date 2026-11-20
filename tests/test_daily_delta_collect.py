@@ -61,6 +61,38 @@ def test_missing_sessions_overlap_assets_and_chain_are_db_free(monkeypatch):
     assert second['sequence']==2 and second['previous_package_sha256']==package_digest(first)
 
 
+@pytest.mark.parametrize('phase',['calendar','fetch'])
+def test_temporary_kis_defer_preserves_kr_cursor_and_authenticated_other_markets(monkeypatch,tmp_path,capsys,phase):
+    import json
+    from price_lab.providers import KisTemporaryError
+    from price_lab.daily_delta_codec import seal_package,open_package,package_digest
+    c=calendar(monkeypatch);initial=bootstrap();before=copy.deepcopy(initial)
+    class Pending(Provider):
+        defer_temporary_kis=True
+        def reconcile_sessions(self,market,days,known):
+            if market=='kr' and phase=='calendar':raise KisTemporaryError('OPSQ0008')
+            return days
+        def fetch_market_part(self,market,sessions,assets,**kwargs):
+            if market=='kr' and phase=='fetch':
+                return MarketBatch(market,pd.DataFrame(),assets,[],[],
+                    {'deferred_reason':'KIS_TEMPORARY_ERROR'},tuple(sessions))
+            return super().fetch_market_part(market,sessions,assets,**kwargs)
+    value=c.collect_delta(Pending(),bootstrap=initial,now=NOW,audit=True)
+    assert initial==before
+    assert {part['market'] for part in value['parts']}=={'us','crypto'}
+    assert value['state']['sessions']['kr']==initial['sessions']['kr']
+    assert value['state']['watermarks']['kr']==initial['watermarks']['kr']
+    assert 'kr' not in value['state']['audit_cursor']
+    events=[json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert any(e['reason'] in {'KIS_TEMPORARY_ERROR','KIS_CALENDAR_DEFERRED'} for e in events)
+    path=tmp_path/'partial.pldelta';seal_package(value,path,b'x'*32)
+    restored=open_package(path,b'x'*32)
+    assert package_digest(restored)==package_digest(value)
+    recovered=c.collect_delta(Provider(),prior_payload=restored,now=NOW)
+    assert recovered['state']['watermarks']['kr']=='2024-01-05'
+    assert recovered['previous_package_sha256']==package_digest(value)
+
+
 @pytest.mark.parametrize('audit',[False,True])
 def test_us_collection_defers_latest_session_but_fills_older_gaps(monkeypatch,capsys,audit):
     import json
