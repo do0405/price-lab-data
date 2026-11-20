@@ -174,7 +174,7 @@ def test_temporary_kis_failure_defers_kr_prices_without_approving_missing_action
             return pd.DataFrame()
         def fetch_actions(self,*args):raise KisTemporaryError('OPSQ0008')
     provider=Providers(alpaca=object(),krx=Krx(),kis=Kis(),defer_empty_krx=True,defer_temporary_kis=True)
-    result=provider.fetch_market_part('kr',days,pd.DataFrame())
+    result=provider.fetch_market_part('kr',days,pd.DataFrame(columns=['market','symbol']))
     assert result.deferred_sessions==tuple(days) and result.completed_sessions==[]
     assert result.bars.empty and result.actions==[]
     assert result.provenance=={'deferred_reason':'KIS_TEMPORARY_ERROR'}
