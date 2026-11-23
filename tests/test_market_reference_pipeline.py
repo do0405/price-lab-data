@@ -42,6 +42,15 @@ def test_pending_topup_is_bounded_even_with_denied_providers():
     assert len(state['pending'])<100
 
 
+def test_old_catalog_checkpoint_migrates_without_repeating_404_or_losing_scope():
+    state=p.initial_state('2026-11-23'); old=s.task('SP_CATALOG','2024',page=1)
+    state['pending']=[old]; state['cursors']['daily']=NOW.date().isoformat()
+    p.plan(state,bootstrap(),NOW)
+    assert not any(t['kind']=='SP_CATALOG' for t in state['pending'])
+    assert s.task('SP_ARCHIVE','2024',page=1) in state['pending']
+    assert state['checked'][s.digest(old)]['status']=='RETIRED_ENDPOINT_REPLACED'
+
+
 def test_separate_owner_cannot_modify_existing_korean_stream(monkeypatch):
     from price_lab import research_ownership as own
     from test_research_ownership import Contents

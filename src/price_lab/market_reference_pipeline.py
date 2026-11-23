@@ -139,6 +139,14 @@ def plan(state, bootstrap, now):
     today=now.date().isoformat(); through=min(bootstrap['through'],(now-timedelta(days=1)).date().isoformat())
     state['through']=max(state['through'],through)
     pending={s.digest(t):t for t in state['pending']}
+    # Preserve old signed tasks, but do not keep retrying the retired catalog
+    # endpoint. Its exact replacement is a different task identity.
+    for key,old in list(pending.items()):
+        if old['kind']=='SP_CATALOG':
+            pending.pop(key)
+            state['checked'][key]=dict(status='RETIRED_ENDPOINT_REPLACED')
+            replacement=s.task('SP_ARCHIVE',old['entity'],day=old['requested_date'],page=old['page'])
+            if s.digest(replacement) not in state['checked']: pending.setdefault(s.digest(replacement),replacement)
     def add(t):
         key=s.digest(t)
         if key not in state['checked']: pending.setdefault(key,t)
