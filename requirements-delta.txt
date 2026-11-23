@@ -4,3 +4,4 @@ requests==2.34.2
 exchange-calendars==4.13.2
 cryptography==50.0.2
 pytest==8.4.2
+pypdf==6.11.0

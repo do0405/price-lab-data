@@ -105,6 +105,9 @@ def validate_state(state):
 
 
 def validate_payload(payload):
+    if isinstance(payload,dict) and payload.get('stream_id')=='market-reference-v1':
+        from .market_reference_sources import validate_payload as market_contract
+        return market_contract(payload)
     _fields(payload,(*_IDENTITY,'records','state'))
     if payload['schema']!='research-delta-v1' or payload['stream_id']!=STREAM:raise ValueError('Unsupported research stream')
     seq=payload['sequence']

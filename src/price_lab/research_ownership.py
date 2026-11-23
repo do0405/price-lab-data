@@ -76,14 +76,15 @@ def _validate(body):
     return body
 
 
-def _read_remote(*, token, key, ref=None):
-    path = PATH if ref is None else f'{PATH}?ref={ref}'
+def _read_remote(*, token, key, ref=None, namespace=None):
+    control_path, history_path = _control_paths(namespace)
+    path = control_path if ref is None else f'{control_path}?ref={ref}'
     try:
         remote = _api('GET', path, token=token, revalidate=True)
     except RuntimeError as exc:
         if ref is not None or 'HTTP 404' not in str(exc):
             raise
-        history = _api('GET', HISTORY, token=token, revalidate=True)
+        history = _api('GET', history_path, token=token, revalidate=True)
         if not isinstance(history, list) or history:
             raise ValueError('Missing previously initialized ownership control') from None
         return None, None
@@ -102,14 +103,21 @@ def _read_remote(*, token, key, ref=None):
     return body, remote['sha']
 
 
-def read_control(*, token=None, key=None):
+def _control_paths(namespace=None):
+    if namespace is None: return PATH, HISTORY
+    if namespace != 'market-references': raise ValueError('Unsupported ownership namespace')
+    return '/contents/.github/market-reference-owner.json', '/commits?path=.github%2Fmarket-reference-owner.json&per_page=1'
+
+
+def read_control(*, token=None, key=None, namespace=None):
     """Return authenticated control, or None only before its first creation."""
-    body, _ = _read_remote(token=token, key=key or os.environ.get('PRICE_DATA_KEY'))
+    options={} if namespace is None else dict(namespace=namespace)
+    body, _ = _read_remote(token=token, key=key or os.environ.get('PRICE_DATA_KEY'), **options)
     return body
 
 
 class ResearchOwner:
-    def __init__(self, role, *, owner_id=None, token=None, key=None, clock=None):
+    def __init__(self, role, *, owner_id=None, token=None, key=None, clock=None, namespace=None):
         if role not in ('local', 'cloud'):
             raise ValueError('Invalid ownership role')
         owner_id = uuid.uuid4().hex if owner_id is None else owner_id
@@ -124,6 +132,8 @@ class ResearchOwner:
         self._epoch = None
         self._checked_at = None
         self._last_now = None
+        self._path, _ = _control_paths(namespace)
+        self._remote_options = {} if namespace is None else dict(namespace=namespace)
 
     @property
     def control(self):
@@ -164,7 +174,7 @@ class ResearchOwner:
         for attempt, delay in enumerate(READ_DELAYS):
             if delay:
                 time.sleep(delay)
-            body, sha = _read_remote(token=self._token, key=self._key)
+            body, sha = _read_remote(token=self._token, key=self._key, **self._remote_options)
             # Only a signed older revision of the same control may be a
             # lagging read. Never adopt it as the current lease or head.
             if (attempt < len(READ_DELAYS) - 1 and prior and body
@@ -194,10 +204,10 @@ class ResearchOwner:
             if sha is not None:
                 update['sha'] = sha
             try:
-                written = _api('PUT', PATH, token=self._token, payload=update)
+                written = _api('PUT', self._path, token=self._token, payload=update)
                 commit = (written.get('commit') or {}).get('sha')
                 if isinstance(commit, str) and _COMMIT_SHA.fullmatch(commit):
-                    confirmed, _ = _read_remote(token=self._token, key=self._key, ref=commit)
+                    confirmed, _ = _read_remote(token=self._token, key=self._key, ref=commit, **self._remote_options)
                     if confirmed != proposed:
                         raise ValueError('Committed ownership control differs from proposed state')
                     self._observe(confirmed)
