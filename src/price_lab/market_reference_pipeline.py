@@ -147,6 +147,13 @@ def plan(state, bootstrap, now):
             state['checked'][key]=dict(status='RETIRED_ENDPOINT_REPLACED')
             replacement=s.task('SP_ARCHIVE',old['entity'],day=old['requested_date'],page=old['page'])
             if s.digest(replacement) not in state['checked']: pending.setdefault(s.digest(replacement),replacement)
+    if state['cursors'].get('lseg_count_contract',0)<2:
+        for key,metadata in state['checked'].items():
+            failed=metadata.get('task',{})
+            if metadata.get('status')=='RESPONSE_CONTRACT' and failed.get('kind')=='LSEG_CATALOG':
+                metadata.update(status='RECHECK_AFTER_COUNT_CONTRACT_FIX',retry_at=now.isoformat())
+                pending.setdefault(key,failed)
+        state['cursors']['lseg_count_contract']=2
     def add(t):
         key=s.digest(t)
         if key not in state['checked']: pending.setdefault(key,t)

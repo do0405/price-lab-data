@@ -55,6 +55,12 @@ def test_lseg_pagination_retains_year_and_stops_at_total():
     assert not s.discovered(s.task('LSEG_CATALOG','2016',page=1),b'{"Data":[],"TotalCount":51}')
 
 
+def test_lseg_accepts_official_integral_float_count_but_rejects_fractional():
+    t=s.task('LSEG_CATALOG','2026')
+    s.validate_response(t,b'{"Data":[],"TotalCount":2842.0}')
+    with pytest.raises(ValueError): s.validate_response(t,b'{"Data":[],"TotalCount":2.5}')
+
+
 def test_sp_archive_follows_only_next_page_of_requested_year():
     t=s.task('SP_ARCHIVE','2024',day='2026-11-24')
     found=s.discovered(t,b'<html><a href="https://press.spglobal.com/index.php?s=2429&amp;year=2024&amp;l=100&amp;o=100">Next</a></html>')

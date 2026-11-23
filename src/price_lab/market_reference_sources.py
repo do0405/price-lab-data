@@ -181,7 +181,9 @@ def validate_response(request, body):
         if not any('종목코드' in r and '업종' in r for r in rows): raise ValueError('KIND industry table missing')
     elif kind=='LSEG_CATALOG':
         value=json.loads(body)
-        if 'ErrorCode' in value or not isinstance(value.get('Data'),list) or type(value.get('TotalCount')) is not int: raise ValueError('LSEG catalog mismatch')
+        count=value.get('TotalCount')
+        if ('ErrorCode' in value or not isinstance(value.get('Data'),list) or type(count) not in (int,float)
+                or not math.isfinite(count) or not 0<=count<=1000000 or int(count)!=count): raise ValueError('LSEG catalog mismatch')
     elif kind=='RUSSELL_PDF':
         if not body.startswith(b'%PDF-'): raise ValueError('Official PDF required')
     else:
