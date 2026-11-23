@@ -79,3 +79,9 @@ def test_authenticated_separate_stream_roundtrip_and_corruption(tmp_path):
 def test_index_response_date_cannot_be_substituted():
     t=s.task('KRX_INDEX','kospi','2026-11-20')
     with pytest.raises(ValueError): s.validate_response(t,b'{"OutBlock_1":[{"BAS_DD":"20261119","IDX_NM":"KOSPI","CLSPRC_IDX":"100"}]}')
+
+
+def test_index_response_must_match_requested_family():
+    t=s.task('KRX_INDEX','kospi','2026-11-20')
+    body=b'{"OutBlock_1":[{"BAS_DD":"20261120","IDX_CLSS":"KOSDAQ","IDX_NM":"KOSDAQ","CLSPRC_IDX":"100"}]}'
+    with pytest.raises(ValueError): s.validate_response(t,body)

@@ -163,7 +163,8 @@ def validate_response(request, body):
         if not isinstance(rows,list) or not rows: raise ValueError('Missing official KRX rows')
         for row in rows:
             if kind=='KRX_INDEX':
-                if row.get('BAS_DD')!=request['requested_date'].replace('-','') or not row.get('IDX_NM') or 'CLSPRC_IDX' not in row: raise ValueError('KRX index/date mismatch')
+                if (row.get('BAS_DD')!=request['requested_date'].replace('-','') or
+                    row.get('IDX_CLSS')!=request['entity'].upper() or not row.get('IDX_NM') or 'CLSPRC_IDX' not in row): raise ValueError('KRX index/date/family mismatch')
             elif not row.get('ISU_SRT_CD'): raise ValueError('KRX security identity missing')
     elif kind=='SEC_MAP':
         value=json.loads(body)
