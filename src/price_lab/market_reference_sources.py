@@ -254,5 +254,5 @@ def validate_state(state):
     for key in ('cursors','seen','checked','cooldowns','requests'):
         if not isinstance(state[key],dict): raise ValueError('Reference map required')
     for request in state['pending']: validate_task(request)
-    if len(state['pending'])>5000 or len(canonical(state).encode())>12*1024**2: raise ValueError('Reference state bound')
+    if len(state['pending'])>5000 or len(canonical(state).encode())>32*1024**2: raise ValueError('Reference state bound')
     return state

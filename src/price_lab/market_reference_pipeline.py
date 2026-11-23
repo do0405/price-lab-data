@@ -139,6 +139,12 @@ def plan(state, bootstrap, now):
     today=now.date().isoformat(); through=min(bootstrap['through'],(now-timedelta(days=1)).date().isoformat())
     state['through']=max(state['through'],through)
     pending={s.digest(t):t for t in state['pending']}
+    refresh_kinds={'FUND_LATEST','KIND_INDUSTRY','RUSSELL_PAGE','FRED_INDEX','CBOE_INDEX','SEC_MAP'}
+    for key,old in list(pending.items()):
+        if old['kind'] in refresh_kinds and old['requested_date']:
+            pending.pop(key)
+            replacement=s.task(old['kind'],old['entity'],page=old['page'])
+            pending.setdefault(s.digest(replacement),replacement)
     # Preserve old signed tasks, but do not keep retrying the retired catalog
     # endpoint. Its exact replacement is a different task identity.
     for key,old in list(pending.items()):
@@ -154,22 +160,29 @@ def plan(state, bootstrap, now):
                 metadata.update(status='RECHECK_AFTER_COUNT_CONTRACT_FIX',retry_at=now.isoformat())
                 pending.setdefault(key,failed)
         state['cursors']['lseg_count_contract']=2
-    def add(t):
+    def add(t,refresh=False):
         key=s.digest(t)
-        if key not in state['checked']: pending.setdefault(key,t)
-    if state['cursors'].get('daily')!=today:
-        current=[s.task('FUND_LATEST',f,day=today) for f in s.FUNDS]
-        current += [s.task('KIND_INDUSTRY',day=today),s.task('RUSSELL_PAGE',day=today),s.task('SEC_MAP',day=today)]
-        current += [s.task('FRED_INDEX',index,day=today) for index in ('SP500','NASDAQ100','NASDAQCOM')]
-        current += [s.task('CBOE_INDEX',index,day=today) for index in ('VIX','VVIX')]
-        current += [s.task('LSEG_CATALOG',str(now.year),day=today),s.task('SP_ARCHIVE',str(now.year),day=today)]
+        checked=state['checked'].get(key,{})
+        if key not in state['checked'] or (refresh and checked.get('checked_at','')<(now-timedelta(days=7)).isoformat()): pending.setdefault(key,t)
+    window=today+f'T{now.hour//6*6:02d}'
+    if state['cursors'].get('current_window')!=window:
+        current=[s.task('FUND_LATEST',f) for f in s.FUNDS]
+        current += [s.task('KIND_INDUSTRY'),s.task('RUSSELL_PAGE'),s.task('SEC_MAP')]
+        current += [s.task('FRED_INDEX',index) for index in ('SP500','NASDAQ100','NASDAQCOM')]
+        current += [s.task('CBOE_INDEX',index) for index in ('VIX','VVIX')]
+        current += [s.task('LSEG_CATALOG',str(now.year)),s.task('SP_ARCHIVE',str(now.year))]
         current += [s.task('NASDAQ_NOTICE','https://ir.nasdaq.com/news-releases/news-release-details/annual-changes-nasdaq-100-indexr'+suffix) for suffix in ('-2','','-1','-3','-4','-5')]
         last=bootstrap['kr_sessions'][-1]
         current += [s.task('KRX_INDEX',family,last) for family in ('kospi','kosdaq','krx')]
         current += [s.task('KRX_MEMBERS',index,last) for index in ('KOSPI200','KOSDAQ150')]
         current += [s.task('KRX_SECTOR',market,last) for market in ('KOSPI','KOSDAQ')]
-        pending={**{s.digest(t):t for t in current if s.digest(t) not in state['checked']},**pending}
+        due={}
+        for t in current:
+            key=s.digest(t); stamp=state['checked'].get(key,{}).get('checked_at')
+            if stamp is None or datetime.fromisoformat(stamp)<=now-timedelta(hours=6): due[key]=t
+        pending={**due,**pending}
         state['cursors']['daily']=today
+        state['cursors']['current_window']=window
     for key,metadata in state['checked'].items():
         if metadata.get('task') and metadata.get('retry_at','')<=now.isoformat():
             pending.setdefault(key,metadata['task'])
@@ -190,7 +203,7 @@ def plan(state, bootstrap, now):
         elif name=='funds':
             for fund in s.FUNDS: add(s.task('FUND',fund,value))
         elif name=='sec':
-            add(s.task('SEC_SUBMISSIONS',value,cycle)); add(s.task('SEC_FACTS',value,cycle))
+            add(s.task('SEC_SUBMISSIONS',value),refresh=True); add(s.task('SEC_FACTS',value),refresh=True)
         else: add(s.task('LSEG_CATALOG' if name=='lseg' else 'SP_ARCHIVE',str(value)))
         state['cursors'][name]=cursor+1
     state['pending']=list(pending.values())
@@ -255,6 +268,7 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
                 state['pending']=[x for x in state['pending'] if s.digest(x)!=key]
         else:
             sha=hashlib.sha256(body).hexdigest()
+            changed=state['seen'].get(key)!=sha
             if sha not in state['seen'].values():
                 retrieved=fixed or datetime.now(timezone.utc)
                 records.append(dict(task=t,retrieved_at=retrieved.isoformat(),body_base64=base64.b64encode(body).decode(),body_sha256=sha))
@@ -269,7 +283,11 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
             existing={s.digest(x) for x in state['pending']}
             for child in s.discovered(t,body):
                 child_key=s.digest(child)
-                if child_key not in existing and child_key not in state['seen']:
+                stamp=state['checked'].get(child_key,{}).get('checked_at')
+                refresh=(changed and t['kind'] in ('LSEG_CATALOG','SP_ARCHIVE') and
+                         (child['kind'] in ('LSEG_CATALOG','SP_ARCHIVE') or
+                          stamp is None or datetime.fromisoformat(stamp)<=now-timedelta(days=1)))
+                if child_key not in existing and (child_key not in state['seen'] or refresh):
                     state['pending'].append(child); existing.add(child_key)
         if sum(len(r['body_base64']) for r in records)>60*1024**2: break
         sleep(1)

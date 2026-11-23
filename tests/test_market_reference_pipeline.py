@@ -51,6 +51,32 @@ def test_old_catalog_checkpoint_migrates_without_repeating_404_or_losing_scope()
     assert state['checked'][s.digest(old)]['status']=='RETIRED_ENDPOINT_REPLACED'
 
 
+def test_current_refresh_reuses_keys_every_six_hours_instead_of_growing_daily_ids():
+    from datetime import timedelta
+    state=p.initial_state('2026-11-23'); keys=set()
+    for cycle in range(12):
+        now=NOW+timedelta(hours=6*cycle)
+        p.plan(state,bootstrap(),now)
+        current=[t for t in state['pending'] if t['kind']=='FUND_LATEST']
+        assert len(current)==5 and all(t['requested_date']=='' for t in current)
+        keys.update(s.digest(t) for t in current)
+        for t in current: state['checked'][s.digest(t)]=dict(status='COLLECTED',checked_at=now.isoformat())
+        state['pending']=[t for t in state['pending'] if t['kind']!='FUND_LATEST']
+    assert len(keys)==5
+
+
+def test_weekly_sec_refresh_reuses_stable_issuer_task_identity():
+    from datetime import timedelta
+    state=p.initial_state('2026-11-23'); p.plan(state,bootstrap(),NOW)
+    old=[t for t in state['pending'] if t['kind'] in ('SEC_FACTS','SEC_SUBMISSIONS')]
+    assert len(old)==2
+    for t in old: state['checked'][s.digest(t)]=dict(status='COLLECTED',checked_at=NOW.isoformat())
+    state['pending']=[];state['cursors']['sec']=1
+    p.plan(state,bootstrap(),NOW+timedelta(days=8))
+    new=[t for t in state['pending'] if t['kind'] in ('SEC_FACTS','SEC_SUBMISSIONS')]
+    assert new==old and all(t['requested_date']=='' for t in new)
+
+
 def test_separate_owner_cannot_modify_existing_korean_stream(monkeypatch):
     from price_lab import research_ownership as own
     from test_research_ownership import Contents
