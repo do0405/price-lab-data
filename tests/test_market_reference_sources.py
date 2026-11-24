@@ -106,3 +106,64 @@ def test_official_weight_document_uses_the_fixed_public_pdf_endpoint():
     assert task['url']=='https://www.nasdaq.com/docs/global-indexes/NDX'
     assert s.validate_response(task,b'%PDF-1.7\nfixture')
     with pytest.raises(ValueError):s.task('NASDAQ_WEIGHTS','SP500')
+
+
+def citi_catalog_body():
+    return b'''<html><table id="tblCANotices"><tr><td>Company</td><td>Date of Notice</td><td></td><td>Ticker</td><td>CUSIP</td><td>Ratio (ORD:DR)</td><td>Type</td><td>Country</td><td>Exchange</td><td>Corporate Action Type</td></tr>
+    <tr><td>Example</td><td>07/14/2016</td><td><a href="previewPdf.aspx?caId=513">PDF</a></td><td>EXM</td><td>756568101</td><td>1:2</td><td>ADR</td><td>Spain</td><td>OTC</td><td>Ratio Change</td></tr></table></html>'''
+
+
+def test_citi_catalog_requires_exact_table_and_discovers_only_reported_pdf_ids():
+    task=s.task('CITI_CATALOG');body=citi_catalog_body()
+    assert s.validate_response(task,body)==body
+    row=s.citi_notices(body)[0]
+    assert row['notice_id']=='513' and row['notice_date']=='2016-07-14'
+    assert row['ratio_reported']=='1:2' and row['cusip']=='756568101'
+    assert s.discovered(task,body)==[s.task('CITI_NOTICE','513')]
+    for bad in [body.replace(b'previewPdf.aspx?caId=513',b'https://evil.example/previewPdf.aspx?caId=513'),body.replace(b'1:2',b'0:2'),body.replace(b'07/14/2016',b'02/31/2016')]:
+        with pytest.raises(ValueError):s.validate_response(task,bad)
+
+
+def test_extended_reference_endpoints_are_fixed_and_narrow():
+    for kind,entity in [('CITI_NOTICE','513'),('LSEG_WEIGHTS','US1000'),('RUSSELL_IPO_PDF','3000'),('BNY_NOTICE','AD2000235')]:
+        t=s.task(kind,entity);assert s.validate_response(t,b'%PDF-1.7\nfixture')
+        with pytest.raises(ValueError):s.task(kind,'https://evil.example/notice.pdf')
+    with pytest.raises(ValueError):s.task('LSEG_WEIGHTS','UNKNOWN')
+    for kind in ['CITI_CATALOG','LSEG_WEIGHT_CATALOG','RUSSELL_IPO_PAGE']:
+        with pytest.raises(ValueError):s.task(kind,'https://evil.example/')
+
+
+def test_lseg_weights_catalog_selects_allowlisted_core_indices_and_exact_download_url():
+    t=s.task('LSEG_WEIGHT_CATALOG')
+    url=s.task('LSEG_WEIGHTS','US1000')['url']+'?indexdetails=US1000'
+    body=json.dumps({'Data':[{'IndexId':'US1000','IndexName':'Russell 1000','Url':url,'ReportType':'StocksWeight'},
+        {'IndexId':'OTHER','IndexName':'Other','Url':'https://evil.example/','ReportType':'StocksWeight'}]}).encode()
+    assert s.discovered(t,body)==[s.task('LSEG_WEIGHTS','US1000')]
+    assert s.weight_catalog(body.replace(b'Russell 1000',b'Russell\xa01000'))==['US1000']
+    with pytest.raises(ValueError):s.validate_response(t,body.replace(url.encode(),b'https://evil.example/'))
+
+
+def test_finra_daily_is_date_scoped_json_and_paginates_only_a_full_page():
+    t=s.task('FINRA_DAILY',day='2026-11-20')
+    assert t['method']=='POST' and t['params']['dateRangeFilters'][0]=={
+        'fieldName':'calendarDay','startDate':'2026-11-20','endDate':'2026-11-20'}
+    rows=[{'OTCDailyListID':n+1,'calendarDay':'2026-11-20','dailyListEventCode':'DA'} for n in range(1000)]
+    body=json.dumps(rows).encode();assert s.validate_response(t,body)==body
+    assert s.discovered(t,body)==[s.task('FINRA_DAILY',day='2026-11-20',page=1)]
+    assert not s.discovered(t,b'[]') and s.validate_response(t,b'[]')==b'[]'
+    with pytest.raises(ValueError):s.validate_response(t,body.replace(b'2026-11-20',b'2026-11-19'))
+    with pytest.raises(ValueError):s.task('FINRA_DAILY',day='2010-01-01')
+    with pytest.raises(ValueError):s.task('FINRA_DAILY',day='2026-11-20',page=501)
+
+
+def test_citi_pdf_follows_only_exact_official_attachment_annotations(monkeypatch):
+    import pypdf
+    from types import SimpleNamespace
+    class Ref(dict):
+        def get_object(self):return self
+    urls=['https://depositaryreceipts.citi.com/adr/common/file.aspx?idf=6832',
+        'https://evil.example/adr/common/file.aspx?idf=6832',
+        'https://depositaryreceipts.citi.com/private/file.aspx?idf=6832']
+    page={'/Annots':[Ref({'/A':{'/URI':u}}) for u in urls]}
+    monkeypatch.setattr(pypdf,'PdfReader',lambda *_:SimpleNamespace(pages=[page]))
+    assert s.discovered(s.task('CITI_NOTICE','2621'),b'%PDF-fixture')==[s.task('CITI_ATTACHMENT','6832')]

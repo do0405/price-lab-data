@@ -9,6 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import time
 from urllib.parse import urlsplit
@@ -26,9 +27,12 @@ ASSET='market-reference.pldelta'
 
 def _config_targets(config):
     version=config.get('version')
-    expected={'version','ciks'}|({'research_targets'} if version==2 else set())
-    if type(version) is not int or version not in (1,2) or set(config)!=expected:
+    expected={'version','ciks'}|({'research_targets'} if version in (2,3) else set())|({'depositary_attachment_ids'} if version==3 else set())
+    if type(version) is not int or version not in (1,2,3) or set(config)!=expected:
         raise ValueError('Market bootstrap contract mismatch')
+    ids=config.get('depositary_attachment_ids',[])
+    if not isinstance(ids,list) or len(ids)>5000 or any(not isinstance(v,str) or not re.fullmatch('[1-9][0-9]{0,7}',v) for v in ids) or len(set(ids))!=len(ids):
+        raise ValueError('Bounded unique depositary attachment IDs required')
     targets=config.get('research_targets',[])
     if not isinstance(targets,list) or len(targets)>200:raise ValueError('Bounded research snapshot targets required')
     seen=set()
@@ -56,8 +60,22 @@ def enqueue_targets(config_path,targets):
     combined=sorted(merged.values(),key=lambda t:(t['snapshot_date'],t['fund']))
     if combined==old:return dict(status='UNCHANGED',targets=len(old))
     updated=dict(version=2,ciks=config['ciks'],research_targets=combined)
+    if config['version']==3:updated.update(version=3,depositary_attachment_ids=config['depositary_attachment_ids'])
     _config_targets(updated);_atomic(path,updated)
     return dict(status='UPDATED',targets=len(combined))
+
+
+def enqueue_attachments(config_path,ids):
+    """Caller holds the planning lock; discoveries must come from owned raw."""
+    path=Path(config_path);config=json.loads(path.read_text(encoding='utf-8'));targets=_config_targets(config)
+    if not isinstance(ids,list) or any(not isinstance(v,str) or not re.fullmatch('[1-9][0-9]{0,7}',v) for v in ids):
+        raise ValueError('Exact public attachment IDs required')
+    merged=sorted(set(config.get('depositary_attachment_ids',[]))|set(ids),key=int)
+    updated=dict(version=3,ciks=config['ciks'],research_targets=targets,depositary_attachment_ids=merged)
+    _config_targets(updated)
+    if updated==config:return dict(status='UNCHANGED',attachments=len(merged))
+    _atomic(path,updated)
+    return dict(status='UPDATED',attachments=len(merged),added=len(merged)-len(config.get('depositary_attachment_ids',[])))
 
 
 def bootstrap(config_path,now=None):
@@ -74,7 +92,8 @@ def bootstrap(config_path,now=None):
     us=[str(x.date()) for x in xcals.get_calendar('XNYS',start='2010-01-01',end=through).sessions]
     months={d[:7]:d for d in us if d[:7]<through[:7]}
     return dict(through=through,kr_sessions=kr,us_month_ends=list(months.values()),
-                ciks=list(dict.fromkeys(config['ciks'])),research_targets=targets)
+                ciks=list(dict.fromkeys(config['ciks'])),research_targets=targets,
+                depositary_attachment_ids=config.get('depositary_attachment_ids',[]))
 
 
 def _atomic(path, value):
@@ -178,6 +197,23 @@ def plan(state, bootstrap, now):
     today=now.date().isoformat(); through=min(bootstrap['through'],(now-timedelta(days=1)).date().isoformat())
     state['through']=max(state['through'],through)
     pending={s.digest(t):t for t in state['pending']}
+    if state['cursors'].get('lseg_weight_encoding_contract',0)<1:
+        catalog=s.task('LSEG_WEIGHT_CATALOG');key=s.digest(catalog);metadata=state['checked'].get(key,{})
+        if metadata.get('status')=='RESPONSE_CONTRACT':
+            metadata.update(status='RECHECK_AFTER_WEIGHT_ENCODING_FIX',retry_at=now.isoformat())
+            pending.setdefault(key,catalog)
+        state['cursors']['lseg_weight_encoding_contract']=1
+    # Introduce new fixed public sources inside an already-running window too.
+    seeds=[s.task('CITI_CATALOG'),s.task('LSEG_WEIGHT_CATALOG'),s.task('RUSSELL_IPO_PAGE')]
+    seeds += [s.task('LSEG_WEIGHTS',code) for code in ('US1000','US2000','US3000')]
+    seeds += [s.task('CITI_NOTICE',code) for code in ('513','2621','1720')]
+    seeds += [s.task('BNY_NOTICE','AD2000235')]
+    seeds += [s.task('CITI_ATTACHMENT',id) for id in bootstrap.get('depositary_attachment_ids',[])]
+    seeds += [s.task('RUSSELL_PDF',url) for url in s.RUSSELL_ARCHIVE_REPORTS]
+    seeds += [s.task('FINRA_DAILY',day=(date.fromisoformat(through)-timedelta(days=n)).isoformat())
+              for n in range(5) if (date.fromisoformat(through)-timedelta(days=n)).isoformat()>='2018-12-18']
+    fresh={s.digest(t):t for t in seeds if s.digest(t) not in state['checked'] and s.digest(t) not in pending}
+    pending={**fresh,**pending}
     factsheet=s.task('NASDAQ_FACTSHEET','NDX');factsheet_key=s.digest(factsheet)
     if factsheet_key not in state['checked'] and factsheet_key not in pending:
         pending={factsheet_key:factsheet,**pending}
@@ -245,6 +281,10 @@ def plan(state, bootstrap, now):
         current += [s.task('CBOE_INDEX',index) for index in ('VIX','VVIX')]
         current += [s.task('NASDAQ_FACTSHEET','NDX')]
         current += [s.task('NASDAQ_WEIGHTS','NDX')]
+        current += [s.task('CITI_CATALOG'),s.task('LSEG_WEIGHT_CATALOG'),s.task('RUSSELL_IPO_PAGE')]
+        current += [s.task('LSEG_WEIGHTS',code) for code in s.LSEG_WEIGHT_INDICES]
+        current += [s.task('FINRA_DAILY',day=(date.fromisoformat(through)-timedelta(days=n)).isoformat())
+                    for n in range(5) if (date.fromisoformat(through)-timedelta(days=n)).isoformat()>='2018-12-18']
         current += [s.task('LSEG_CATALOG',str(now.year)),s.task('SP_ARCHIVE',str(now.year))]
         current += [s.task('NASDAQ_NOTICE','https://ir.nasdaq.com/news-releases/news-release-details/annual-changes-nasdaq-100-indexr'+suffix) for suffix in ('-2','','-1','-3','-4','-5')]
         last=bootstrap['kr_sessions'][-1]
@@ -254,7 +294,8 @@ def plan(state, bootstrap, now):
         due={}
         for t in current:
             key=s.digest(t); stamp=state['checked'].get(key,{}).get('checked_at')
-            if stamp is None or datetime.fromisoformat(stamp)<=now-timedelta(hours=6): due[key]=t
+            interval=timedelta(days=1) if t['kind']=='CITI_CATALOG' else timedelta(days=7) if t['kind'] in ('LSEG_WEIGHTS','RUSSELL_IPO_PAGE') else timedelta(hours=6)
+            if stamp is None or datetime.fromisoformat(stamp)<=now-interval: due[key]=t
         pending={**due,**pending}
         state['cursors']['daily']=today
         state['cursors']['current_window']=window
@@ -267,7 +308,9 @@ def plan(state, bootstrap, now):
     if state['cursors'].get('sec',0)>=len(issuers) and (now.date()-date.fromisoformat(cycle)).days>=7:
         state['cursors']['sec']=0; cycle=str((now-timedelta(days=now.weekday())).date()); state['cursors']['sec_cycle']=cycle
     categories=[('indices',bootstrap['kr_sessions']),('funds',bootstrap['us_month_ends']),('sec',issuers),('lseg',list(range(int(through[:4]),2009,-1))),('sp',list(range(int(through[:4]),2009,-1)))]
+    categories.append(('finra',range(max(0,(date.fromisoformat(through)-date(2018,12,18)).days+1))))
     kinds={'indices':{'KRX_INDEX'},'funds':{'FUND'},'sec':{'SEC_SUBMISSIONS','SEC_FACTS'},'lseg':{'LSEG_CATALOG'},'sp':{'SP_ARCHIVE'}}
+    kinds['finra']={'FINRA_DAILY'}
     for name,values in categories:
         if sum(t['kind'] in kinds[name] for t in pending.values())>=10: continue
         cursor=state['cursors'].get(name,0)
@@ -279,6 +322,7 @@ def plan(state, bootstrap, now):
             for fund in s.FUNDS: add(s.task('FUND',fund,value))
         elif name=='sec':
             add(s.task('SEC_SUBMISSIONS',value),refresh=True); add(s.task('SEC_FACTS',value),refresh=True)
+        elif name=='finra':add(s.task('FINRA_DAILY',day=(date.fromisoformat(through)-timedelta(days=value)).isoformat()))
         else: add(s.task('LSEG_CATALOG' if name=='lseg' else 'SP_ARCHIVE',str(value)))
         state['cursors'][name]=cursor+1
     state['pending']=list(pending.values())
@@ -296,11 +340,12 @@ class Fetcher:
             # The public PDF endpoint needs ordinary document Accept headers.
             # No cookies, login session or authorization is sent to this host.
             headers={'User-Agent':'Mozilla/5.0','Accept':'application/pdf','Accept-Language':'en-US,en;q=0.9'}
+        if task['kind']=='FINRA_DAILY':headers['Accept']='application/json'
         if task['kind']=='KRX_INDEX':
             value=self.credentials.get('KRX_API_KEY')
             if not value: return 401,{},b''
             headers['AUTH_KEY']=value
-        options={'json':task['params']} if task['kind']=='LSEG_CATALOG' else {'data':task['params']} if task['method']=='POST' else {'params':task['params']}
+        options={'json':task['params']} if task['kind'] in ('LSEG_CATALOG','FINRA_DAILY') else {'data':task['params']} if task['method']=='POST' else {'params':task['params']}
         try:
             with self.session.request(task['method'],task['url'],headers=headers,timeout=(15,35),allow_redirects=False,stream=True,**options) as response:
                 chunks=[]; total=0
@@ -319,6 +364,7 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
     # intact; an absent catalog URL does not deny all notices on that host.
     for host,cooldown in list(state['cooldowns'].items()):
         if cooldown['reason']=='HTTP_404': state['cooldowns'].pop(host)
+        elif host=='api.finra.org' and cooldown['reason']=='HTTP_204':state['cooldowns'].pop(host)
     fetch=fetch or Fetcher()
     for _ in range(max_requests):
         now=fixed or datetime.now(timezone.utc)
@@ -326,8 +372,14 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
         plan(state,bootstrap,now)
         ready=[t for t in state['pending'] if state['cooldowns'].get(urlsplit(t['url']).hostname,{}).get('retry_at','')<=now.isoformat() and state['checked'].get(s.digest(t),{}).get('retry_at','')<=now.isoformat()]
         if not ready: break
-        t=ready[0]; key=s.digest(t); host=urlsplit(t['url']).hostname
+        t=ready[0]
+        # Large ADR catalogs must not starve prices, shares or index backfill.
+        if sent%5==4 and t['kind'] in ('CITI_NOTICE','CITI_ATTACHMENT'):
+            t=next((candidate for candidate in ready if candidate['kind'] not in ('CITI_NOTICE','CITI_ATTACHMENT')),t)
+        key=s.digest(t); host=urlsplit(t['url']).hostname
         status,headers,body=fetch(t); sent+=1; state['requests'][host]=state['requests'].get(host,0)+1
+        empty_finra=t['kind']=='FINRA_DAILY' and status==204 and not body
+        if empty_finra:status,body=200,b'[]'
         reason=None
         if status==200:
             try: s.validate_response(t,body)
@@ -353,6 +405,7 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
                 records.append(dict(task=t,retrieved_at=retrieved.isoformat(),body_base64=base64.b64encode(body).decode(),body_sha256=sha))
             else: unchanged+=1
             state['seen'][key]=sha; state['checked'][key]=dict(status='COLLECTED',checked_at=now.isoformat())
+            if empty_finra:state['checked'][key].update(status='SOURCE_EMPTY',response_status=204)
             if t['kind']=='SEC_MAP':
                 value=json.loads(body); position=value['fields'].index('cik')
                 observed=[str(int(row[position])).zfill(10) for row in value['data']]
@@ -366,6 +419,9 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
                 refresh=(changed and t['kind'] in ('LSEG_CATALOG','SP_ARCHIVE') and
                          (child['kind'] in ('LSEG_CATALOG','SP_ARCHIVE') or
                           stamp is None or datetime.fromisoformat(stamp)<=now-timedelta(days=1)))
+                if t['kind'] in ('CITI_CATALOG','RUSSELL_IPO_PAGE'):
+                    interval=timedelta(days=30 if t['kind']=='CITI_CATALOG' else 7)
+                    refresh=stamp is not None and datetime.fromisoformat(stamp)<=now-interval
                 if child_key not in existing and (child_key not in state['seen'] or refresh):
                     state['pending'].append(child); existing.add(child_key)
         if sum(len(r['body_base64']) for r in records)>60*1024**2: break

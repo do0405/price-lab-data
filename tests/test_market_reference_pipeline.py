@@ -12,6 +12,48 @@ from test_market_reference_sources import fund_body,payload
 NOW=datetime(2026,11,24,tzinfo=timezone.utc)
 
 
+def test_extended_sources_join_existing_window_without_replaying_completed_documents():
+    b=bootstrap();state=p.initial_state('2026-11-23');state['cursors']['current_window']='2026-11-24T00'
+    done=s.task('BNY_NOTICE','AD2000235');state['checked'][s.digest(done)]={'status':'COLLECTED','checked_at':NOW.isoformat()}
+    p.plan(state,b,NOW)
+    for t in [s.task('CITI_CATALOG'),s.task('LSEG_WEIGHT_CATALOG'),s.task('LSEG_WEIGHTS','US1000'),s.task('RUSSELL_IPO_PAGE')]:
+        assert t in state['pending']
+    assert done not in state['pending']
+
+
+def test_citi_backfill_keeps_a_slot_for_other_reference_categories():
+    state=p.initial_state('2026-11-23');state['pending']=[s.task('CITI_NOTICE',str(n)) for n in range(1,10)]+[s.task('FRED_INDEX','SP500')]
+    calls=[]
+    def fetch(t):
+        calls.append(t['kind'])
+        return 200,{},b'observation_date,SP500\n2026-11-20,100\n' if t['kind']=='FRED_INDEX' else b'%PDF-fixture'
+    # Freeze planning to isolate lane fairness from current-window discovery.
+    from unittest.mock import patch
+    with patch.object(p,'plan',lambda state,*args:state):
+        p.collect(state,bootstrap(),now=NOW,max_requests=5,fetch=fetch,sleep=lambda _:None)
+    assert calls[:4]==['CITI_NOTICE']*4 and calls[4]=='FRED_INDEX'
+
+
+def test_attachment_targets_preserve_issuer_and_fund_targets_and_are_idempotent(tmp_path):
+    path=tmp_path/'bootstrap.json';initial=dict(version=2,ciks=['0000320193'],research_targets=[])
+    path.write_text(json.dumps(initial))
+    assert p.enqueue_attachments(path,['6832','6832'])['added']==1
+    before=path.read_bytes();assert p.enqueue_attachments(path,['6832'])['status']=='UNCHANGED';assert path.read_bytes()==before
+    p.enqueue_targets(path,[dict(fund='IWB',snapshot_date='2026-10-21')])
+    config=json.loads(path.read_text());assert config['depositary_attachment_ids']==['6832'] and config['ciks']==initial['ciks'] and config['version']==3
+    with pytest.raises(ValueError):p.enqueue_attachments(path,['https://evil.example/'])
+
+
+def test_finra_empty_day_204_is_not_a_host_denial_or_an_invented_event():
+    from unittest.mock import patch
+    state=p.initial_state('2026-11-23');t=s.task('FINRA_DAILY',day='2026-11-22');state['pending']=[t]
+    with patch.object(p,'plan',lambda state,*args:state):
+        out=p.collect(state,bootstrap(),now=NOW,max_requests=1,fetch=lambda _: (204,{},b''),sleep=lambda _:None)
+    assert not out['state']['cooldowns']
+    assert out['state']['checked'][s.digest(t)]['status']=='SOURCE_EMPTY'
+    assert base64.b64decode(out['records'][0]['body_base64'])==b'[]'
+
+
 def bootstrap():
     return dict(through='2026-11-23',kr_sessions=['2010-01-04','2026-11-23'],us_month_ends=['2010-01-29','2026-10-30'],ciks=['0000320193'])
 

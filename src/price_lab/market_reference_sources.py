@@ -21,6 +21,16 @@ ISHARES = 'https://www.ishares.com/varnish-api/blk-one01-product-data/product-da
 LSEG = 'https://www.lseg.com/content/lseg/en_us/ftse-russell/index-resources/notices/jcr:content/root/container/page_content_region/page-content-region/section/section-fw/index_announcements_.indexannouncement.json'
 MAX_BODY = 28 * 1024**2
 NASDAQ_REPORTS=('https://indexes.nasdaqomx.com/docs/202601%20NDX%20Reconstitution%20and%20Performance%20Highlights.pdf',)
+LSEG_WEIGHT_CATALOG='https://www.lseg.com/content/lseg/en_us/ftse-russell/index-resources/constituent-weights/jcr:content/root/container/page_content_region/page-content-region/section/section-fw/data_table.constituentsandweights.json'
+LSEG_WEIGHT_DOWNLOAD='https://research.ftserussell.com/analytics/factsheets/Home/DownloadConstituentsWeights/'
+LSEG_WEIGHT_INDICES={f'US{int(size)+offset}':('RUSSELL'+size+suffix,'Russell '+size+label)
+    for size in ('1000','2000','3000') for offset,suffix,label in (
+        (0,'',''),(1,'_GROWTH',' Growth'),(2,'_VALUE',' Value'))}
+RUSSELL_ARCHIVE_REPORTS=(
+    'https://www.lseg.com/content/dam/ftse-russell/en_us/documents/other/ru3000-additions-20250613.pdf',
+    'https://www.lseg.com/content/dam/ftse-russell/en_us/documents/other/ru3000-additions-20260618.pdf')
+CITI_CATALOG='https://depositaryreceipts.citi.com/adr/notices/pgm_dispCA.aspx?pageId=16&subpageID=112'
+CITI_PDF='https://depositaryreceipts.citi.com/adr/notices/previewPdf.aspx'
 
 
 def canonical(value):
@@ -74,6 +84,34 @@ def task(kind, entity='', day='', page=0):
         if not re.fullmatch(r'20\d{2}', entity): raise ValueError('Catalog year required')
         url = LSEG; method = 'POST'
         params = dict(content_type='tech-notice, meth-review', family_mnemonic='', page_number=page, page_size=50, qry='', year=int(entity))
+    elif kind=='LSEG_WEIGHT_CATALOG':
+        if entity or day or page:raise ValueError('Fixed weight catalog required')
+        url=LSEG_WEIGHT_CATALOG
+    elif kind=='LSEG_WEIGHTS':
+        if entity not in LSEG_WEIGHT_INDICES or day or page:raise ValueError('Supported official weight index required')
+        url=LSEG_WEIGHT_DOWNLOAD;params=dict(indexdetails=entity)
+    elif kind=='RUSSELL_IPO_PAGE':
+        if entity or day or page:raise ValueError('Fixed IPO page required')
+        url='https://www.lseg.com/en/ftse-russell/russell-reconstitution/ipo-additions'
+    elif kind=='RUSSELL_IPO_PDF':
+        if entity not in ('1000','2000','3000') or day or page:raise ValueError('Supported Russell IPO index required')
+        url=f'https://www.lseg.com/content/dam/ftse-russell/en_us/documents/other/final-ipo-additions-3-qtr-r{entity}.pdf'
+    elif kind=='CITI_CATALOG':
+        if entity or day or page:raise ValueError('Fixed depositary catalog required')
+        url=CITI_CATALOG
+    elif kind=='CITI_NOTICE':
+        if not re.fullmatch(r'[1-9]\d{0,7}',entity) or day or page:raise ValueError('Exact public Citi notice ID required')
+        url=CITI_PDF;params=dict(caId=entity)
+    elif kind=='CITI_ATTACHMENT':
+        if not re.fullmatch(r'[1-9]\d{0,7}',entity) or day or page:raise ValueError('Exact public Citi attachment ID required')
+        url='https://depositaryreceipts.citi.com/adr/common/file.aspx';params=dict(idf=entity)
+    elif kind=='BNY_NOTICE':
+        if not re.fullmatch(r'AD\d{7}',entity) or day or page:raise ValueError('Exact public BNY document ID required')
+        url=f'https://www.adrbny.com/content/dam/adr/documents/corporate-actions-dr/files/{entity}.pdf'
+    elif kind=='FINRA_DAILY':
+        if entity or not day or day<'2018-12-18' or page>500:raise ValueError('Bounded FINRA calendar day required')
+        url='https://api.finra.org/data/group/otcMarket/name/otcDailyList';method='POST'
+        params=dict(limit=1000,offset=page*1000,dateRangeFilters=[dict(fieldName='calendarDay',startDate=day,endDate=day)])
     elif kind == 'RUSSELL_PAGE':
         url = 'https://www.lseg.com/en/ftse-russell/russell-reconstitution'
     elif kind == 'NASDAQ_NOTICE':
@@ -159,11 +197,108 @@ def fund_points(body, request):
     return payload, points, actual
 
 
+class _CitiNotices(HTMLParser):
+    def __init__(self):
+        super().__init__();self.active=False;self.row=None;self.cell=None;self.rows=[];self.links=[]
+    def handle_starttag(self,tag,attrs):
+        attrs=dict(attrs)
+        if tag=='table' and attrs.get('id')=='tblCANotices':self.active=True
+        elif self.active:
+            if tag=='tr':self.row=[];self.links=[]
+            elif tag in ('td','th') and self.row is not None:self.cell=[]
+            elif tag=='a' and attrs.get('href') and self.row is not None:self.links.append(attrs['href'])
+    def handle_data(self,value):
+        if self.cell is not None:self.cell.append(value)
+    def handle_endtag(self,tag):
+        if tag=='table' and self.active:self.active=False
+        elif self.active and tag in ('td','th') and self.cell is not None:
+            self.row.append(' '.join(' '.join(self.cell).split()));self.cell=None
+        elif self.active and tag=='tr' and self.row is not None:
+            self.rows.append((self.row,self.links));self.row=None
+
+
+def citi_notices(body):
+    parser=_CitiNotices();parser.feed(body.decode('utf-8-sig'))
+    header=['Company','Date of Notice','','Ticker','CUSIP','Ratio (ORD:DR)','Type','Country','Exchange','Corporate Action Type']
+    if not parser.rows or parser.rows[0][0]!=header:raise ValueError('Citi corporate action table contract mismatch')
+    result=[]
+    for cells,links in parser.rows[1:]:
+        if len(cells)!=10:raise ValueError('Citi notice column mismatch')
+        ids=[]
+        for link in links:
+            u=urlsplit(urljoin(CITI_CATALOG,link));q=parse_qs(u.query)
+            if u.path.endswith('/previewPdf.aspx'):
+                if u.scheme!='https' or u.netloc!='depositaryreceipts.citi.com' or u.path!='/adr/notices/previewPdf.aspx' or set(q)!={'caId'} or len(q['caId'])!=1:
+                    raise ValueError('Citi notice link is outside the public endpoint')
+                task('CITI_NOTICE',q['caId'][0]);ids.append(q['caId'][0])
+        if len(set(ids))!=1:raise ValueError('Unique Citi notice PDF required')
+        ratio=re.fullmatch(r'(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)',cells[5])
+        if not ratio or any(float(x)<=0 for x in ratio.groups()):raise ValueError('Positive reported ORD:DR ratio required')
+        if not re.fullmatch(r'[0-9A-Z*@#]{9}',cells[4]):raise ValueError('Reported Citi CUSIP required')
+        result.append(dict(notice_id=ids[0],company=cells[0],notice_date=datetime.strptime(cells[1],'%m/%d/%Y').date().isoformat(),
+            raw_symbol=cells[3],cusip=cells[4],ratio_reported=cells[5],ordinary_per_dr=float(ratio[1])/float(ratio[2]),
+            dr_type=cells[6],country=cells[7],exchange=cells[8],action_type=cells[9]))
+    if not 1<=len(result)<=10000:raise ValueError('Bounded nonempty Citi notice list required')
+    return result
+
+
+def weight_catalog_records(body):
+    try:text=body.decode('utf-8-sig')
+    except UnicodeDecodeError:text=body.decode('cp1252')
+    value=json.loads(text)
+    if not isinstance(value,dict) or not isinstance(value.get('Data'),list) or not 1<=len(value['Data'])<=5000:
+        raise ValueError('LSEG constituent weight catalog mismatch')
+    found=[]
+    for row in value['Data']:
+        if not isinstance(row,dict):raise ValueError('LSEG weight catalog row required')
+        code=row.get('IndexId')
+        if code not in LSEG_WEIGHT_INDICES:continue
+        expected=task('LSEG_WEIGHTS',code)
+        if row.get('ReportType')!='StocksWeight' or row.get('Url')!=expected['url']+'?indexdetails='+code:
+            raise ValueError('LSEG weight catalog download mismatch')
+        found.append(row)
+    return list({row['IndexId']:row for row in found}.values())
+
+
+def weight_catalog(body):
+    return [row['IndexId'] for row in weight_catalog_records(body)]
+
+
+def citi_attachment_tasks(reader):
+    if len(reader.pages)>40:raise ValueError('Citi attachment discovery page bound')
+    result=[]
+    for page in reader.pages:
+        if not hasattr(page,'get'):continue
+        for ref in page.get('/Annots',[]):
+            action=ref.get_object().get('/A')
+            if action is None:continue
+            action=action.get_object() if hasattr(action,'get_object') else action
+            uri=action.get('/URI')
+            if not uri:continue
+            u=urlsplit(str(uri));q=parse_qs(u.query)
+            if u.scheme in ('https','http') and u.netloc=='depositaryreceipts.citi.com' and u.path=='/adr/common/file.aspx' and set(q)=={'idf'} and len(q['idf'])==1:
+                try:result.append(task('CITI_ATTACHMENT',q['idf'][0]))
+                except ValueError:continue
+    return list({digest(t):t for t in result}.values())
+
+
 def validate_response(request, body):
     validate_task(request)
     if not isinstance(body,bytes) or not 0<len(body)<=MAX_BODY: raise ValueError('Reference body bound')
     kind=request['kind']
-    if kind.startswith('FUND'): fund_points(body,request)
+    if kind=='FINRA_DAILY':
+        rows=json.loads(body)
+        if not isinstance(rows,list) or len(rows)>1000:raise ValueError('Bounded FINRA rows required')
+        ids=set()
+        for row in rows:
+            if (not isinstance(row,dict) or row.get('calendarDay')!=request['requested_date'] or
+                    type(row.get('OTCDailyListID')) is not int or row['OTCDailyListID']<=0 or
+                    not isinstance(row.get('dailyListEventCode'),str) or row['OTCDailyListID'] in ids):
+                raise ValueError('FINRA date/event identity mismatch')
+            ids.add(row['OTCDailyListID'])
+    elif kind=='CITI_CATALOG':citi_notices(body)
+    elif kind=='LSEG_WEIGHT_CATALOG':weight_catalog(body)
+    elif kind.startswith('FUND'): fund_points(body,request)
     elif kind in ('FRED_INDEX','CBOE_INDEX'):
         rows=list(csv.DictReader(io.StringIO(body.decode('utf-8-sig'))))
         fields={'DATE','VVIX' if request['entity']=='VVIX' else 'CLOSE'} if kind=='CBOE_INDEX' else {request['entity']}
@@ -196,7 +331,7 @@ def validate_response(request, body):
         count=value.get('TotalCount')
         if ('ErrorCode' in value or not isinstance(value.get('Data'),list) or type(count) not in (int,float)
                 or not math.isfinite(count) or not 0<=count<=1000000 or int(count)!=count): raise ValueError('LSEG catalog mismatch')
-    elif kind in ('RUSSELL_PDF','NASDAQ_PDF','NASDAQ_FACTSHEET','NASDAQ_WEIGHTS'):
+    elif kind in ('RUSSELL_PDF','NASDAQ_PDF','NASDAQ_FACTSHEET','NASDAQ_WEIGHTS','LSEG_WEIGHTS','RUSSELL_IPO_PDF','CITI_NOTICE','CITI_ATTACHMENT','BNY_NOTICE'):
         if not body.startswith(b'%PDF-'): raise ValueError('Official PDF required')
     else:
         p=html(body)
@@ -208,7 +343,24 @@ def validate_response(request, body):
 def discovered(request, body):
     """Discover only official, narrowly scoped follow-ups; no arbitrary URL fetch."""
     kind=request['kind']; result=[]
-    if kind in ('SP_CATALOG','SP_ARCHIVE','RUSSELL_PAGE'):
+    if kind=='CITI_NOTICE':
+        from pypdf import PdfReader
+        from pypdf.errors import PdfReadError
+        try:
+            reader=PdfReader(io.BytesIO(body))
+            result=citi_attachment_tasks(reader)
+        except PdfReadError:pass
+    elif kind=='FINRA_DAILY':
+        if len(json.loads(body))==1000:
+            result=[task('FINRA_DAILY',day=request['requested_date'],page=request['page']+1)]
+    elif kind=='CITI_CATALOG':
+        notices=sorted(citi_notices(body),key=lambda r:r['notice_date'],reverse=True)
+        result=[task('CITI_NOTICE',r['notice_id']) for r in notices]
+    elif kind=='LSEG_WEIGHT_CATALOG':result=[task('LSEG_WEIGHTS',code) for code in weight_catalog(body)]
+    elif kind=='RUSSELL_IPO_PAGE':
+        links={urljoin(request['url'],link) for link in html(body).links}
+        result=[task('RUSSELL_IPO_PDF',code) for code in ('1000','2000','3000') if task('RUSSELL_IPO_PDF',code)['url'] in links]
+    elif kind in ('SP_CATALOG','SP_ARCHIVE','RUSSELL_PAGE'):
         for link in html(body).links:
             url=urljoin(request['url'],link).split('#')[0]
             candidate='RUSSELL_PDF' if kind=='RUSSELL_PAGE' else 'SP_NOTICE'
