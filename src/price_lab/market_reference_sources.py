@@ -306,8 +306,8 @@ def jpm_page(request,body):
         raise ValueError('JPM pagination mismatch')
     seen=set();unique=[]
     for row in rows:
-        if not isinstance(row,dict) or not re.fullmatch(r'[A-Za-z0-9@#*]{9}',str(row.get('cusip',''))):
-            raise ValueError('Reported JPM CUSIP required')
+        if not isinstance(row,dict) or not isinstance(row.get('cusip'),str) or not re.fullmatch(r'[A-Za-z0-9@#*]{1,32}',row['cusip']):
+            raise ValueError('Bounded reported JPM identifier required')
         identity=digest(row)
         # The official response can repeat the exact same action row. Keep
         # its original response bytes, normalize that identical value once.
@@ -320,7 +320,7 @@ def jpm_page(request,body):
                 if value is not None and (type(value) not in (int,float) or not math.isfinite(value) or value<0):
                     raise ValueError('Invalid reported JPM value')
         else:
-            if not isinstance(row.get('action'),str) or not row['action']:raise ValueError('JPM action required')
+            if row.get('action') is not None and not isinstance(row['action'],str):raise ValueError('Invalid JPM action')
             for key in ('eventDate','announcementDate'):
                 value=row.get(key)
                 if value not in (None,''):

@@ -197,13 +197,13 @@ def plan(state, bootstrap, now):
     today=now.date().isoformat(); through=min(bootstrap['through'],(now-timedelta(days=1)).date().isoformat())
     state['through']=max(state['through'],through)
     pending={s.digest(t):t for t in state['pending']}
-    if state['cursors'].get('jpm_catalog_contract',0)<1:
-        for kind in ('JPM_UNIVERSE','JPM_ACTIONS'):
-            t=s.task(kind);key=s.digest(t);metadata=state['checked'].get(key,{})
-            if metadata.get('status')=='RESPONSE_CONTRACT':
-                metadata.update(status='RECHECK_AFTER_JPM_CASE_AND_DUPLICATE_FIX',retry_at=now.isoformat())
+    if state['cursors'].get('jpm_catalog_contract',0)<3:
+        for key,metadata in state['checked'].items():
+            t=metadata.get('task',{})
+            if metadata.get('status')=='RESPONSE_CONTRACT' and t.get('kind') in ('JPM_UNIVERSE','JPM_ACTIONS'):
+                metadata.update(status='RECHECK_AFTER_JPM_REPORTED_IDENTIFIER_AND_MISSING_ACTION_FIX',retry_at=now.isoformat())
                 pending.setdefault(key,t)
-        state['cursors']['jpm_catalog_contract']=1
+        state['cursors']['jpm_catalog_contract']=3
     if state['cursors'].get('lseg_weight_encoding_contract',0)<1:
         catalog=s.task('LSEG_WEIGHT_CATALOG');key=s.digest(catalog);metadata=state['checked'].get(key,{})
         if metadata.get('status')=='RESPONSE_CONTRACT':

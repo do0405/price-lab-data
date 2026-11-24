@@ -29,7 +29,7 @@ def test_extended_sources_join_existing_window_without_replaying_completed_docum
     b=bootstrap();state=p.initial_state('2026-11-23');state['cursors']['current_window']='2026-11-24T00'
     done=s.task('BNY_NOTICE','AD2000235');state['checked'][s.digest(done)]={'status':'COLLECTED','checked_at':NOW.isoformat()}
     p.plan(state,b,NOW)
-    for t in [s.task('CITI_CATALOG'),s.task('LSEG_WEIGHT_CATALOG'),s.task('LSEG_WEIGHTS','US1000'),s.task('RUSSELL_IPO_PAGE'),s.task('RUSSELL_IPO_PDF','3000',page=4)]:
+    for t in [s.task('JPM_UNIVERSE'),s.task('JPM_ACTIONS'),s.task('CITI_CATALOG'),s.task('LSEG_WEIGHT_CATALOG'),s.task('LSEG_WEIGHTS','US1000'),s.task('RUSSELL_IPO_PAGE'),s.task('RUSSELL_IPO_PDF','3000',page=4)]:
         assert t in state['pending']
     assert done not in state['pending']
 

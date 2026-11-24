@@ -26,7 +26,7 @@ def test_jpm_public_catalog_pagination_is_exact_and_bounded():
     assert s.discovered(t,body)==[s.task('JPM_UNIVERSE',page=1)]
     s.validate_response(s.task('JPM_UNIVERSE',page=1),jpm_body([row],offset=1000,total=1001))
     assert not s.discovered(s.task('JPM_UNIVERSE',page=1),jpm_body([row],offset=1000,total=1001))
-    for bad in [jpm_body([row],offset=1000),jpm_body([{**row,'globalMarketCap':-1}]),jpm_body([{**row,'cusip':'invalid'}])]:
+    for bad in [jpm_body([row],offset=1000),jpm_body([{**row,'globalMarketCap':-1}]),jpm_body([{**row,'cusip':'https://evil.example'}])]:
         with pytest.raises(ValueError):s.validate_response(t,bad)
     lower={**row,'cusip':'471115a02'};s.validate_response(t,jpm_body([lower]))
     assert s.jpm_page(t,jpm_body([row,row]))[0]==[row]
@@ -37,6 +37,8 @@ def test_jpm_action_contract_retains_reported_date_and_document_revision():
     row={'cusip':'471115402','action':'Ratio Change','eventDate':'2024-10-01T00:00:00.000Z',
         'announcementDate':'2024-09-10T00:00:00.000Z','notices':{'pdf':'a'*32},'sequenceNo':3}
     t=s.task('JPM_ACTIONS');s.validate_response(t,jpm_body([row]))
+    for action in (None,''):
+        s.validate_response(t,jpm_body([{**row,'action':action}]))
     with pytest.raises(ValueError):s.validate_response(t,jpm_body([{**row,'eventDate':'bad'}]))
     with pytest.raises(ValueError):s.validate_response(t,jpm_body([{**row,'notices':{'pdf':'https://evil.example'}}]))
 
