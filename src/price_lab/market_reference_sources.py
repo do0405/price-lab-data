@@ -20,6 +20,7 @@ FUNDS = {'IVV': (239726, 'SP500', 'us-ishares', 'en_US'),
 ISHARES = 'https://www.ishares.com/varnish-api/blk-one01-product-data/product-data/api/v2/get-product-data'
 LSEG = 'https://www.lseg.com/content/lseg/en_us/ftse-russell/index-resources/notices/jcr:content/root/container/page_content_region/page-content-region/section/section-fw/index_announcements_.indexannouncement.json'
 MAX_BODY = 28 * 1024**2
+NASDAQ_REPORTS=('https://indexes.nasdaqomx.com/docs/202601%20NDX%20Reconstitution%20and%20Performance%20Highlights.pdf',)
 
 
 def canonical(value):
@@ -87,6 +88,10 @@ def task(kind, entity='', day='', page=0):
     elif kind == 'RUSSELL_PDF':
         if not re.fullmatch(r'https://www\.lseg\.com/content/dam/ftse-russell/en_us/documents/other/ru(?:1000|2000|3000)-(?:additions|deletions)-\d{8}\.pdf', entity): raise ValueError('Official Russell PDF required')
         url = entity
+    elif kind == 'NASDAQ_PDF':
+        if not re.fullmatch(r'https://indexes\.nasdaqomx\.com/docs/20\d{2}(?:0[1-9]|1[0-2])%20NDX%20Reconstitution%20and%20Performance%20Highlights\.pdf',entity):
+            raise ValueError('Official Nasdaq research PDF required')
+        url=entity
     elif kind == 'SP_CATALOG':
         if not re.fullmatch(r'20\d{2}', entity): raise ValueError('Catalog year required')
         url = 'https://press.spglobal.com/news-releases'; params = dict(year=entity, l=100, o=page * 100)
@@ -185,7 +190,7 @@ def validate_response(request, body):
         count=value.get('TotalCount')
         if ('ErrorCode' in value or not isinstance(value.get('Data'),list) or type(count) not in (int,float)
                 or not math.isfinite(count) or not 0<=count<=1000000 or int(count)!=count): raise ValueError('LSEG catalog mismatch')
-    elif kind=='RUSSELL_PDF':
+    elif kind in ('RUSSELL_PDF','NASDAQ_PDF'):
         if not body.startswith(b'%PDF-'): raise ValueError('Official PDF required')
     else:
         p=html(body)

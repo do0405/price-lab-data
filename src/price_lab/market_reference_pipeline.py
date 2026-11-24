@@ -140,6 +140,11 @@ def plan(state, bootstrap, now):
     today=now.date().isoformat(); through=min(bootstrap['through'],(now-timedelta(days=1)).date().isoformat())
     state['through']=max(state['through'],through)
     pending={s.digest(t):t for t in state['pending']}
+    # Immutable, observed official reports get one acquisition. A different
+    # public host does not clear or bypass an IR host's denial/cooldown.
+    for url in s.NASDAQ_REPORTS:
+        report=s.task('NASDAQ_PDF',url); key=s.digest(report)
+        if key not in state['checked'] and key not in pending:pending={key:report,**pending}
     refresh_kinds={'FUND_LATEST','KIND_INDUSTRY','RUSSELL_PAGE','FRED_INDEX','CBOE_INDEX','SEC_MAP'}
     for key,old in list(pending.items()):
         if old['kind'] in refresh_kinds and old['requested_date']:

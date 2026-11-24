@@ -85,3 +85,10 @@ def test_index_response_must_match_requested_family():
     t=s.task('KRX_INDEX','kospi','2026-11-20')
     body=b'{"OutBlock_1":[{"BAS_DD":"20261120","IDX_CLSS":"KOSDAQ","IDX_NM":"KOSDAQ","CLSPRC_IDX":"100"}]}'
     with pytest.raises(ValueError): s.validate_response(t,body)
+def test_nasdaq_research_pdf_has_an_exact_official_scope():
+    from price_lab import market_reference_sources as s
+    url='https://indexes.nasdaqomx.com/docs/202601%20NDX%20Reconstitution%20and%20Performance%20Highlights.pdf'
+    task=s.task('NASDAQ_PDF',url)
+    assert task['url']==url and s.validate_response(task,b'%PDF-1.7\nfixture')
+    for invalid in (url.replace('indexes.nasdaqomx.com','example.com'),url+'?token=secret',url.replace('/docs/','/private/')):
+        with pytest.raises(ValueError):s.task('NASDAQ_PDF',invalid)

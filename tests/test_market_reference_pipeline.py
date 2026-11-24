@@ -106,3 +106,14 @@ def test_cloud_import_never_loads_database_or_private_credentials():
     code="import runpy,sys;runpy.run_path('scripts/market_reference_pipeline.py',run_name='inspect');from price_lab import market_reference_pipeline;assert 'duckdb' not in sys.modules;assert 'price_lab.local_credentials' not in sys.modules"
     result=subprocess.run([sys.executable,'-B','-c',code],cwd=root,capture_output=True)
     assert result.returncode==0,result.stderr.decode(errors='replace')
+def test_immutable_nasdaq_report_is_discovered_once_without_resetting_denied_hosts():
+    state=p.initial_state('2026-11-23')
+    state['cooldowns']['ir.nasdaq.com']=dict(reason='HTTP_403',retry_at='2026-11-25T00:00:00+00:00')
+    p.plan(state,bootstrap(),NOW)
+    reports=[t for t in state['pending'] if t['kind']=='NASDAQ_PDF']
+    assert len(reports)==1
+    state['checked'][s.digest(reports[0])]=dict(status='COLLECTED',checked_at=NOW.isoformat())
+    state['pending']=[t for t in state['pending'] if t['kind']!='NASDAQ_PDF']
+    p.plan(state,bootstrap(),NOW)
+    assert not any(t['kind']=='NASDAQ_PDF' for t in state['pending'])
+    assert state['cooldowns']['ir.nasdaq.com']['reason']=='HTTP_403'
