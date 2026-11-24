@@ -189,6 +189,15 @@ def plan(state, bootstrap, now):
         t=s.task('FUND',target['fund'],target['snapshot_date']);key=s.digest(t)
         if key not in state['checked'] and key not in pending:requested[key]=t
     pending={**requested,**pending}
+    # The newest index session may still be unpublished. Keep the preceding
+    # completed week in scope instead of leaving all modern levels behind the
+    # chronological 2010 backfill. Empty/failed tasks keep their own backoff.
+    recent_indices={}
+    for day in bootstrap['kr_sessions'][-5:]:
+        for family in ('kospi','kosdaq','krx'):
+            t=s.task('KRX_INDEX',family,day);key=s.digest(t)
+            if key not in state['checked'] and key not in pending:recent_indices[key]=t
+    pending={**recent_indices,**pending}
     # Fill the recent dated research window before the long historical queue.
     # The same stable task keys are reused by chronological backfill, so a
     # completed snapshot is neither downloaded nor stored twice.

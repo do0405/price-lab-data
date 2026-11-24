@@ -164,3 +164,14 @@ def test_new_factsheet_is_found_even_inside_an_existing_refresh_window():
     state['pending']=[t for t in state['pending'] if t!=task]
     p.plan(state,bootstrap(),NOW)
     assert task in state['pending']
+
+
+def test_recent_completed_index_week_is_not_starved_by_unpublished_latest_session():
+    b=bootstrap();b['kr_sessions']=['2026-11-16','2026-11-17','2026-11-18','2026-11-19','2026-11-20','2026-11-23']
+    state=p.initial_state(b['through']);p.plan(state,b,NOW)
+    for day in b['kr_sessions'][-5:]:
+        assert all(s.task('KRX_INDEX',family,day) in state['pending'] for family in ('kospi','kosdaq','krx'))
+    completed=s.task('KRX_INDEX','kospi','2026-11-20')
+    state['checked'][s.digest(completed)]=dict(status='COLLECTED',checked_at=NOW.isoformat())
+    state['pending']=[t for t in state['pending'] if t!=completed];p.plan(state,b,NOW)
+    assert completed not in state['pending']
