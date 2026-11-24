@@ -422,6 +422,11 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
                 if t['kind'] in ('CITI_CATALOG','RUSSELL_IPO_PAGE'):
                     interval=timedelta(days=30 if t['kind']=='CITI_CATALOG' else 7)
                     refresh=stamp is not None and datetime.fromisoformat(stamp)<=now-interval
+                if t['kind']=='CITI_NOTICE':
+                    # A stable cover PDF can link to an in-place corrected
+                    # attachment. Recheck that child on the monthly cycle too.
+                    refresh=stamp is not None and (datetime.fromisoformat(stamp)<=now-timedelta(days=30)
+                        or changed and datetime.fromisoformat(stamp)<=now-timedelta(days=1))
                 if child_key not in existing and (child_key not in state['seen'] or refresh):
                     state['pending'].append(child); existing.add(child_key)
         if sum(len(r['body_base64']) for r in records)>60*1024**2: break

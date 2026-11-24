@@ -54,6 +54,19 @@ def test_finra_empty_day_204_is_not_a_host_denial_or_an_invented_event():
     assert base64.b64decode(out['records'][0]['body_base64'])==b'[]'
 
 
+def test_monthly_unchanged_citi_cover_still_rechecks_old_attachment(monkeypatch):
+    from datetime import timedelta
+    import hashlib
+    cover=s.task('CITI_NOTICE','2621');child=s.task('CITI_ATTACHMENT','6832');body=b'%PDF-fixture'
+    state=p.initial_state('2026-11-23');state['pending']=[cover]
+    state['seen'][s.digest(cover)]=hashlib.sha256(body).hexdigest();state['seen'][s.digest(child)]='a'*64
+    state['checked'][s.digest(child)]={'status':'COLLECTED','checked_at':(NOW-timedelta(days=31)).isoformat()}
+    monkeypatch.setattr(p,'plan',lambda state,*args:state)
+    monkeypatch.setattr(s,'discovered',lambda *args:[child])
+    out=p.collect(state,bootstrap(),now=NOW,max_requests=1,fetch=lambda _: (200,{},body),sleep=lambda _:None)
+    assert child in out['state']['pending'] and out['records']==[]
+
+
 def bootstrap():
     return dict(through='2026-11-23',kr_sessions=['2010-01-04','2026-11-23'],us_month_ends=['2010-01-29','2026-10-30'],ciks=['0000320193'])
 
