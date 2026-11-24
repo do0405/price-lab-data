@@ -94,8 +94,9 @@ def task(kind, entity='', day='', page=0):
         if entity or day or page:raise ValueError('Fixed IPO page required')
         url='https://www.lseg.com/en/ftse-russell/russell-reconstitution/ipo-additions'
     elif kind=='RUSSELL_IPO_PDF':
-        if entity not in ('1000','2000','3000') or day or page:raise ValueError('Supported Russell IPO index required')
-        url=f'https://www.lseg.com/content/dam/ftse-russell/en_us/documents/other/final-ipo-additions-3-qtr-r{entity}.pdf'
+        if entity not in ('1000','2000','3000') or day or page not in (0,1,2,4):raise ValueError('Supported Russell IPO index/quarter required')
+        quarter=page or 3  # Keep the original signed Q3 task identity.
+        url=f'https://www.lseg.com/content/dam/ftse-russell/en_us/documents/other/final-ipo-additions-{quarter}-qtr-r{entity}.pdf'
     elif kind=='CITI_CATALOG':
         if entity or day or page:raise ValueError('Fixed depositary catalog required')
         url=CITI_CATALOG
@@ -360,7 +361,8 @@ def discovered(request, body):
     elif kind=='LSEG_WEIGHT_CATALOG':result=[task('LSEG_WEIGHTS',code) for code in weight_catalog(body)]
     elif kind=='RUSSELL_IPO_PAGE':
         links={urljoin(request['url'],link) for link in html(body).links}
-        result=[task('RUSSELL_IPO_PDF',code) for code in ('1000','2000','3000') if task('RUSSELL_IPO_PDF',code)['url'] in links]
+        candidates=[task('RUSSELL_IPO_PDF',code,page=q) for code in ('1000','2000','3000') for q in (0,1,2,4)]
+        result=[t for t in candidates if t['url'] in links]
     elif kind in ('SP_CATALOG','SP_ARCHIVE','RUSSELL_PAGE'):
         for link in html(body).links:
             url=urljoin(request['url'],link).split('#')[0]

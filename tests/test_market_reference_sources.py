@@ -167,3 +167,10 @@ def test_citi_pdf_follows_only_exact_official_attachment_annotations(monkeypatch
     page={'/Annots':[Ref({'/A':{'/URI':u}}) for u in urls]}
     monkeypatch.setattr(pypdf,'PdfReader',lambda *_:SimpleNamespace(pages=[page]))
     assert s.discovered(s.task('CITI_NOTICE','2621'),b'%PDF-fixture')==[s.task('CITI_ATTACHMENT','6832')]
+
+
+def test_ipo_discovery_follows_new_quarters_without_guessing_absent_files():
+    t=s.task('RUSSELL_IPO_PAGE');q1=s.task('RUSSELL_IPO_PDF','3000',page=1)
+    body=('<html><a href="'+q1['url']+'">Q1</a><a href="https://evil.example/final-ipo-additions-4-qtr-r3000.pdf">x</a></html>').encode()
+    assert s.discovered(t,body)==[q1]
+    assert '3-qtr' in s.task('RUSSELL_IPO_PDF','3000')['url']
