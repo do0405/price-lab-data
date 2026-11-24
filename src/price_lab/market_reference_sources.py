@@ -28,7 +28,9 @@ LSEG_WEIGHT_INDICES={f'US{int(size)+offset}':('RUSSELL'+size+suffix,'Russell '+s
         (0,'',''),(1,'_GROWTH',' Growth'),(2,'_VALUE',' Value'))}
 RUSSELL_ARCHIVE_REPORTS=(
     'https://www.lseg.com/content/dam/ftse-russell/en_us/documents/other/ru3000-additions-20250613.pdf',
-    'https://www.lseg.com/content/dam/ftse-russell/en_us/documents/other/ru3000-additions-20260618.pdf')
+    'https://www.lseg.com/content/dam/ftse-russell/en_us/documents/other/ru3000-additions-20260618.pdf',
+    'https://www.lseg.com/content/dam/ftse-russell/en_us/documents/other/ru3000-additions-preliminary-20240524.pdf',
+    'https://www.lseg.com/content/dam/ftse-russell/en_us/documents/other/ru3000-deletions-preliminary-20240524.pdf')
 CITI_CATALOG='https://depositaryreceipts.citi.com/adr/notices/pgm_dispCA.aspx?pageId=16&subpageID=112'
 CITI_PDF='https://depositaryreceipts.citi.com/adr/notices/previewPdf.aspx'
 
@@ -125,7 +127,7 @@ def task(kind, entity='', day='', page=0):
         if entity not in ('VIX','VVIX'): raise ValueError('Supported Cboe index required')
         url=f'https://cdn-api.cboe.com/api/global/us_indices/daily_prices/{entity}_History.csv'
     elif kind == 'RUSSELL_PDF':
-        if not re.fullmatch(r'https://www\.lseg\.com/content/dam/ftse-russell/en_us/documents/other/ru(?:1000|2000|3000)-(?:additions|deletions)-\d{8}\.pdf', entity): raise ValueError('Official Russell PDF required')
+        if not re.fullmatch(r'https://www\.lseg\.com/content/dam/ftse-russell/en_us/documents/other/ru(?:1000|2000|3000)-(?:additions|deletions)-(?:preliminary-)?\d{8}\.pdf', entity): raise ValueError('Official Russell PDF required')
         url = entity
     elif kind == 'NASDAQ_PDF':
         if not re.fullmatch(r'https://indexes\.nasdaqomx\.com/docs/20\d{2}(?:0[1-9]|1[0-2])%20NDX%20Reconstitution%20and%20Performance%20Highlights\.pdf',entity):

@@ -210,6 +210,10 @@ def plan(state, bootstrap, now):
     seeds += [s.task('BNY_NOTICE','AD2000235')]
     seeds += [s.task('CITI_ATTACHMENT',id) for id in bootstrap.get('depositary_attachment_ids',[])]
     seeds += [s.task('RUSSELL_PDF',url) for url in s.RUSSELL_ARCHIVE_REPORTS]
+    # Verified public files remain useful after they disappear from the
+    # current-quarter page. Reuse their original tasks, never the filename
+    # quarter as a substitute for the PDF's declared effective date/year.
+    seeds += [s.task('RUSSELL_IPO_PDF',index,page=q) for index in ('1000','2000','3000') for q in (1,4)]
     seeds += [s.task('FINRA_DAILY',day=(date.fromisoformat(through)-timedelta(days=n)).isoformat())
               for n in range(5) if (date.fromisoformat(through)-timedelta(days=n)).isoformat()>='2018-12-18']
     fresh={s.digest(t):t for t in seeds if s.digest(t) not in state['checked'] and s.digest(t) not in pending}
