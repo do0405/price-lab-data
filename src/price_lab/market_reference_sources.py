@@ -233,7 +233,8 @@ def citi_notices(body):
                 task('CITI_NOTICE',q['caId'][0]);ids.append(q['caId'][0])
         if len(set(ids))!=1:raise ValueError('Unique Citi notice PDF required')
         ratio=re.fullmatch(r'(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)',cells[5])
-        if not ratio or any(float(x)<=0 for x in ratio.groups()):raise ValueError('Positive reported ORD:DR ratio required')
+        if not ratio or any(not math.isfinite(float(x)) or float(x)<=0 for x in ratio.groups()):raise ValueError('Positive reported ORD:DR ratio required')
+        if not math.isfinite(float(ratio[1])/float(ratio[2])):raise ValueError('Finite reported ORD:DR ratio required')
         if not re.fullmatch(r'[0-9A-Z*@#]{9}',cells[4]):raise ValueError('Reported Citi CUSIP required')
         result.append(dict(notice_id=ids[0],company=cells[0],notice_date=datetime.strptime(cells[1],'%m/%d/%Y').date().isoformat(),
             raw_symbol=cells[3],cusip=cells[4],ratio_reported=cells[5],ordinary_per_dr=float(ratio[1])/float(ratio[2]),

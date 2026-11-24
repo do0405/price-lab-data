@@ -120,7 +120,7 @@ def test_citi_catalog_requires_exact_table_and_discovers_only_reported_pdf_ids()
     assert row['notice_id']=='513' and row['notice_date']=='2016-07-14'
     assert row['ratio_reported']=='1:2' and row['cusip']=='756568101'
     assert s.discovered(task,body)==[s.task('CITI_NOTICE','513')]
-    for bad in [body.replace(b'previewPdf.aspx?caId=513',b'https://evil.example/previewPdf.aspx?caId=513'),body.replace(b'1:2',b'0:2'),body.replace(b'07/14/2016',b'02/31/2016')]:
+    for bad in [body.replace(b'previewPdf.aspx?caId=513',b'https://evil.example/previewPdf.aspx?caId=513'),body.replace(b'1:2',b'0:2'),body.replace(b'1:2',b'9'*400+b':1'),body.replace(b'07/14/2016',b'02/31/2016')]:
         with pytest.raises(ValueError):s.validate_response(task,bad)
 
 
