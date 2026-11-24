@@ -54,6 +54,99 @@ def test_download_rejects_cipher_hash_and_never_sends_credentials(monkeypatch,tm
         t.download_package(metadata(),tmp_path)
 
 
+def test_local_asset_api_requests_binary_without_credentials(monkeypatch,tmp_path):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from price_lab import daily_delta_transport as t
+
+    def get(url,**kwargs):
+        assert url==f'{t.API}/releases/assets/1'
+        assert kwargs['headers']=={'Accept':'application/octet-stream','Cache-Control':'no-cache'}
+        return nullcontext(SimpleNamespace(status_code=200,url=url,iter_content=lambda _: [b'12345678']))
+    monkeypatch.setattr(t.requests,'get',get)
+    with pytest.raises(ValueError,match='hash'):
+        t.download_package(metadata(),tmp_path,asset_api=True)
+
+
+@pytest.mark.parametrize(('statuses','expected_calls'), [([504, 200], 2), ([504, 504, 504], 3), ([404], 1)])
+def test_download_retries_only_transient_http_errors(monkeypatch,tmp_path,statuses,expected_calls):
+    import hashlib
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from price_lab import daily_delta_transport as t
+
+    payload=b'12345678'
+    release=metadata()
+    body=json.loads(release['body'])
+    release['body']=json.dumps(dict(body,ciphertext_sha256=hashlib.sha256(payload).hexdigest()))
+    attempts=iter(statuses)
+    calls=[]
+    def get(url,**kwargs):
+        status=next(attempts)
+        calls.append(status)
+        return nullcontext(SimpleNamespace(status_code=status,url=url,iter_content=lambda _: [payload]))
+    monkeypatch.setattr(t.requests,'get',get)
+    monkeypatch.setattr(t.time,'sleep',lambda _:None)
+    if statuses[-1]==200:
+        assert t.download_package(release,tmp_path).read_bytes()==payload
+    else:
+        with pytest.raises(t.PackageDownloadHTTPError) as failure:
+            t.download_package(release,tmp_path)
+        assert failure.value.status_code==statuses[-1]
+    assert len(calls)==expected_calls
+
+
+@pytest.mark.parametrize('stream',['daily','research'])
+@pytest.mark.parametrize('http_status',[403,429])
+def test_asset_api_limit_uses_the_verified_public_release_asset(monkeypatch,tmp_path,stream,http_status):
+    import hashlib
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from price_lab import daily_delta_transport as daily, research_delta_transport as research
+
+    transport=daily if stream=='daily' else research
+    release=metadata()
+    body=json.loads(release['body'])
+    release['body']=json.dumps(dict(body,ciphertext_sha256=hashlib.sha256(b'12345678').hexdigest()))
+    if stream=='research':
+        monkeypatch.setattr(research,'package_metadata',daily.package_metadata)
+    public_url=release['assets'][0]['browser_download_url']
+    api_url=f'{daily.API}/releases/assets/1'
+    calls=[]
+    def get(url,**kwargs):
+        calls.append(url)
+        return nullcontext(SimpleNamespace(status_code=http_status if url==api_url else 200,
+            url=url,iter_content=lambda _: [b'12345678']))
+    monkeypatch.setattr(transport.requests,'get',get)
+    assert transport.download_package(release,tmp_path,asset_api=True).read_bytes()==b'12345678'
+    assert calls==[api_url,public_url]
+
+
+@pytest.mark.parametrize('stream',['daily','research'])
+def test_local_asset_download_changes_route_after_two_gateway_failures(monkeypatch,tmp_path,stream):
+    import hashlib
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from price_lab import daily_delta_transport as daily, research_delta_transport as research
+
+    transport=daily if stream=='daily' else research
+    payload=b'12345678'
+    release=metadata()
+    browser_url=release['assets'][0]['browser_download_url']
+    asset_url=f'{daily.API}/releases/assets/1'
+    monkeypatch.setattr(transport,'package_metadata',
+                        lambda _: {'ciphertext_sha256':hashlib.sha256(payload).hexdigest()})
+    calls=[]
+    def get(url,**kwargs):
+        calls.append(url)
+        status=504 if url==asset_url else 200
+        return nullcontext(SimpleNamespace(status_code=status,url=url,iter_content=lambda _: [payload]))
+    monkeypatch.setattr(transport.requests,'get',get)
+    monkeypatch.setattr(transport.time,'sleep',lambda _:None)
+    assert transport.download_package(release,tmp_path,asset_api=True).read_bytes()==payload
+    assert calls==[asset_url,asset_url,browser_url]
+
+
 def test_published_same_package_retry_does_not_mutate_release(monkeypatch,tmp_path):
     from price_lab import daily_delta_transport as t
     from price_lab import daily_delta_codec as c

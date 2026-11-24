@@ -95,8 +95,10 @@ def test_closed_batches_immediately_continue_without_schedule_wait(tmp_path,monk
         published.append(payload)
         return {'sequence':payload['sequence'],'package_sha256':package_digest(payload)}
     monkeypatch.setattr(wire,'publish_package',publish)
-    result=p.run_pipeline(seconds=420,max_requests=1,max_batches=2)
+    ticks=[]
+    result=p.run_pipeline(seconds=420,max_requests=1,max_batches=2,service_tick=lambda:ticks.append(len(published)))
     assert result['batches']==2 and len(published)==2
+    assert ticks==[1,2], 'Local service runs only after closed batch publication'
     assert published[1]['previous_package_sha256']==package_digest(published[0])
     if already_seen:assert not published[0]['records'] and not published[1]['records']
     else:assert published[0]['records'][0]['task']!=published[1]['records'][0]['task']

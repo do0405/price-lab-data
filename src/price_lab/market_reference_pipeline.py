@@ -52,11 +52,11 @@ def tag(head):
     return f"delta-market-{head['sequence']:012d}-{head['package_sha256']}"
 
 
-def load(head, directory, *, key=None):
+def load(head, directory, *, key=None, token=None):
     directory=Path(directory); directory.mkdir(parents=True,exist_ok=True)
     path=directory/(tag(head)+'.pldelta')
     if not path.exists():
-        release=_api('GET','/releases/tags/'+tag(head),revalidate=True)
+        release=_api('GET','/releases/tags/'+tag(head),revalidate=True,token=token)
         if release.get('tag_name')!=tag(head) or release.get('draft') or release.get('prerelease'): raise ValueError('Committed reference release unavailable')
         assets=[a for a in release.get('assets',[]) if a.get('name')==ASSET]
         if len(assets)!=1 or not 0<assets[0]['size']<=135*1024**2: raise ValueError('Reference asset contract mismatch')
@@ -64,7 +64,8 @@ def load(head, directory, *, key=None):
         partial=path.with_suffix('.working')
         try:
             headers={'Accept':'application/octet-stream','Cache-Control':'no-cache'}
-            if os.environ.get('GITHUB_TOKEN'): headers['Authorization']='Bearer '+os.environ['GITHUB_TOKEN']
+            credential=token or os.environ.get('GITHUB_TOKEN')
+            if credential: headers['Authorization']='Bearer '+credential
             with requests.get(url,headers=headers,timeout=(20,90),allow_redirects=False,stream=True) as response:
                 if response.status_code==302:
                     target=response.headers.get('Location',''); u=urlsplit(target)

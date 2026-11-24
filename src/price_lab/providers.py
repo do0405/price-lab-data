@@ -37,6 +37,7 @@ class KisTemporaryError(ProviderError):
         super().__init__('KIS unsuccessful response')
 
 
+
 @dataclass
 class MarketBatch:
     market:str
@@ -234,8 +235,9 @@ class AlpacaProvider:
         if market not in ('us','crypto') or not sessions:raise ProviderError('Invalid Alpaca bar request')
         if adjustment not in ('raw','split') or (market=='crypto' and adjustment!='raw'):raise ValueError('Unsupported Alpaca adjustment')
         if isinstance(batch_size,bool) or not isinstance(batch_size,int) or not 1<=batch_size<=500:raise ProviderError('Invalid Alpaca symbol batch size')
+        # Alpaca's omitted asof means the current entity. Pin that default once,
+        # including across pages, so a split companion can use the same entity.
         if market=='us':
-            # Pin Alpaca's default entity date across all request chunks/pages.
             asof=datetime.now(timezone.utc).date().isoformat() if asof is None else asof
             if asof!='-':
                 try:
@@ -243,10 +245,9 @@ class AlpacaProvider:
                 except (TypeError,ValueError):raise ProviderError('Invalid Alpaca entity asof') from None
         elif asof is not None:raise ValueError('Crypto bars do not support entity asof')
         wanted=set(pd.DatetimeIndex(sessions).normalize());rows=[]
-        start=_day(min(wanted));end=_day(max(wanted)+pd.Timedelta(days=1))+'T00:00:00Z'
         for offset in range(0,len(symbols),batch_size):
-            chunk=list(symbols[offset:offset+batch_size]);params={'symbols':','.join(chunk),'timeframe':'1Day','start':start,
-                'end':end,'limit':10000,'sort':'asc'}
+            chunk=list(symbols[offset:offset+batch_size]);params={'symbols':','.join(chunk),'timeframe':'1Day','start':_day(min(wanted)),
+                'end':_day(max(wanted)+pd.Timedelta(days=1))+'T00:00:00Z','limit':10000,'sort':'asc'}
             if market=='us':params.update(feed=self.feed,adjustment=adjustment,asof=asof)
             path='/v2/stocks/bars' if market=='us' else '/v1beta3/crypto/us/bars'
             for page in self._pages(path,params,'bars'):
@@ -263,18 +264,22 @@ class AlpacaProvider:
                         rows.append(dict(market=market,symbol=symbol,session_date=date,**{k:_number(record[v]) for k,v in [('open','o'),('high','h'),('low','l'),('close','c')]},
                                          volume=volume,turnover=volume*vwap if vwap is not None else 0.,vwap=vwap,currency='USD' if market=='us' else symbol.rsplit('/',1)[-1],source='alpaca',
                                          trade_count=record.get('n'),feed=self.feed if market=='us' else 'us',turnover_method='provider_vwap_times_volume',vwap_method='provider',
-                                         retrieved_at=datetime.now(timezone.utc).isoformat(),is_tradable_bar=bool(volume>0 and all(_number(record[c])>0 for c in ('o','h','l','c')))))
+                                         retrieved_at=datetime.now(timezone.utc).isoformat(),is_tradable_bar=bool(
+                                             (volume>=0 if market=='crypto' else volume>0)
+                                             and _number(record['l'])>0 and _number(record['h'])>=max(_number(record[c]) for c in ('o','l','c'))
+                                             and _number(record['l'])<=min(_number(record[c]) for c in ('o','c')))))
         frame=pd.DataFrame(rows)
         if frame.empty:raise ProviderError('Alpaca empty completed-session bars')
         if frame.duplicated(['symbol','session_date']).any():raise ProviderError('Duplicate Alpaca bar key')
         frame['trade_count']=pd.array(frame.trade_count,dtype='Int64')
         if market=='us':
-            frame.attrs['alpaca_query']=dict(symbols=list(symbols),timeframe='1Day',start=start,end=end,
-                feed=self.feed,asof=asof,adjustment=adjustment,batch_size=batch_size)
+            frame.attrs['alpaca_query']=dict(symbols=list(symbols),timeframe='1Day',start=_day(min(wanted)),
+                end=_day(max(wanted)+pd.Timedelta(days=1))+'T00:00:00Z',feed=self.feed,
+                asof=asof,adjustment=adjustment,batch_size=batch_size)
         return frame
     def fetch_actions(self,start,end):
         result=[]
-        for groups in self._pages('/v1/corporate-actions',{'start':_day(start),'end':_day(end),'types':'forward_split,reverse_split','limit':1000,'sort':'asc','data_quality':'complete'},'corporate_actions'):
+        for groups in self._pages('/v1/corporate-actions',{'start':_day(start),'end':_day(end),'limit':1000,'sort':'asc','data_quality':'complete'},'corporate_actions'):
             if not isinstance(groups,dict):raise ProviderError('Alpaca actions shape invalid')
             for group,records in groups.items():
                 if not isinstance(records,list):raise ProviderError('Alpaca action group invalid')
@@ -481,8 +486,15 @@ class Providers:
                 sessions=[day for day in sessions if day not in deferred]
                 if not sessions:return MarketBatch(market,pd.DataFrame(),universe,[],[],{},tuple(deferred))
             try:
-                frames.append(self.kis.fetch_benchmarks(sessions));bars=pd.concat(frames,ignore_index=True)
+                try:frames.append(self.kis.fetch_benchmarks(sessions))
+                except ProviderError:
+                    from .price_source_selection import kr_bar_problem
+                    actual={(r['symbol'],pd.Timestamp(r['session_date'])) for f in frames for r in f.to_dict('records') if kr_bar_problem(r) is None}
+                    if any((s,pd.Timestamp(d)) not in actual for s in BENCHMARKS['kr'] for d in sessions):raise
+                bars=pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()
                 universe=pd.concat([universe,*universes],ignore_index=True).drop_duplicates(['market','symbol'],keep='last')
+                from .price_source_selection import complete_kr_price_bars
+                bars=complete_kr_price_bars(bars,self.kis,sessions,expected_symbols=universe.symbol)
                 actions=self.kis.fetch_actions(action_start,max(sessions))
             except KisTemporaryError:
                 if not self.defer_temporary_kis:raise

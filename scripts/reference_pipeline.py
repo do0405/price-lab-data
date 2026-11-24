@@ -72,7 +72,7 @@ def takeover_state(prior,owner,now):
     return state
 
 
-def run_pipeline(*,seconds=420,max_requests=100,max_batches=100,work_root=None,owner=None):
+def run_pipeline(*,seconds=420,max_requests=100,max_batches=100,work_root=None,owner=None,state_transform=None,service_tick=None):
     from price_lab.research_delta_codec import open_bootstrap,package_digest
     from price_lab.research_delta_transport import newest_package,load_package,publish_package
     from price_lab.research_delta_collect import collect_batch,official_fetcher,extend_sessions
@@ -105,14 +105,14 @@ def run_pipeline(*,seconds=420,max_requests=100,max_batches=100,work_root=None,o
             control=read_control(key=key)
             release=canonical_newest(control['head'])
             prior=load_package(release,work,key=key) if release else None
-            return _produce(bootstrap,prior,work,key,end,clock,seconds,max_requests,max_batches,owner)
+            return _produce(bootstrap,prior,work,key,end,clock,seconds,max_requests,max_batches,owner,state_transform=state_transform,service_tick=service_tick)
         finally:
             try:owner.release()
             except Exception:pass  # Expiry is the fallback; never roll back a committed head.
-    return _produce(bootstrap,prior,work,key,end,clock,seconds,max_requests,max_batches,None)
+    return _produce(bootstrap,prior,work,key,end,clock,seconds,max_requests,max_batches,None,state_transform=state_transform,service_tick=service_tick)
 
 
-def _produce(bootstrap,prior,work,key,end,clock,seconds,max_requests,max_batches,owner):
+def _produce(bootstrap,prior,work,key,end,clock,seconds,max_requests,max_batches,owner,*,state_transform=None,service_tick=None):
     from price_lab.research_delta_codec import package_digest
     from price_lab.research_delta_transport import publish_package
     from price_lab.research_delta_collect import collect_batch,official_fetcher,extend_sessions
@@ -126,6 +126,9 @@ def _produce(bootstrap,prior,work,key,end,clock,seconds,max_requests,max_batches
         price=daily.load_package(latest_daily,work,key=key)
         state=extend_sessions(state,price['state']['sessions']['kr'])
         del price
+    # The local wrapper can prioritize repairs using its canonical reader.
+    # Cloud execution supplies no callback and imports no database code.
+    if state_transform is not None:state=state_transform(state)
     fetch=official_fetcher()
     invocation=f"{os.environ.get('GITHUB_RUN_ID','manual')}-{os.environ.get('GITHUB_RUN_ATTEMPT','1')}-{uuid.uuid4().hex}"
     sent=[];status='RUNNING';total_requests=0;yielded=False
@@ -167,6 +170,7 @@ def _produce(bootstrap,prior,work,key,end,clock,seconds,max_requests,max_batches
         if owner is not None:owner.commit_head(payload)
         sent.append({'sequence':published['sequence'],'records':len(records),'package_sha256':published['package_sha256']})
         prior=payload
+        if service_tick is not None:service_tick()
         print(json.dumps({'stage':'research_batch','status':status,**sent[-1],'cloud_database':False}),flush=True)
         if owner is not None and owner.role=='cloud' and owner.should_yield():
             yielded=True;status='YIELDED_TO_LOCAL';break

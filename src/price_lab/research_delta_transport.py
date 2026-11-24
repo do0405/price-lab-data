@@ -6,6 +6,7 @@ Local synchronization imports the database applier inside pull_latest only.
 import hashlib
 import base64
 from collections import deque
+from itertools import chain
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime,timezone
@@ -18,12 +19,16 @@ import time
 from urllib.parse import urlsplit
 
 import requests
+from .daily_delta_transport import (
+    PackageDownloadHTTPError, TRANSIENT_DOWNLOAD_HTTP_STATUSES, asset_download_request,
+)
 
 REPOSITORY='do0405/price-lab-data'
 API='https://api.github.com/repos/'+REPOSITORY
 PURPOSE='kr-research-delta'
 ASSET='research.pldelta'
 MAX_ASSET_BYTES=129*1024**2
+MAX_RECEIVE_PACKAGES=1000
 MAX_PAGES=100
 _HEX=re.compile(r'[0-9a-f]{64}')
 UNSET=object()
@@ -278,18 +283,20 @@ def _canonical_packages(head,*,after_sequence,expected_cursor_hash,token):
     raise ValueError('Canonical research package discovery bound reached')
 
 
-def download_package(release,directory):
+def download_package(release,directory,*,asset_api=False):
     meta=package_metadata(release);asset=release['assets'][0]
     directory=Path(directory);directory.mkdir(parents=True,exist_ok=True)
     target=directory/ASSET
+    url,options,allowed_hosts=asset_download_request(asset,asset_api=asset_api)
     for attempt in range(3):
         digest=hashlib.sha256();total=0
         try:
-            with requests.get(asset['browser_download_url'],stream=True,
-                    timeout=(20,120),allow_redirects=True) as response:
-                if response.status_code!=200:raise RuntimeError('Research package download HTTP failure')
+            with requests.get(url,stream=True,
+                    timeout=(20,120),allow_redirects=True,**options) as response:
+                if response.status_code != 200:
+                    raise PackageDownloadHTTPError(response.status_code)
                 final=urlsplit(response.url)
-                if final.scheme!='https' or final.hostname not in ('github.com','release-assets.githubusercontent.com'):
+                if final.scheme!='https' or final.hostname not in allowed_hosts:
                     raise ValueError('Invalid research package redirect')
                 with target.open('wb') as out:
                     for block in response.iter_content(1024*1024):
@@ -301,25 +308,35 @@ def download_package(release,directory):
             return target
         except requests.exceptions.SSLError:
             raise RuntimeError('Research package TLS verification failed') from None
+        except PackageDownloadHTTPError as error:
+            if attempt < 2 and 'api.github.com' in allowed_hosts and error.status_code in (403, 429):
+                url,options,allowed_hosts=asset_download_request(asset,asset_api=False)
+                continue
+            if attempt==2 or error.status_code not in TRANSIENT_DOWNLOAD_HTTP_STATUSES:
+                raise
+            if 'api.github.com' in allowed_hosts and attempt==1:
+                url,options,allowed_hosts=asset_download_request(asset,asset_api=False)
+            time.sleep(attempt+1)
         except (requests.Timeout,requests.ConnectionError,requests.exceptions.ChunkedEncodingError):
-            if attempt==2:raise RuntimeError('Research package download exhausted retries') from None
+            if attempt==2:raise requests.ConnectionError('Research package download exhausted retries') from None
             time.sleep(attempt+1)
     raise RuntimeError('Research package download failed')
 
 
-def load_package(release,work_root,*,key=None):
+def load_package(release,work_root,*,key=None,asset_api=False):
     from .research_delta_codec import open_package,package_digest
     meta=package_metadata(release)
     Path(work_root).mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='research-read-',dir=work_root) as temporary:
-        payload=open_package(download_package(release,temporary),key=key or os.environ.get('PRICE_DATA_KEY'))
+        payload=open_package(download_package(release,temporary,asset_api=asset_api),
+            key=key or os.environ.get('PRICE_DATA_KEY'))
     if (package_digest(payload)!=meta['package_sha256'] or
             any(payload.get(k)!=meta.get(k) for k in ('sequence','stream_id','previous_package_sha256'))):
         raise ValueError('Authenticated research package metadata mismatch')
     return payload
 
 
-def ordered_packages(releases,work_root,*,key=None):
+def ordered_packages(releases,work_root,*,key=None,asset_api=False):
     """Two local read-ahead jobs; only the caller applies in canonical order.
 
     Each existing loader authenticates and owns its temporary directory. Closing
@@ -330,18 +347,19 @@ def ordered_packages(releases,work_root,*,key=None):
     128MiB JSON-byte limit is not a bound on decoded Python objects or RSS.
     """
     iterator=iter(releases);pending=deque();end=object()
+    options={'asset_api':True} if asset_api else {}
     with ThreadPoolExecutor(max_workers=2,thread_name_prefix='research-read') as pool:
         try:
             for _ in range(2):
                 release=next(iterator,end)
                 if release is end:break
-                pending.append(pool.submit(load_package,release,work_root,key=key))
+                pending.append(pool.submit(load_package,release,work_root,key=key,**options))
             while pending:
                 future=pending.popleft()
                 yield future.result()
                 release=next(iterator,end)
                 if release is not end:
-                    pending.append(pool.submit(load_package,release,work_root,key=key))
+                    pending.append(pool.submit(load_package,release,work_root,key=key,**options))
         finally:
             for future in pending:future.cancel()
 
@@ -431,13 +449,13 @@ def publish_package(payload,*,key=None,token=None,work_root=None,expected_head=U
         'sequence':payload['sequence'],'package_sha256':digest,'ciphertext_bytes':uploaded['size']}
 
 
-def pull_latest(root,*,key=None,max_packages=1,max_bytes=None,token=None):
+def pull_latest(root,*,key=None,max_packages=1,max_bytes=None,token=None,progress=None):
     """Local only: bounded, contiguous research suffix; failures retain cursor."""
     import duckdb
-    from .ingestion import resolve_current,managed_lock,current_reader
+    from .ingestion import managed_lock,current_reader
     from .research_delta_apply import apply_packages
     from .research_ownership import read_control
-    if type(max_packages) is not int or not 1<=max_packages<=100:raise ValueError('Invalid research apply bound')
+    if type(max_packages) is not int or not 1<=max_packages<=MAX_RECEIVE_PACKAGES:raise ValueError('Invalid research apply bound')
     if max_bytes is not None and (type(max_bytes) is not int or max_bytes<1):raise ValueError('Invalid research byte bound')
     root=Path(root);root.mkdir(parents=True,exist_ok=True)
     with managed_lock(root/'research-transport'):
@@ -449,8 +467,12 @@ def pull_latest(root,*,key=None,max_packages=1,max_bytes=None,token=None):
                     row=db.execute("SELECT sequence,package_sha256 FROM research_delta_receipts WHERE stream_id='kr-reference-evidence-v1' ORDER BY sequence DESC LIMIT 1").fetchone()
                     if row:after,cursor_hash=row
             manifest=dict(current)
+        remote_head_sequence=None
         def discover(sequence,digest):
+            nonlocal remote_head_sequence
             control=read_control(token=token,key=key)
+            if control is not None:
+                remote_head_sequence=control['head']['sequence'] if control.get('head') else 0
             options=dict(after_sequence=sequence,expected_cursor_hash=digest,token=token)
             return canonical_packages(control['head'],**options) if control else list_packages(**options)
         releases=discover(after,cursor_hash)
@@ -462,23 +484,42 @@ def pull_latest(root,*,key=None,max_packages=1,max_bytes=None,token=None):
                 break
             selected.append(release);size+=amount
         if selected:
-            with closing(ordered_packages(selected,root/'research-download',key=key)) as payloads:
-                result=apply_packages(payloads,root)
+            if progress:progress('DOWNLOADING')
+            with closing(ordered_packages(selected,root/'research-download',key=key,asset_api=True)) as payloads:
+                first=next(payloads)
+                suffix=chain((first,),payloads)
+                del first
+                if progress:progress('WAITING_WRITER')
+                result=apply_packages(suffix,root,**({'on_progress':progress} if progress else {}))
             if result.get('error_code')=='RESEARCH_STORAGE_RESERVE_REQUIRED':
                 return {**result,'more_available':False,'downloaded':True,
                     'transport':'research-delta-v1','ciphertext_bytes':size,'cloud_database':False}
-            if result['status'] not in ('PUBLISHED','UNCHANGED','COMMITTED_RECOVERY_PENDING'):raise ValueError('Research validation failed; previous cursor retained')
+            if result['status'] not in ('PUBLISHED','UNCHANGED','COMMITTED_RECOVERY_PENDING'):
+                if result.get('failure_http_status') is not None:
+                    raise PackageDownloadHTTPError(result['failure_http_status'])
+                if result.get('failure_reason')=='REMOTE_TRANSPORT_UNAVAILABLE':
+                    raise requests.ConnectionError('Research transport interrupted; previous cursor retained')
+                if result.get('failure_type')=='TimeoutError':
+                    raise TimeoutError('Research apply timed out; previous cursor retained')
+                if result.get('failure_type')=='PermissionError':
+                    raise PermissionError('Research apply temporarily blocked; previous cursor retained')
+                raise ValueError('Research validation failed; previous cursor retained')
         else:result={'status':'UNCHANGED','applied_packages':[],'manifest':manifest}
-        more=len(selected)<len(releases)
+        remaining_packages=len(releases)-len(selected)
+        more=remaining_packages>0
         if selected and not more:
             # A multi-GB local publication can overlap new ready cloud batches.
             # Rediscovery is reporting after the committed cursor, not a second
             # application or a reason to roll back an already valid publication.
             try:
-                more=bool(discover(result['applied_sequence'],result['package_sha256']))
-            except Exception:result['warning_code']='RESEARCH_TIP_CHECK_UNAVAILABLE'
+                pending=discover(result['applied_sequence'],result['package_sha256'])
+                remaining_packages=len(pending);more=bool(pending)
+            except Exception:
+                result['warning_code']='RESEARCH_TIP_CHECK_UNAVAILABLE'
+                remaining_packages=None  # Committed prefix, frontier not confirmed.
         return {**result,'status':'MORE_AVAILABLE' if more and result['status']!='COMMITTED_RECOVERY_PENDING' else result['status'],
             'more_available':more,'downloaded':bool(selected),'transport':'research-delta-v1',
-            'ciphertext_bytes':size,'cloud_database':False}
+            'ciphertext_bytes':size,'cloud_database':False,'remote_head_sequence':remote_head_sequence,
+            'remaining_packages':remaining_packages}
 
 

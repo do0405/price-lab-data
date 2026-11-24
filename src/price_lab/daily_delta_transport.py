@@ -5,6 +5,7 @@ Local synchronization imports the database applier inside pull_latest only.
 """
 import hashlib
 import base64
+from itertools import chain
 from datetime import datetime,timezone
 import json
 import os
@@ -24,6 +25,13 @@ MAX_ASSET_BYTES=513*1024**2
 MAX_PAGES=100
 _HEX=re.compile(r'[0-9a-f]{64}')
 _DISCOVERY_ATTEMPTS=3
+TRANSIENT_DOWNLOAD_HTTP_STATUSES=(408,500,502,503,504)
+
+
+class PackageDownloadHTTPError(RuntimeError):
+    def __init__(self, status_code):
+        super().__init__('Package download HTTP failure')
+        self.status_code = status_code
 
 
 class _IncompleteDiscovery(ValueError):
@@ -189,18 +197,29 @@ def _newest_package(*,token):
     raise ValueError('Latest daily package discovery bound reached; refusing a new bootstrap')
 
 
-def download_package(release,directory):
+def asset_download_request(asset, *, asset_api):
+    hosts=('github.com','release-assets.githubusercontent.com')
+    if asset_api:
+        return (f"{API}/releases/assets/{asset['id']}",
+                {'headers':{'Accept':'application/octet-stream','Cache-Control':'no-cache'}},
+                (*hosts,'api.github.com'))
+    return asset['browser_download_url'],{},hosts
+
+
+def download_package(release,directory,*,asset_api=False):
     meta=package_metadata(release);asset=release['assets'][0]
     directory=Path(directory);directory.mkdir(parents=True,exist_ok=True)
     target=directory/ASSET
+    url,options,allowed_hosts=asset_download_request(asset,asset_api=asset_api)
     for attempt in range(3):
         digest=hashlib.sha256();total=0
         try:
-            with requests.get(asset['browser_download_url'],stream=True,
-                    timeout=(20,120),allow_redirects=True) as response:
-                if response.status_code!=200:raise RuntimeError('Daily package download HTTP failure')
+            with requests.get(url,stream=True,
+                    timeout=(20,120),allow_redirects=True,**options) as response:
+                if response.status_code != 200:
+                    raise PackageDownloadHTTPError(response.status_code)
                 final=urlsplit(response.url)
-                if final.scheme!='https' or final.hostname not in ('github.com','release-assets.githubusercontent.com'):
+                if final.scheme!='https' or final.hostname not in allowed_hosts:
                     raise ValueError('Invalid daily package redirect')
                 with target.open('wb') as out:
                     for block in response.iter_content(1024*1024):
@@ -212,18 +231,31 @@ def download_package(release,directory):
             return target
         except requests.exceptions.SSLError:
             raise RuntimeError('Daily package TLS verification failed') from None
+        except PackageDownloadHTTPError as error:
+            if attempt < 2 and 'api.github.com' in allowed_hosts and error.status_code in (403, 429):
+                url,options,allowed_hosts=asset_download_request(asset,asset_api=False)
+                continue
+            if attempt==2 or error.status_code not in TRANSIENT_DOWNLOAD_HTTP_STATUSES:
+                raise
+            if 'api.github.com' in allowed_hosts and attempt==1:
+                url,options,allowed_hosts=asset_download_request(asset,asset_api=False)
+            time.sleep(attempt+1)
         except (requests.Timeout,requests.ConnectionError,requests.exceptions.ChunkedEncodingError):
-            if attempt==2:raise RuntimeError('Daily package download exhausted retries') from None
+            if attempt==2:raise requests.ConnectionError('Daily package download exhausted retries') from None
             time.sleep(attempt+1)
     raise RuntimeError('Daily package download failed')
 
 
-def load_package(release,work_root,*,key=None):
-    from .daily_delta_codec import open_package,package_digest
-    meta=package_metadata(release)
+def load_package(release,work_root,*,key=None,asset_api=False):
     Path(work_root).mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='daily-read-',dir=work_root) as temporary:
-        payload=open_package(download_package(release,temporary),key=key or os.environ.get('PRICE_DATA_KEY'))
+        return _open_download(release,download_package(release,temporary,asset_api=asset_api),key=key)
+
+
+def _open_download(release,path,*,key):
+    from .daily_delta_codec import open_package,package_digest
+    meta=package_metadata(release)
+    payload=open_package(path,key=key or os.environ.get('PRICE_DATA_KEY'))
     if (package_digest(payload)!=meta['package_sha256'] or
             any(payload.get(k)!=meta.get(k) for k in ('sequence','stream_id','previous_package_sha256'))):
         raise ValueError('Authenticated daily package metadata mismatch')
@@ -283,11 +315,13 @@ def publish_package(payload,*,key=None,token=None,work_root=None):
         'sequence':payload['sequence'],'package_sha256':digest,'ciphertext_bytes':uploaded['size']}
 
 
-def pull_latest(root,*,key=None,token=None):
+def pull_latest(root,*,key=None,token=None,progress=None):
     """Local only: apply authenticated packages to the latest local DB parent."""
     import duckdb
-    from .ingestion import resolve_current,managed_lock,current_reader
+    from . import daily_action_holds
+    from .ingestion import managed_lock,current_reader
     from .daily_delta_apply import apply_packages
+    from .us_price_history import receipt_scan_pending
     root=Path(root);root.mkdir(parents=True,exist_ok=True)
     with managed_lock(root/'daily-transport'):
         after=0;cursor_hash=None
@@ -297,6 +331,7 @@ def pull_latest(root,*,key=None,token=None):
                 if 'daily_delta_receipts' in {r[0] for r in db.execute('SHOW TABLES').fetchall()}:
                     row=db.execute("SELECT sequence,package_sha256 FROM daily_delta_receipts WHERE stream_id='price-daily-v1' ORDER BY sequence DESC LIMIT 1").fetchone()
                     if row:after,cursor_hash=row
+                pending_replay=bool(daily_action_holds.read(db)) or receipt_scan_pending(db)
         releases=list_packages(after_sequence=after,expected_cursor_hash=cursor_hash,token=token);applied=[]
         if releases:
             from .price_remediation import held_daily
@@ -309,8 +344,20 @@ def pull_latest(root,*,key=None,token=None):
             # A later confirmation may resolve an earlier pending action.
             # Authenticate and stage the contiguous suffix, then validate actions
             # once against all of its raw evidence before committing any receipt.
-            payloads=(load_package(release,root/'daily-download',key=key) for release in releases)
-            result=apply_packages(payloads,root)
+            if progress:progress('DOWNLOADING')
+            download_root=root/'daily-download'
+            download_root.mkdir(parents=True,exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix='daily-suffix-',dir=download_root) as temporary:
+                # Finish network and ciphertext checks before opening the writer.
+                # Decode lazily so a backlog does not retain every payload in RAM.
+                paths=[download_package(release,Path(temporary)/str(index),asset_api=True)
+                       for index,release in enumerate(releases)]
+                payloads=(_open_download(release,path,key=key) for release,path in zip(releases,paths))
+                first=next(payloads)
+                suffix=chain((first,),payloads)
+                del first
+                if progress:progress('WAITING_WRITER')
+                result=apply_packages(suffix,root,**({'progress':progress} if progress else {}))
             if result['status']=='WAITING_VALIDATION':
                 held_daily(root,remember=True,diagnostic_sha256=result.get('diagnostic_sha256'),**held)
                 return {**result,'transport':'daily-delta-v1','applied_packages':[],
@@ -319,12 +366,16 @@ def pull_latest(root,*,key=None,token=None):
                 raise ValueError('Daily package local validation failed; previous database retained')
             applied=[{'sequence':package_metadata(release)['sequence'],'status':result['status'],
                 'package_sha256':package_metadata(release)['package_sha256']} for release in releases]
-        if releases:manifest=result['manifest']
         else:
-            with current_reader(root) as current:manifest=dict(current)
-        return {'manifest':manifest,'transport':'daily-delta-v1','downloaded':bool(releases),
-            'status':result['status'] if releases else 'UNCHANGED',
-            'unchanged':not releases,'applied_packages':applied,'cloud_database':False}
+            if pending_replay:
+                result=apply_packages((),root,**({'progress':progress} if progress else {}))
+            else:
+                with current_reader(root) as current:
+                    result=dict(status='UNCHANGED',manifest=dict(current),applied_sequence=after)
+        return {'manifest':result['manifest'],'transport':'daily-delta-v1','downloaded':bool(releases),
+            'status':result['status'],'held_action_ranges':result.get('held_action_ranges',0),
+            'action_holds':result.get('action_holds',[]),'applied_sequence':result.get('applied_sequence'),
+            'unchanged':result['status']=='UNCHANGED' and not releases,'applied_packages':applied,'cloud_database':False}
 
 
 def record_periodic_status(payload,*,now=None):
