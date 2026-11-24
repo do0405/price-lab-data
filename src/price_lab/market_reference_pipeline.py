@@ -376,6 +376,9 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
         # Large ADR catalogs must not starve prices, shares or index backfill.
         if sent%5==4 and t['kind'] in ('CITI_NOTICE','CITI_ATTACHMENT'):
             t=next((candidate for candidate in ready if candidate['kind'] not in ('CITI_NOTICE','CITI_ATTACHMENT')),t)
+        elif t['kind'] in ('CITI_NOTICE','CITI_ATTACHMENT'):
+            preferred='CITI_NOTICE' if sent%5==0 else 'CITI_ATTACHMENT'
+            t=next((candidate for candidate in ready if candidate['kind']==preferred),t)
         key=s.digest(t); host=urlsplit(t['url']).hostname
         status,headers,body=fetch(t); sent+=1; state['requests'][host]=state['requests'].get(host,0)+1
         empty_finra=t['kind']=='FINRA_DAILY' and status==204 and not body

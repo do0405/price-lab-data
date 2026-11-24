@@ -67,6 +67,19 @@ def test_monthly_unchanged_citi_cover_still_rechecks_old_attachment(monkeypatch)
     assert child in out['state']['pending'] and out['records']==[]
 
 
+def test_citi_attachment_backlog_is_not_left_behind_all_cover_notices(monkeypatch):
+    state=p.initial_state('2026-11-23')
+    state['pending']=[s.task('CITI_NOTICE',str(n)) for n in range(1,8)]+[s.task('CITI_ATTACHMENT',str(n)) for n in range(10,15)]+[s.task('FRED_INDEX','SP500')]
+    calls=[]
+    monkeypatch.setattr(p,'plan',lambda state,*args:state);monkeypatch.setattr(s,'discovered',lambda *args:[])
+    def fetch(t):
+        calls.append(t['kind'])
+        body=b'observation_date,SP500\n2026-11-20,100\n' if t['kind']=='FRED_INDEX' else b'%PDF-fixture'
+        return 200,{},body+str(len(calls)).encode() if t['kind']!='FRED_INDEX' else body
+    p.collect(state,bootstrap(),now=NOW,max_requests=5,fetch=fetch,sleep=lambda _:None)
+    assert calls==['CITI_NOTICE','CITI_ATTACHMENT','CITI_ATTACHMENT','CITI_ATTACHMENT','FRED_INDEX']
+
+
 def bootstrap():
     return dict(through='2026-11-23',kr_sessions=['2010-01-04','2026-11-23'],us_month_ends=['2010-01-29','2026-10-30'],ciks=['0000320193'])
 
