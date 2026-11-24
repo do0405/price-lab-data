@@ -197,6 +197,13 @@ def plan(state, bootstrap, now):
     today=now.date().isoformat(); through=min(bootstrap['through'],(now-timedelta(days=1)).date().isoformat())
     state['through']=max(state['through'],through)
     pending={s.digest(t):t for t in state['pending']}
+    if state['cursors'].get('jpm_catalog_contract',0)<1:
+        for kind in ('JPM_UNIVERSE','JPM_ACTIONS'):
+            t=s.task(kind);key=s.digest(t);metadata=state['checked'].get(key,{})
+            if metadata.get('status')=='RESPONSE_CONTRACT':
+                metadata.update(status='RECHECK_AFTER_JPM_CASE_AND_DUPLICATE_FIX',retry_at=now.isoformat())
+                pending.setdefault(key,t)
+        state['cursors']['jpm_catalog_contract']=1
     if state['cursors'].get('lseg_weight_encoding_contract',0)<1:
         catalog=s.task('LSEG_WEIGHT_CATALOG');key=s.digest(catalog);metadata=state['checked'].get(key,{})
         if metadata.get('status')=='RESPONSE_CONTRACT':
@@ -204,7 +211,7 @@ def plan(state, bootstrap, now):
             pending.setdefault(key,catalog)
         state['cursors']['lseg_weight_encoding_contract']=1
     # Introduce new fixed public sources inside an already-running window too.
-    seeds=[s.task('CITI_CATALOG'),s.task('LSEG_WEIGHT_CATALOG'),s.task('RUSSELL_IPO_PAGE')]
+    seeds=[s.task('JPM_UNIVERSE'),s.task('JPM_ACTIONS'),s.task('CITI_CATALOG'),s.task('LSEG_WEIGHT_CATALOG'),s.task('RUSSELL_IPO_PAGE')]
     seeds += [s.task('LSEG_WEIGHTS',code) for code in ('US1000','US2000','US3000')]
     seeds += [s.task('CITI_NOTICE',code) for code in ('513','2621','1720')]
     seeds += [s.task('BNY_NOTICE','AD2000235')]
@@ -286,6 +293,7 @@ def plan(state, bootstrap, now):
         current += [s.task('NASDAQ_FACTSHEET','NDX')]
         current += [s.task('NASDAQ_WEIGHTS','NDX')]
         current += [s.task('CITI_CATALOG'),s.task('LSEG_WEIGHT_CATALOG'),s.task('RUSSELL_IPO_PAGE')]
+        current += [s.task('JPM_UNIVERSE'),s.task('JPM_ACTIONS')]
         current += [s.task('LSEG_WEIGHTS',code) for code in s.LSEG_WEIGHT_INDICES]
         current += [s.task('FINRA_DAILY',day=(date.fromisoformat(through)-timedelta(days=n)).isoformat())
                     for n in range(5) if (date.fromisoformat(through)-timedelta(days=n)).isoformat()>='2018-12-18']
@@ -298,7 +306,7 @@ def plan(state, bootstrap, now):
         due={}
         for t in current:
             key=s.digest(t); stamp=state['checked'].get(key,{}).get('checked_at')
-            interval=timedelta(days=1) if t['kind']=='CITI_CATALOG' else timedelta(days=7) if t['kind'] in ('LSEG_WEIGHTS','RUSSELL_IPO_PAGE') else timedelta(hours=6)
+            interval=timedelta(days=1) if t['kind'] in ('CITI_CATALOG','JPM_UNIVERSE','JPM_ACTIONS') else timedelta(days=7) if t['kind'] in ('LSEG_WEIGHTS','RUSSELL_IPO_PAGE') else timedelta(hours=6)
             if stamp is None or datetime.fromisoformat(stamp)<=now-interval: due[key]=t
         pending={**due,**pending}
         state['cursors']['daily']=today
@@ -361,8 +369,11 @@ class Fetcher:
         except requests.RequestException: return 0,{},b''
 
 
-def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sleep,deadline=None):
+def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sleep,deadline=None,source_kinds=None):
     if type(max_requests) is not int or not 1<=max_requests<=100: raise ValueError('Bounded market requests required')
+    if source_kinds is not None and (not isinstance(source_kinds,(list,tuple)) or not 1<=len(source_kinds)<=50
+            or any(not isinstance(kind,str) or not re.fullmatch(r'[A-Z_]{1,50}',kind) for kind in source_kinds)):
+        raise ValueError('Bounded source kind selection required')
     fixed=now; now=now or datetime.now(timezone.utc); state=copy.deepcopy(s.validate_state(state)); records=[]; sent=0; unchanged=0
     # Legacy 404 endpoint failures are task-scoped. Keep authentication denials
     # intact; an absent catalog URL does not deny all notices on that host.
@@ -375,6 +386,7 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
         if deadline is not None and time.monotonic()>=deadline-40: break
         plan(state,bootstrap,now)
         ready=[t for t in state['pending'] if state['cooldowns'].get(urlsplit(t['url']).hostname,{}).get('retry_at','')<=now.isoformat() and state['checked'].get(s.digest(t),{}).get('retry_at','')<=now.isoformat()]
+        if source_kinds is not None:ready=[t for t in ready if t['kind'] in source_kinds]
         if not ready: break
         t=ready[0]
         # Large ADR catalogs must not starve prices, shares or index backfill.
@@ -383,6 +395,10 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
         elif t['kind'] in ('CITI_NOTICE','CITI_ATTACHMENT'):
             preferred='CITI_NOTICE' if sent%5==0 else 'CITI_ATTACHMENT'
             t=next((candidate for candidate in ready if candidate['kind']==preferred),t)
+        # A short, bounded JPM catalog chain shares half of the other-source
+        # lane; a large directory cannot starve all other reference categories.
+        if sent%10==4:
+            t=next((candidate for candidate in ready if candidate['kind'] in ('JPM_UNIVERSE','JPM_ACTIONS')),t)
         key=s.digest(t); host=urlsplit(t['url']).hostname
         status,headers,body=fetch(t); sent+=1; state['requests'][host]=state['requests'].get(host,0)+1
         empty_finra=t['kind']=='FINRA_DAILY' and status==204 and not body
@@ -429,6 +445,8 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
                 if t['kind'] in ('CITI_CATALOG','RUSSELL_IPO_PAGE'):
                     interval=timedelta(days=30 if t['kind']=='CITI_CATALOG' else 7)
                     refresh=stamp is not None and datetime.fromisoformat(stamp)<=now-interval
+                if t['kind'] in ('JPM_UNIVERSE','JPM_ACTIONS'):
+                    refresh=stamp is not None and datetime.fromisoformat(stamp)<=now-timedelta(days=1)
                 if t['kind']=='CITI_NOTICE':
                     # A stable cover PDF can link to an in-place corrected
                     # attachment. Recheck that child on the monthly cycle too.
@@ -441,7 +459,7 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
     return dict(state=state,records=records,requests=sent,unchanged=unchanged)
 
 
-def run(bootstrap, directory, *, seconds=600,max_requests=50,max_batches=10,role='cloud',key=None,credentials=None):
+def run(bootstrap, directory, *, seconds=600,max_requests=50,max_batches=10,role='cloud',key=None,credentials=None,source_kinds=None):
     key=key or os.environ.get('PRICE_DATA_KEY'); directory=Path(directory); directory.mkdir(parents=True,exist_ok=True)
     owner=ResearchOwner(role,key=key,namespace=NAMESPACE)
     control=read_control(key=key,namespace=NAMESPACE)
@@ -453,7 +471,7 @@ def run(bootstrap, directory, *, seconds=600,max_requests=50,max_batches=10,role
         for _ in range(max_batches):
             if time.monotonic()>=end-40: break
             owner.guard(force=True)
-            result=collect(state,bootstrap,max_requests=max_requests,fetch=Fetcher(credentials=credentials,guard=owner.guard),deadline=end)
+            result=collect(state,bootstrap,max_requests=max_requests,fetch=Fetcher(credentials=credentials,guard=owner.guard),deadline=end,source_kinds=source_kinds)
             if not result['requests']: break
             payload=dict(schema='research-delta-v1',stream_id=s.STREAM,sequence=prior['sequence']+1 if prior else 1,
                          previous_package_sha256=package_digest(prior) if prior else None,bootstrap_anchor_sha256=s.ANCHOR,

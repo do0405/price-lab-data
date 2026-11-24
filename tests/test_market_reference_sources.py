@@ -13,6 +13,34 @@ def fund_body(day=20261120):
     return json.dumps({'productId':239726,'currencyCode':'USD','componentsByNameMap':{'holdings':{'containersByNameMap':{'all':{'dataPointsByNameMap':points}}}}}).encode()
 
 
+def jpm_body(items,*,offset=0,total=None):
+    total=len(items)+offset if total is None else total
+    return json.dumps({'data':{'items':items,'pagination':{'currentItemCount':len(items),
+        'hasMore':offset+len(items)<total,'limit':1000,'offset':offset,'totalItems':total}}}).encode()
+
+
+def test_jpm_public_catalog_pagination_is_exact_and_bounded():
+    t=s.task('JPM_UNIVERSE');row={'cusip':'471115402','ticker':'JMHLY','name':'Example','globalMarketCap':123.5}
+    body=jpm_body([{**row,'cusip':str(100000000+n)} for n in range(1000)],total=1001)
+    s.validate_response(t,body)
+    assert s.discovered(t,body)==[s.task('JPM_UNIVERSE',page=1)]
+    s.validate_response(s.task('JPM_UNIVERSE',page=1),jpm_body([row],offset=1000,total=1001))
+    assert not s.discovered(s.task('JPM_UNIVERSE',page=1),jpm_body([row],offset=1000,total=1001))
+    for bad in [jpm_body([row],offset=1000),jpm_body([{**row,'globalMarketCap':-1}]),jpm_body([{**row,'cusip':'invalid'}])]:
+        with pytest.raises(ValueError):s.validate_response(t,bad)
+    lower={**row,'cusip':'471115a02'};s.validate_response(t,jpm_body([lower]))
+    assert s.jpm_page(t,jpm_body([row,row]))[0]==[row]
+    with pytest.raises(ValueError):s.task('JPM_UNIVERSE','https://evil.example')
+
+
+def test_jpm_action_contract_retains_reported_date_and_document_revision():
+    row={'cusip':'471115402','action':'Ratio Change','eventDate':'2024-10-01T00:00:00.000Z',
+        'announcementDate':'2024-09-10T00:00:00.000Z','notices':{'pdf':'a'*32},'sequenceNo':3}
+    t=s.task('JPM_ACTIONS');s.validate_response(t,jpm_body([row]))
+    with pytest.raises(ValueError):s.validate_response(t,jpm_body([{**row,'eventDate':'bad'}]))
+    with pytest.raises(ValueError):s.validate_response(t,jpm_body([{**row,'notices':{'pdf':'https://evil.example'}}]))
+
+
 def payload():
     from price_lab.market_reference_pipeline import initial_state
     body=fund_body(); t=s.task('FUND','IVV','2026-11-20')

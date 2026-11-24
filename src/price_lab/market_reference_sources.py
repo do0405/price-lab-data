@@ -33,6 +33,7 @@ RUSSELL_ARCHIVE_REPORTS=(
     'https://www.lseg.com/content/dam/ftse-russell/en_us/documents/other/ru3000-deletions-preliminary-20240524.pdf')
 CITI_CATALOG='https://depositaryreceipts.citi.com/adr/notices/pgm_dispCA.aspx?pageId=16&subpageID=112'
 CITI_PDF='https://depositaryreceipts.citi.com/adr/notices/previewPdf.aspx'
+JPM_PUBLIC='https://adr.api.wsod.com/jpmadr-public/v1/'
 
 
 def canonical(value):
@@ -99,6 +100,10 @@ def task(kind, entity='', day='', page=0):
         if entity not in ('1000','2000','3000') or day or page not in (0,1,2,4):raise ValueError('Supported Russell IPO index/quarter required')
         quarter=page or 3  # Keep the original signed Q3 task identity.
         url=f'https://www.lseg.com/content/dam/ftse-russell/en_us/documents/other/final-ipo-additions-{quarter}-qtr-r{entity}.pdf'
+    elif kind in ('JPM_UNIVERSE','JPM_ACTIONS'):
+        if entity or day or page>199:raise ValueError('Bounded public JPM catalog required')
+        url=JPM_PUBLIC+('drUniverse' if kind=='JPM_UNIVERSE' else 'corporateActions')
+        params=dict(limit=1000,offset=page*1000)
     elif kind=='CITI_CATALOG':
         if entity or day or page:raise ValueError('Fixed depositary catalog required')
         url=CITI_CATALOG
@@ -286,11 +291,54 @@ def citi_attachment_tasks(reader):
     return list({digest(t):t for t in result}.values())
 
 
+def jpm_page(request,body):
+    """Public page contract; midnight dates and global cap do not certify PIT/units."""
+    value=json.loads(body)
+    if not isinstance(value,dict) or not isinstance(value.get('data'),dict):raise ValueError('JPM data object required')
+    data=value['data'];rows=data.get('items');p=data.get('pagination',{})
+    if not isinstance(p,dict):raise ValueError('JPM pagination object required')
+    if not isinstance(rows,list) or len(rows)>1000:raise ValueError('Bounded JPM rows required')
+    if (type(p.get('offset')) is not int or p['offset']!=request['page']*1000 or p.get('limit')!=1000
+            or type(p.get('currentItemCount')) is not int or p['currentItemCount']!=len(rows)
+            or type(p.get('totalItems')) is not int or not 0<=p['totalItems']<=200000
+            or p['offset']+len(rows)>p['totalItems'] or type(p.get('hasMore')) is not bool
+            or p['hasMore']!=(p['offset']+len(rows)<p['totalItems']) or p['hasMore'] and len(rows)!=1000):
+        raise ValueError('JPM pagination mismatch')
+    seen=set();unique=[]
+    for row in rows:
+        if not isinstance(row,dict) or not re.fullmatch(r'[A-Za-z0-9@#*]{9}',str(row.get('cusip',''))):
+            raise ValueError('Reported JPM CUSIP required')
+        identity=digest(row)
+        # The official response can repeat the exact same action row. Keep
+        # its original response bytes, normalize that identical value once.
+        if identity in seen:continue
+        seen.add(identity);unique.append(row)
+        if request['kind']=='JPM_UNIVERSE':
+            if not isinstance(row.get('name'),str) or not row['name'].strip():raise ValueError('JPM program name required')
+            for key in ('globalMarketCap','price'):
+                value=row.get(key)
+                if value is not None and (type(value) not in (int,float) or not math.isfinite(value) or value<0):
+                    raise ValueError('Invalid reported JPM value')
+        else:
+            if not isinstance(row.get('action'),str) or not row['action']:raise ValueError('JPM action required')
+            for key in ('eventDate','announcementDate'):
+                value=row.get(key)
+                if value not in (None,''):
+                    try:datetime.fromisoformat(value.replace('Z','+00:00'))
+                    except (ValueError,TypeError,AttributeError):raise ValueError('Invalid JPM reported date') from None
+            notices=row.get('notices') or {}
+            if not isinstance(notices,dict):raise ValueError('JPM document metadata required')
+            for key in ('pdf','xbrl'):
+                if notices.get(key) and not re.fullmatch(r'[a-f0-9]{32}',notices[key]):raise ValueError('Exact JPM document ID required')
+    return unique,p
+
+
 def validate_response(request, body):
     validate_task(request)
     if not isinstance(body,bytes) or not 0<len(body)<=MAX_BODY: raise ValueError('Reference body bound')
     kind=request['kind']
-    if kind=='FINRA_DAILY':
+    if kind in ('JPM_UNIVERSE','JPM_ACTIONS'):jpm_page(request,body)
+    elif kind=='FINRA_DAILY':
         rows=json.loads(body)
         if not isinstance(rows,list) or len(rows)>1000:raise ValueError('Bounded FINRA rows required')
         ids=set()
@@ -347,7 +395,10 @@ def validate_response(request, body):
 def discovered(request, body):
     """Discover only official, narrowly scoped follow-ups; no arbitrary URL fetch."""
     kind=request['kind']; result=[]
-    if kind=='CITI_NOTICE':
+    if kind in ('JPM_UNIVERSE','JPM_ACTIONS'):
+        _,page=jpm_page(request,body)
+        if page['hasMore']:result=[task(kind,page=request['page']+1)]
+    elif kind=='CITI_NOTICE':
         from pypdf import PdfReader
         from pypdf.errors import PdfReadError
         try:

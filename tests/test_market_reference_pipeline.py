@@ -7,9 +7,22 @@ import subprocess
 import sys
 import pytest
 from price_lab import market_reference_sources as s,market_reference_pipeline as p
-from test_market_reference_sources import fund_body,payload
+from test_market_reference_sources import fund_body,payload,jpm_body
 
 NOW=datetime(2026,11,24,tzinfo=timezone.utc)
+
+
+def test_targeted_reference_collection_preserves_other_pending_sources():
+    from unittest.mock import patch
+    state=p.initial_state('2026-11-23');other=s.task('CITI_NOTICE','513');target=s.task('JPM_UNIVERSE')
+    state['pending']=[other,target];calls=[]
+    def fetch(t):
+        calls.append(t['kind']);return 200,{},jpm_body([{'cusip':'471115402','name':'Example'}])
+    with patch.object(p,'plan',lambda state,*args:state):
+        result=p.collect(state,bootstrap(),now=NOW,max_requests=5,fetch=fetch,sleep=lambda _:None,
+            source_kinds=['JPM_UNIVERSE'])
+    assert calls==['JPM_UNIVERSE']
+    assert result['state']['pending']==[other] and result['requests']==1
 
 
 def test_extended_sources_join_existing_window_without_replaying_completed_documents():
