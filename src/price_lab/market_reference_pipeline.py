@@ -140,6 +140,15 @@ def plan(state, bootstrap, now):
     today=now.date().isoformat(); through=min(bootstrap['through'],(now-timedelta(days=1)).date().isoformat())
     state['through']=max(state['through'],through)
     pending={s.digest(t):t for t in state['pending']}
+    # Fill the recent dated research window before the long historical queue.
+    # The same stable task keys are reused by chronological backfill, so a
+    # completed snapshot is neither downloaded nor stored twice.
+    recent={}
+    for day in reversed(bootstrap['us_month_ends'][-3:]):
+        for fund in s.FUNDS:
+            t=s.task('FUND',fund,day); key=s.digest(t)
+            if key not in state['checked'] and key not in pending:recent[key]=t
+    pending={**recent,**pending}
     # Immutable, observed official reports get one acquisition. A different
     # public host does not clear or bypass an IR host's denial/cooldown.
     for url in s.NASDAQ_REPORTS:

@@ -117,3 +117,15 @@ def test_immutable_nasdaq_report_is_discovered_once_without_resetting_denied_hos
     p.plan(state,bootstrap(),NOW)
     assert not any(t['kind']=='NASDAQ_PDF' for t in state['pending'])
     assert state['cooldowns']['ir.nasdaq.com']['reason']=='HTTP_403'
+
+
+def test_recent_research_months_are_backfilled_without_replaying_checked_snapshots():
+    state=p.initial_state('2026-11-23');b=bootstrap()
+    b['us_month_ends']=['2010-01-29','2026-08-31','2026-09-30','2026-10-30']
+    p.plan(state,b,NOW)
+    expected=s.task('FUND','IVV','2026-09-30')
+    assert expected in state['pending']
+    state['checked'][s.digest(expected)]=dict(status='COLLECTED',checked_at=NOW.isoformat())
+    state['pending']=[t for t in state['pending'] if t!=expected]
+    p.plan(state,b,NOW)
+    assert expected not in state['pending']
