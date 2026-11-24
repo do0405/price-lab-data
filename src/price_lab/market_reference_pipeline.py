@@ -24,6 +24,42 @@ NAMESPACE='market-references'
 ASSET='market-reference.pldelta'
 
 
+def _config_targets(config):
+    version=config.get('version')
+    expected={'version','ciks'}|({'research_targets'} if version==2 else set())
+    if type(version) is not int or version not in (1,2) or set(config)!=expected:
+        raise ValueError('Market bootstrap contract mismatch')
+    targets=config.get('research_targets',[])
+    if not isinstance(targets,list) or len(targets)>200:raise ValueError('Bounded research snapshot targets required')
+    seen=set()
+    for row in targets:
+        if (not isinstance(row,dict) or set(row)!={'fund','snapshot_date'} or
+                not isinstance(row['fund'],str) or row['fund'] not in s.FUNDS or
+                not isinstance(row['snapshot_date'],str)):
+            raise ValueError('Public fund/date target required')
+        if date.fromisoformat(row['snapshot_date']).isoformat()!=row['snapshot_date']:
+            raise ValueError('Canonical target date required')
+        key=(row['fund'],row['snapshot_date'])
+        if key in seen:raise ValueError('Duplicate research target')
+        seen.add(key)
+    return targets
+
+
+def enqueue_targets(config_path,targets):
+    """Caller holds its planning lock; preserve public issuer seeds and tasks."""
+    path=Path(config_path); config=json.loads(path.read_text(encoding='utf-8'))
+    old=_config_targets(config)
+    merged={(t['fund'],t['snapshot_date']):t for t in old}
+    for row in targets:
+        _config_targets(dict(version=2,ciks=config['ciks'],research_targets=[row]))
+        merged[(row['fund'],row['snapshot_date'])]=row
+    combined=sorted(merged.values(),key=lambda t:(t['snapshot_date'],t['fund']))
+    if combined==old:return dict(status='UNCHANGED',targets=len(old))
+    updated=dict(version=2,ciks=config['ciks'],research_targets=combined)
+    _config_targets(updated);_atomic(path,updated)
+    return dict(status='UPDATED',targets=len(combined))
+
+
 def bootstrap(config_path,now=None):
     import exchange_calendars as xcals
     import re
@@ -31,12 +67,14 @@ def bootstrap(config_path,now=None):
     now=now or datetime.now(timezone.utc)
     through=(now.astimezone(ZoneInfo('Asia/Seoul')).date()-timedelta(days=1)).isoformat()
     config=json.loads(Path(config_path).read_text(encoding='utf-8'))
-    if set(config)!={'version','ciks'} or config['version']!=1: raise ValueError('Market bootstrap contract mismatch')
+    targets=_config_targets(config)
+    if any(t['snapshot_date']>through for t in targets):raise ValueError('Future research snapshot target')
     if not isinstance(config['ciks'],list) or len(config['ciks'])>50000 or any(not isinstance(c,str) or not re.fullmatch('[0-9]{10}',c) for c in config['ciks']): raise ValueError('Official CIK seed required')
     kr=[str(x.date()) for x in xcals.get_calendar('XKRX',start='2010-01-01',end=through).sessions]
     us=[str(x.date()) for x in xcals.get_calendar('XNYS',start='2010-01-01',end=through).sessions]
     months={d[:7]:d for d in us if d[:7]<through[:7]}
-    return dict(through=through,kr_sessions=kr,us_month_ends=list(months.values()),ciks=list(dict.fromkeys(config['ciks'])))
+    return dict(through=through,kr_sessions=kr,us_month_ends=list(months.values()),
+                ciks=list(dict.fromkeys(config['ciks'])),research_targets=targets)
 
 
 def _atomic(path, value):
@@ -140,6 +178,14 @@ def plan(state, bootstrap, now):
     today=now.date().isoformat(); through=min(bootstrap['through'],(now-timedelta(days=1)).date().isoformat())
     state['through']=max(state['through'],through)
     pending={s.digest(t):t for t in state['pending']}
+    factsheet=s.task('NASDAQ_FACTSHEET','NDX');factsheet_key=s.digest(factsheet)
+    if factsheet_key not in state['checked'] and factsheet_key not in pending:
+        pending={factsheet_key:factsheet,**pending}
+    requested={}
+    for target in bootstrap.get('research_targets',[]):
+        t=s.task('FUND',target['fund'],target['snapshot_date']);key=s.digest(t)
+        if key not in state['checked'] and key not in pending:requested[key]=t
+    pending={**requested,**pending}
     # Fill the recent dated research window before the long historical queue.
     # The same stable task keys are reused by chronological backfill, so a
     # completed snapshot is neither downloaded nor stored twice.
@@ -154,7 +200,7 @@ def plan(state, bootstrap, now):
     for url in s.NASDAQ_REPORTS:
         report=s.task('NASDAQ_PDF',url); key=s.digest(report)
         if key not in state['checked'] and key not in pending:pending={key:report,**pending}
-    refresh_kinds={'FUND_LATEST','KIND_INDUSTRY','RUSSELL_PAGE','FRED_INDEX','CBOE_INDEX','SEC_MAP'}
+    refresh_kinds={'FUND_LATEST','KIND_INDUSTRY','RUSSELL_PAGE','FRED_INDEX','CBOE_INDEX','SEC_MAP','NASDAQ_FACTSHEET'}
     for key,old in list(pending.items()):
         if old['kind'] in refresh_kinds and old['requested_date']:
             pending.pop(key)
@@ -185,6 +231,7 @@ def plan(state, bootstrap, now):
         current += [s.task('KIND_INDUSTRY'),s.task('RUSSELL_PAGE'),s.task('SEC_MAP')]
         current += [s.task('FRED_INDEX',index) for index in ('SP500','NASDAQ100','NASDAQCOM')]
         current += [s.task('CBOE_INDEX',index) for index in ('VIX','VVIX')]
+        current += [s.task('NASDAQ_FACTSHEET','NDX')]
         current += [s.task('LSEG_CATALOG',str(now.year)),s.task('SP_ARCHIVE',str(now.year))]
         current += [s.task('NASDAQ_NOTICE','https://ir.nasdaq.com/news-releases/news-release-details/annual-changes-nasdaq-100-indexr'+suffix) for suffix in ('-2','','-1','-3','-4','-5')]
         last=bootstrap['kr_sessions'][-1]

@@ -129,3 +129,38 @@ def test_recent_research_months_are_backfilled_without_replaying_checked_snapsho
     state['pending']=[t for t in state['pending'] if t!=expected]
     p.plan(state,b,NOW)
     assert expected not in state['pending']
+
+
+def test_targeted_snapshot_config_is_backward_compatible_and_idempotent(tmp_path):
+    path=tmp_path/'seed.json';path.write_text(json.dumps({'version':1,'ciks':['0000320193']}))
+    target=dict(fund='IWB',snapshot_date='2026-10-21')
+    assert p.enqueue_targets(path,[target])['status']=='UPDATED'
+    raw=path.read_bytes()
+    assert p.enqueue_targets(path,[target])['status']=='UNCHANGED' and path.read_bytes()==raw
+    b=p.bootstrap(path,now=NOW)
+    assert b['research_targets']==[target] and b['ciks']==['0000320193']
+    state=p.initial_state(b['through']);p.plan(state,b,NOW)
+    task=s.task('FUND','IWB','2026-10-21')
+    assert task in state['pending']
+    state['checked'][s.digest(task)]=dict(status='COLLECTED',checked_at=NOW.isoformat())
+    state['pending']=[t for t in state['pending'] if t!=task];p.plan(state,b,NOW)
+    assert task not in state['pending']
+
+
+@pytest.mark.parametrize('target',[
+    dict(fund='EVIL',snapshot_date='2026-10-21'),
+    dict(fund='IWB',snapshot_date='2999-01-01'),
+    dict(fund='IWB',snapshot_date='invalid'),
+    dict(fund='IWB',snapshot_date='2026-10-21',url='https://example.com'),
+])
+def test_targeted_snapshot_config_rejects_unbounded_or_nonpublic_inputs(tmp_path,target):
+    path=tmp_path/'seed.json';path.write_text(json.dumps({'version':2,'ciks':[], 'research_targets':[target]}))
+    with pytest.raises(ValueError):p.bootstrap(path,now=NOW)
+
+
+def test_new_factsheet_is_found_even_inside_an_existing_refresh_window():
+    state=p.initial_state('2026-11-23');p.plan(state,bootstrap(),NOW)
+    task=s.task('NASDAQ_FACTSHEET','NDX')
+    state['pending']=[t for t in state['pending'] if t!=task]
+    p.plan(state,bootstrap(),NOW)
+    assert task in state['pending']

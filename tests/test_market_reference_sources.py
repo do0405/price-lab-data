@@ -92,3 +92,10 @@ def test_nasdaq_research_pdf_has_an_exact_official_scope():
     assert task['url']==url and s.validate_response(task,b'%PDF-1.7\nfixture')
     for invalid in (url.replace('indexes.nasdaqomx.com','example.com'),url+'?token=secret',url.replace('/docs/','/private/')):
         with pytest.raises(ValueError):s.task('NASDAQ_PDF',invalid)
+
+
+def test_nasdaq_factsheet_endpoint_is_fixed_and_current_not_an_arbitrary_pdf():
+    t=s.task('NASDAQ_FACTSHEET','NDX')
+    assert t['url']=='https://indexes.nasdaq.com/docs/FS_NDX.pdf'
+    assert s.validate_response(t,b'%PDF-1.7\nfixture')
+    with pytest.raises(ValueError):s.task('NASDAQ_FACTSHEET','https://example.com/a.pdf')
