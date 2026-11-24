@@ -95,6 +95,9 @@ def task(kind, entity='', day='', page=0):
     elif kind == 'NASDAQ_FACTSHEET':
         if entity!='NDX':raise ValueError('Official Nasdaq factsheet required')
         url='https://indexes.nasdaq.com/docs/FS_NDX.pdf'
+    elif kind == 'NASDAQ_WEIGHTS':
+        if entity!='NDX':raise ValueError('Official Nasdaq weight document required')
+        url='https://www.nasdaq.com/docs/global-indexes/NDX'
     elif kind == 'SP_CATALOG':
         if not re.fullmatch(r'20\d{2}', entity): raise ValueError('Catalog year required')
         url = 'https://press.spglobal.com/news-releases'; params = dict(year=entity, l=100, o=page * 100)
@@ -193,7 +196,7 @@ def validate_response(request, body):
         count=value.get('TotalCount')
         if ('ErrorCode' in value or not isinstance(value.get('Data'),list) or type(count) not in (int,float)
                 or not math.isfinite(count) or not 0<=count<=1000000 or int(count)!=count): raise ValueError('LSEG catalog mismatch')
-    elif kind in ('RUSSELL_PDF','NASDAQ_PDF','NASDAQ_FACTSHEET'):
+    elif kind in ('RUSSELL_PDF','NASDAQ_PDF','NASDAQ_FACTSHEET','NASDAQ_WEIGHTS'):
         if not body.startswith(b'%PDF-'): raise ValueError('Official PDF required')
     else:
         p=html(body)

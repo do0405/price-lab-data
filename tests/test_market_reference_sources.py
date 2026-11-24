@@ -99,3 +99,10 @@ def test_nasdaq_factsheet_endpoint_is_fixed_and_current_not_an_arbitrary_pdf():
     assert t['url']=='https://indexes.nasdaq.com/docs/FS_NDX.pdf'
     assert s.validate_response(t,b'%PDF-1.7\nfixture')
     with pytest.raises(ValueError):s.task('NASDAQ_FACTSHEET','https://example.com/a.pdf')
+
+
+def test_official_weight_document_uses_the_fixed_public_pdf_endpoint():
+    task=s.task('NASDAQ_WEIGHTS','NDX')
+    assert task['url']=='https://www.nasdaq.com/docs/global-indexes/NDX'
+    assert s.validate_response(task,b'%PDF-1.7\nfixture')
+    with pytest.raises(ValueError):s.task('NASDAQ_WEIGHTS','SP500')
