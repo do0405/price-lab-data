@@ -273,3 +273,50 @@ def test_signed_journal_cannot_regress_below_authenticated_packet_floor(monkeypa
             'used':{'krx':200,'kis':0,'kind':0},'revision':3,'allow_initialize':False},
             now=datetime(2026,10,15,16,tzinfo=timezone.utc),key=b'x'*32)
 
+def test_prepared_suffix_reuses_authenticated_prefix_after_network_failure(tmp_path,monkeypatch):
+    import hashlib,json,requests
+    from pathlib import Path
+    from test_research_delta_codec import payload
+    from test_research_delta_transport import release
+    from price_lab import research_delta_codec as codec
+    packets=[];releases=[];key=b'x'*32;previous=None
+    for n in (1,2):
+        value=payload();value.update(sequence=n,previous_package_sha256=previous)
+        previous=codec.package_digest(value);p=tmp_path/f'packet-{n}'
+        codec.seal_package(value,p,key);raw=p.read_bytes();p.unlink();packets.append(raw)
+        row=release(n,previous,value['previous_package_sha256']);meta=json.loads(row['body'])
+        meta['ciphertext_sha256']=hashlib.sha256(raw).hexdigest();row['body']=json.dumps(meta);row['assets'][0]['size']=len(raw);releases.append(row)
+    fetched=[];fail=True
+    def download(row,directory,**kwargs):
+        n=transport.package_metadata(row)['sequence'];fetched.append(n)
+        if n==2 and fail:raise requests.ConnectionError('transient')
+        p=Path(directory)/transport.ASSET;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(packets[n-1]);return p
+    monkeypatch.setattr(transport,'download_package',download)
+    with pytest.raises(requests.ConnectionError):transport.prepare_packages(releases,tmp_path/'cache',key=key)
+    fail=False
+    prepared=transport.prepare_packages(releases,tmp_path/'cache',key=key)
+    assert fetched.count(1)==1 and fetched.count(2)==2
+    monkeypatch.setattr(transport,'download_package',lambda *a,**k:pytest.fail('Network inside DB apply'))
+    assert [p['sequence'] for p in transport.read_prepared_packages(prepared,key=key)]==[1,2]
+    transport.remove_prepared_packages(prepared)
+    assert not list((tmp_path/'cache').rglob('*.pldelta'))
+
+
+def test_corrupted_prepared_file_is_not_silently_replaced_or_deleted(tmp_path,monkeypatch):
+    import hashlib,json
+    from pathlib import Path
+    from test_research_delta_codec import payload
+    from test_research_delta_transport import release
+    from price_lab import research_delta_codec as codec
+    value=payload();raw_path=tmp_path/'source';codec.seal_package(value,raw_path,b'x'*32);raw=raw_path.read_bytes();raw_path.unlink()
+    row=release(1,codec.package_digest(value));meta=json.loads(row['body']);meta['ciphertext_sha256']=hashlib.sha256(raw).hexdigest();row['body']=json.dumps(meta);row['assets'][0]['size']=len(raw)
+    def download(row,folder,**kwargs):
+        p=Path(folder)/transport.ASSET;p.write_bytes(raw);return p
+    monkeypatch.setattr(transport,'download_package',download)
+    prepared=transport.prepare_packages([row],tmp_path/'cache',key=b'x'*32)
+    path=prepared[0][1];path.write_bytes(b'corrupt')
+    monkeypatch.setattr(transport,'download_package',lambda *a,**k:pytest.fail('Corruption must fail closed'))
+    with pytest.raises(ValueError):transport.prepare_packages([row],tmp_path/'cache',key=b'x'*32)
+    with pytest.raises(ValueError):list(transport.read_prepared_packages(prepared,key=b'x'*32))
+    with pytest.raises(ValueError):transport.remove_prepared_packages(prepared)
+    assert path.read_bytes()==b'corrupt'

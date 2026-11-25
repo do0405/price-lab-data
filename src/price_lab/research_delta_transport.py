@@ -364,6 +364,78 @@ def ordered_packages(releases,work_root,*,key=None,asset_api=False):
             for future in pending:future.cancel()
 
 
+def _prepared_ciphertext(path,release):
+    meta=package_metadata(release);path=Path(path)
+    if path.is_symlink() or path.is_junction() or not path.is_file():
+        raise ValueError('Unsafe or missing prepared research package')
+    if path.stat().st_size!=release['assets'][0]['size']:
+        raise ValueError('Prepared research package size mismatch')
+    digest=hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda:stream.read(1024*1024),b''):digest.update(block)
+    if digest.hexdigest()!=meta['ciphertext_sha256']:
+        raise ValueError('Prepared research package ciphertext mismatch')
+    return meta
+
+
+def _read_prepared(path,release,key):
+    from .research_delta_codec import open_package,package_digest
+    meta=_prepared_ciphertext(path,release)
+    value=open_package(path,key=key or os.environ.get('PRICE_DATA_KEY'))
+    if (package_digest(value)!=meta['package_sha256'] or
+            any(value.get(k)!=meta.get(k) for k in ('sequence','stream_id','previous_package_sha256'))):
+        raise ValueError('Authenticated prepared research package mismatch')
+    return value
+
+
+def prepare_packages(releases,work_root,*,key=None,asset_api=False):
+    """Finish all network/authentication before taking the canonical writer.
+
+    Only authenticated ciphertext is retained by immutable content identity.
+    An interrupted suffix reuses its closed prefix; decoded objects are not
+    accumulated. The caller already bounds count/bytes and owns transport lock.
+    """
+    if not 1<=len(releases)<=1000:raise ValueError('Bounded prepared research suffix required')
+    root=Path(work_root)
+    if root.is_symlink() or root.is_junction():raise ValueError('Unsafe prepared research root')
+    root.mkdir(parents=True,exist_ok=True)
+    cache=root/'closed'
+    if cache.is_symlink() or cache.is_junction():raise ValueError('Unsafe prepared research folder')
+    cache.mkdir(exist_ok=True)
+    def prepare(release):
+        meta=package_metadata(release);target=cache/(meta['ciphertext_sha256']+'.pldelta')
+        if target.exists() or target.is_symlink():
+            _read_prepared(target,release,key)
+        else:
+            with tempfile.TemporaryDirectory(prefix='research-stage-',dir=root) as temporary:
+                path=download_package(release,temporary,asset_api=asset_api)
+                _read_prepared(path,release,key)
+                with path.open('r+b') as stream:stream.flush();os.fsync(stream.fileno())
+                os.replace(path,target)
+        return release,target
+    with ThreadPoolExecutor(max_workers=2,thread_name_prefix='research-stage') as pool:
+        return list(pool.map(prepare,releases))
+
+
+def read_prepared_packages(prepared,*,key=None):
+    """Bounded local decoding only; never downloads during a DB transaction."""
+    for release,path in prepared:yield _read_prepared(path,release,key)
+
+
+def remove_prepared_packages(prepared):
+    """Caller proved this selected suffix committed; keep altered/unknown files."""
+    for release,path in prepared:
+        meta=_prepared_ciphertext(path,release)
+        if path.name!=meta['ciphertext_sha256']+'.pldelta' or path.parent.name!='closed':
+            raise ValueError('Prepared package cleanup ownership mismatch')
+        if any(p.is_symlink() or p.is_junction() for p in (path.parent,path.parent.parent)):
+            raise ValueError('Unsafe prepared package cleanup')
+    removed=0
+    for path in dict.fromkeys(path for _,path in prepared):
+        removed+=path.stat().st_size;path.unlink()
+    return removed
+
+
 def _finalize_release(release, uploaded, body, *, token):
     path = '/releases/' + str(release['id'])
     tag = release['tag_name']
@@ -449,7 +521,7 @@ def publish_package(payload,*,key=None,token=None,work_root=None,expected_head=U
         'sequence':payload['sequence'],'package_sha256':digest,'ciphertext_bytes':uploaded['size']}
 
 
-def pull_latest(root,*,key=None,max_packages=1,max_bytes=None,token=None,progress=None):
+def pull_latest(root,*,key=None,max_packages=1,max_bytes=None,token=None,progress=None,before_apply=None):
     """Local only: bounded, contiguous research suffix; failures retain cursor."""
     import duckdb
     from .ingestion import managed_lock,current_reader
@@ -485,7 +557,11 @@ def pull_latest(root,*,key=None,max_packages=1,max_bytes=None,token=None,progres
             selected.append(release);size+=amount
         if selected:
             if progress:progress('DOWNLOADING')
-            with closing(ordered_packages(selected,root/'research-download',key=key,asset_api=True)) as payloads:
+            prepared=prepare_packages(selected,root/'research-download',key=key,asset_api=True)
+            if before_apply is not None:
+                if progress:progress('WAITING_PRICE_PUBLICATION')
+                before_apply()
+            with closing(read_prepared_packages(prepared,key=key)) as payloads:
                 first=next(payloads)
                 suffix=chain((first,),payloads)
                 del first
@@ -504,6 +580,9 @@ def pull_latest(root,*,key=None,max_packages=1,max_bytes=None,token=None,progres
                 if result.get('failure_type')=='PermissionError':
                     raise PermissionError('Research apply temporarily blocked; previous cursor retained')
                 raise ValueError('Research validation failed; previous cursor retained')
+            if result.get('applied_sequence',0)>=package_metadata(selected[-1])['sequence']:
+                try:remove_prepared_packages(prepared)
+                except (OSError,ValueError):result['warning_code']='RESEARCH_STAGED_CLEANUP_DEFERRED'
         else:result={'status':'UNCHANGED','applied_packages':[],'manifest':manifest}
         remaining_packages=len(releases)-len(selected)
         more=remaining_packages>0
