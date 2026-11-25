@@ -52,6 +52,21 @@ def _config_targets(config):
     return targets
 
 
+def enqueue_ciks(config_path,ciks):
+    """Append official issuer seeds without shifting the persisted scan cursor."""
+    path=Path(config_path);config=json.loads(path.read_text(encoding='utf-8'))
+    _config_targets(config)
+    old=config.get('ciks')
+    for values in (old,ciks):
+        if not isinstance(values,list) or any(not isinstance(c,str) or not re.fullmatch('[0-9]{10}',c) for c in values):
+            raise ValueError('Official CIK seed required')
+    merged=list(dict.fromkeys([*old,*ciks]))
+    if len(merged)>50000:raise ValueError('Bounded official CIK seed required')
+    if merged==old:return dict(status='UNCHANGED',issuers=len(old),added=0)
+    _atomic(path,{**config,'ciks':merged})
+    return dict(status='UPDATED',issuers=len(merged),added=len(merged)-len(old))
+
+
 def enqueue_targets(config_path,targets):
     """Caller holds its planning lock; preserve public issuer seeds and tasks."""
     path=Path(config_path); config=json.loads(path.read_text(encoding='utf-8'))

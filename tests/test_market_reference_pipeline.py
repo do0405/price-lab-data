@@ -60,6 +60,21 @@ def test_pinned_jpm_documents_recheck_monthly_not_on_every_daily_catalog(age,due
     assert (doc in out['state']['pending']) is due
 
 
+def test_historical_issuer_queue_preserves_scan_positions_and_other_config(tmp_path):
+    path=tmp_path/'bootstrap.json'
+    original=dict(version=4,ciks=['0000000009','0000000012'],research_targets=[],
+        depositary_attachment_ids=['123'],jpm_document_ids=['a'*32+':3'])
+    path.write_text(json.dumps(original))
+    result=p.enqueue_ciks(path,['0000000001','0000000009'])
+    updated=json.loads(path.read_text())
+    assert updated=={**original,'ciks':['0000000009','0000000012','0000000001']}
+    assert result==dict(status='UPDATED',issuers=3,added=1)
+    assert p.enqueue_ciks(path,['0000000001'])['status']=='UNCHANGED'
+    prior=path.read_bytes()
+    with pytest.raises(ValueError,match='Official CIK'):p.enqueue_ciks(path,['1'])
+    assert path.read_bytes()==prior
+
+
 def test_sec_identity_recovery_clears_only_hosts_with_valid_successful_canaries():
     from unittest.mock import patch
     state=p.initial_state('2026-11-23')
