@@ -25,6 +25,14 @@ class Session:
         return value
 
 
+def test_registered_txse_assets_are_collected_without_admitting_otc():
+    p=module();values=[dict(id='listed',symbol='OBK',name='Origin Bancorp',exchange='TXSE',status='active',tradable=True),
+        dict(id='otc',symbol='OTCX',name='OTC company',exchange='OTC',status='active',tradable=True)]
+    provider=p.AlpacaProvider('key','secret',client=p.HttpClient(Session([Response(values)]),min_interval=0))
+    frame=provider.fetch_assets('us')
+    assert frame.symbol.tolist()==['OBK'] and frame.iloc[0].provider_asset_id=='listed'
+
+
 def test_completed_sessions_use_exchange_close_and_crypto_utc():
     p=module()
     assert p.completed_sessions('us','2024-07-03','2024-07-05T16:59:00Z')==[pd.Timestamp('2024-07-03')]

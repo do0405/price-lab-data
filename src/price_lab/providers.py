@@ -210,7 +210,8 @@ class AlpacaProvider:
         if market in self._asset_cache:return self._asset_cache[market].copy()
         values=self.client.request_json('GET',self.trading_base+'/v2/assets',headers=self._headers(),params={'status':'active','asset_class':'us_equity' if market=='us' else 'crypto'})
         if not isinstance(values,list) or not values:raise ProviderError('Alpaca empty active asset response')
-        allowed={'NYSE','NASDAQ','AMEX','ARCA','NYSE_ARCA','BATS'}
+        from .price_contract import US_EQUITY_EXCHANGES
+        allowed=US_EQUITY_EXCHANGES
         observed=datetime.now(timezone.utc).isoformat()
         rows=[{'market':market,'symbol':r['symbol'],'name':r.get('name') or r['symbol'],'exchange':r.get('exchange') or 'CRYPTO',
                'provider_asset_id':r.get('id'),'provider_asset_class':r.get('class'),'active_at_collection':r.get('status')=='active',

@@ -2,6 +2,10 @@
 from datetime import datetime
 import math
 
+# Source coverage, not a strategy's exchange filter. TXSE is a registered NMS
+# venue and an official Alpaca AssetExchange value; OTC remains outside scope.
+US_EQUITY_EXCHANGES=frozenset({'NYSE','NASDAQ','AMEX','ARCA','NYSE_ARCA','BATS','TXSE'})
+
 BAR_METADATA={
     'trade_count':'BIGINT','feed':'VARCHAR','turnover_method':'VARCHAR',
     'vwap_method':'VARCHAR','retrieved_at':'TIMESTAMPTZ',
