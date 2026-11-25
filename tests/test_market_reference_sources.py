@@ -41,6 +41,11 @@ def test_jpm_action_contract_retains_reported_date_and_document_revision():
         s.validate_response(t,jpm_body([{**row,'action':action}]))
     with pytest.raises(ValueError):s.validate_response(t,jpm_body([{**row,'eventDate':'bad'}]))
     with pytest.raises(ValueError):s.validate_response(t,jpm_body([{**row,'notices':{'pdf':'https://evil.example'}}]))
+    found=s.discovered(t,jpm_body([row]))
+    assert found==[s.task('JPM_DOCUMENT','a'*32+':3')]
+    assert found[0]['params']=={'cmsId':'a'*32,'sequenceNo':3}
+    assert not s.discovered(t,jpm_body([{**row,'action':'Dividend'}]))
+    with pytest.raises(ValueError):s.task('JPM_DOCUMENT','https://evil.example')
 
 
 def payload():

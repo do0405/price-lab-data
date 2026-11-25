@@ -9,6 +9,11 @@ on:
         type: choice
         options: ['1200', '300', '600']
         default: '1200'
+      source_scope:
+        description: Collect all references or verify the configured SEC path
+        type: choice
+        options: ['all', 'sec']
+        default: 'all'
 permissions:
   contents: read
 concurrency:
@@ -40,4 +45,5 @@ jobs:
           PRICE_DATA_KEY: ${{ secrets.PRICE_DATA_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
           COLLECTION_SECONDS: ${{ inputs.seconds || '1200' }}
-        run: python scripts/market_reference_pipeline.py --seconds "$COLLECTION_SECONDS" --max-requests 50 --max-batches 100
+          REFERENCE_SOURCE_SCOPE: ${{ inputs.source_scope || 'all' }}
+        run: python scripts/market_reference_pipeline.py --seconds "$COLLECTION_SECONDS" --max-requests 50 --max-batches 100 --source-scope "$REFERENCE_SOURCE_SCOPE"

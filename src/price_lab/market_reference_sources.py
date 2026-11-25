@@ -34,6 +34,7 @@ RUSSELL_ARCHIVE_REPORTS=(
 CITI_CATALOG='https://depositaryreceipts.citi.com/adr/notices/pgm_dispCA.aspx?pageId=16&subpageID=112'
 CITI_PDF='https://depositaryreceipts.citi.com/adr/notices/previewPdf.aspx'
 JPM_PUBLIC='https://adr.api.wsod.com/jpmadr-public/v1/'
+JPM_ECONOMIC_ACTIONS={'Ratio Change','Termination','Merger/Exchange','Stock Split','Share Consolidation/Capital Repayment','Spin-off'}
 
 
 def canonical(value):
@@ -42,6 +43,34 @@ def canonical(value):
 
 def digest(value):
     return hashlib.sha256(canonical(value).encode()).hexdigest()
+
+
+def sec_request_identity(value):
+    """Validate an existing declared bot identity; never invent contact details."""
+    if not isinstance(value,str) or not value.isascii() or not 5<=len(value)<=512 or any(c in value for c in '\r\n\x00'):
+        return None
+    match=re.search(r'[^\s<>@]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})',value)
+    if not match or len(value[:match.start()].strip())<3:return None
+    domain=match[1].lower()
+    if domain in ('example.com','example.org','example.net') or domain.endswith(('.invalid','.test')):return None
+    return value.strip()
+
+
+def sec_failure_diagnostic(status,headers,body):
+    """One bounded fingerprint/classification, no raw HTML, contact or headers."""
+    headers={k.lower():str(v) for k,v in headers.items()};sample=body[:65536].decode('utf-8',errors='replace').lower()
+    signals=[]
+    if headers.get('x-mitmproxy-blocked-reason','').upper()=='ROBOTS_DENIED':signals.append('EGRESS_PROXY_ROBOTS_DENIED')
+    if 'undeclared automated tool' in sample:signals.append('UNDECLARED_AUTOMATION')
+    if 'request rate threshold exceeded' in sample:signals.append('REQUEST_RATE_THRESHOLD')
+    classification=signals[0] if signals else 'ACCESS_DENIED_UNSPECIFIED'
+    result=dict(http_status=status,classification=classification,policy_signals=signals,
+        body_bytes=len(body),body_sha256=hashlib.sha256(body).hexdigest())
+    content=headers.get('content-type','').split(';',1)[0].strip().lower()
+    if content in ('text/html','text/plain','application/json'):result['content_type']=content
+    retry=headers.get('retry-after','')
+    if retry.isdecimal():result['retry_after_seconds']=min(int(retry),86400)
+    return result
 
 
 def task(kind, entity='', day='', page=0):
@@ -104,6 +133,11 @@ def task(kind, entity='', day='', page=0):
         if entity or day or page>199:raise ValueError('Bounded public JPM catalog required')
         url=JPM_PUBLIC+('drUniverse' if kind=='JPM_UNIVERSE' else 'corporateActions')
         params=dict(limit=1000,offset=page*1000)
+    elif kind=='JPM_DOCUMENT':
+        match=re.fullmatch(r'([a-f0-9]{32})(?::([1-9][0-9]{0,8}))?',entity)
+        if not match or day or page:raise ValueError('Exact public JPM document/revision required')
+        url=JPM_PUBLIC+'cms/document';params={'cmsId':match[1]}
+        if match[2]:params['sequenceNo']=int(match[2])
     elif kind=='CITI_CATALOG':
         if entity or day or page:raise ValueError('Fixed depositary catalog required')
         url=CITI_CATALOG
@@ -291,6 +325,15 @@ def citi_attachment_tasks(reader):
     return list({digest(t):t for t in result}.values())
 
 
+def jpm_document(raw):
+    if raw.get('action') not in JPM_ECONOMIC_ACTIONS:return None
+    pdf=(raw.get('notices') or {}).get('pdf')
+    if not pdf:return None
+    sequence=raw.get('sequenceNo')
+    if sequence not in (None,0) and (type(sequence) is not int or not 1<=sequence<=999999999):return None
+    return task('JPM_DOCUMENT',pdf+(':'+str(sequence) if sequence else ''))
+
+
 def jpm_page(request,body):
     """Public page contract; midnight dates and global cap do not certify PIT/units."""
     value=json.loads(body)
@@ -383,7 +426,7 @@ def validate_response(request, body):
         count=value.get('TotalCount')
         if ('ErrorCode' in value or not isinstance(value.get('Data'),list) or type(count) not in (int,float)
                 or not math.isfinite(count) or not 0<=count<=1000000 or int(count)!=count): raise ValueError('LSEG catalog mismatch')
-    elif kind in ('RUSSELL_PDF','NASDAQ_PDF','NASDAQ_FACTSHEET','NASDAQ_WEIGHTS','LSEG_WEIGHTS','RUSSELL_IPO_PDF','CITI_NOTICE','CITI_ATTACHMENT','BNY_NOTICE'):
+    elif kind in ('RUSSELL_PDF','NASDAQ_PDF','NASDAQ_FACTSHEET','NASDAQ_WEIGHTS','LSEG_WEIGHTS','RUSSELL_IPO_PDF','CITI_NOTICE','CITI_ATTACHMENT','BNY_NOTICE','JPM_DOCUMENT'):
         if not body.startswith(b'%PDF-'): raise ValueError('Official PDF required')
     else:
         p=html(body)
@@ -396,8 +439,9 @@ def discovered(request, body):
     """Discover only official, narrowly scoped follow-ups; no arbitrary URL fetch."""
     kind=request['kind']; result=[]
     if kind in ('JPM_UNIVERSE','JPM_ACTIONS'):
-        _,page=jpm_page(request,body)
+        records,page=jpm_page(request,body)
         if page['hasMore']:result=[task(kind,page=request['page']+1)]
+        if kind=='JPM_ACTIONS':result += [doc for raw in records if (doc:=jpm_document(raw)) is not None]
     elif kind=='CITI_NOTICE':
         from pypdf import PdfReader
         from pypdf.errors import PdfReadError

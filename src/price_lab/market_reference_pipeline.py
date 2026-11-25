@@ -27,12 +27,15 @@ ASSET='market-reference.pldelta'
 
 def _config_targets(config):
     version=config.get('version')
-    expected={'version','ciks'}|({'research_targets'} if version in (2,3) else set())|({'depositary_attachment_ids'} if version==3 else set())
-    if type(version) is not int or version not in (1,2,3) or set(config)!=expected:
+    expected={'version','ciks'}|({'research_targets'} if version in (2,3,4) else set())|({'depositary_attachment_ids'} if version in (3,4) else set())|({'jpm_document_ids'} if version==4 else set())
+    if type(version) is not int or version not in (1,2,3,4) or set(config)!=expected:
         raise ValueError('Market bootstrap contract mismatch')
     ids=config.get('depositary_attachment_ids',[])
     if not isinstance(ids,list) or len(ids)>5000 or any(not isinstance(v,str) or not re.fullmatch('[1-9][0-9]{0,7}',v) for v in ids) or len(set(ids))!=len(ids):
         raise ValueError('Bounded unique depositary attachment IDs required')
+    documents=config.get('jpm_document_ids',[])
+    if not isinstance(documents,list) or len(documents)>3000 or len(set(documents))!=len(documents):raise ValueError('Bounded unique JPM documents required')
+    for document in documents:s.task('JPM_DOCUMENT',document)
     targets=config.get('research_targets',[])
     if not isinstance(targets,list) or len(targets)>200:raise ValueError('Bounded research snapshot targets required')
     seen=set()
@@ -60,7 +63,8 @@ def enqueue_targets(config_path,targets):
     combined=sorted(merged.values(),key=lambda t:(t['snapshot_date'],t['fund']))
     if combined==old:return dict(status='UNCHANGED',targets=len(old))
     updated=dict(version=2,ciks=config['ciks'],research_targets=combined)
-    if config['version']==3:updated.update(version=3,depositary_attachment_ids=config['depositary_attachment_ids'])
+    if config['version'] in (3,4):updated.update(version=config['version'],depositary_attachment_ids=config['depositary_attachment_ids'])
+    if config['version']==4:updated['jpm_document_ids']=config['jpm_document_ids']
     _config_targets(updated);_atomic(path,updated)
     return dict(status='UPDATED',targets=len(combined))
 
@@ -72,10 +76,24 @@ def enqueue_attachments(config_path,ids):
         raise ValueError('Exact public attachment IDs required')
     merged=sorted(set(config.get('depositary_attachment_ids',[]))|set(ids),key=int)
     updated=dict(version=3,ciks=config['ciks'],research_targets=targets,depositary_attachment_ids=merged)
+    if config['version']==4:updated.update(version=4,jpm_document_ids=config['jpm_document_ids'])
     _config_targets(updated)
     if updated==config:return dict(status='UNCHANGED',attachments=len(merged))
     _atomic(path,updated)
     return dict(status='UPDATED',attachments=len(merged),added=len(merged)-len(config.get('depositary_attachment_ids',[])))
+
+
+def enqueue_jpm_documents(config_path,ids):
+    path=Path(config_path);config=json.loads(path.read_text(encoding='utf-8'));targets=_config_targets(config)
+    if not isinstance(ids,list):raise ValueError('Public document list required')
+    for document in ids:s.task('JPM_DOCUMENT',document)
+    merged=sorted(set(config.get('jpm_document_ids',[]))|set(ids))
+    updated=dict(version=4,ciks=config['ciks'],research_targets=targets,
+        depositary_attachment_ids=config.get('depositary_attachment_ids',[]),jpm_document_ids=merged)
+    _config_targets(updated)
+    if updated==config:return dict(status='UNCHANGED',documents=len(merged))
+    _atomic(path,updated)
+    return dict(status='UPDATED',documents=len(merged),added=len(merged)-len(config.get('jpm_document_ids',[])))
 
 
 def bootstrap(config_path,now=None):
@@ -93,7 +111,7 @@ def bootstrap(config_path,now=None):
     months={d[:7]:d for d in us if d[:7]<through[:7]}
     return dict(through=through,kr_sessions=kr,us_month_ends=list(months.values()),
                 ciks=list(dict.fromkeys(config['ciks'])),research_targets=targets,
-                depositary_attachment_ids=config.get('depositary_attachment_ids',[]))
+                depositary_attachment_ids=config.get('depositary_attachment_ids',[]),jpm_document_ids=config.get('jpm_document_ids',[]))
 
 
 def _atomic(path, value):
@@ -216,6 +234,7 @@ def plan(state, bootstrap, now):
     seeds += [s.task('CITI_NOTICE',code) for code in ('513','2621','1720')]
     seeds += [s.task('BNY_NOTICE','AD2000235')]
     seeds += [s.task('CITI_ATTACHMENT',id) for id in bootstrap.get('depositary_attachment_ids',[])]
+    seeds += [s.task('JPM_DOCUMENT',id) for id in bootstrap.get('jpm_document_ids',[])]
     seeds += [s.task('RUSSELL_PDF',url) for url in s.RUSSELL_ARCHIVE_REPORTS]
     # Verified public files remain useful after they disappear from the
     # current-quarter page. Reuse their original tasks, never the filename
@@ -347,7 +366,11 @@ class Fetcher:
     def __call__(self, task):
         s.validate_task(task)
         if self.guard: self.guard()
-        headers={'User-Agent':self.credentials.get('SEC_USER_AGENT') or 'PriceLab public reference research (https://github.com/do0405/price-lab-data)'}
+        headers={'User-Agent':'PriceLab public reference research (https://github.com/do0405/price-lab-data)'}
+        if task['kind'].startswith('SEC_'):
+            identity=s.sec_request_identity(self.credentials.get('SEC_USER_AGENT') or os.environ.get('SEC_USER_AGENT'))
+            if identity is None:return 0,{'X-PriceLab-Reason':'SEC_IDENTITY_NOT_CONFIGURED'},b''
+            headers.update({'User-Agent':identity,'Accept':'application/json'})
         if task['kind']=='NASDAQ_WEIGHTS':
             # The public PDF endpoint needs ordinary document Accept headers.
             # No cookies, login session or authorization is sent to this host.
@@ -369,7 +392,7 @@ class Fetcher:
         except requests.RequestException: return 0,{},b''
 
 
-def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sleep,deadline=None,source_kinds=None):
+def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sleep,deadline=None,source_kinds=None,recover_sec_identity=False):
     if type(max_requests) is not int or not 1<=max_requests<=100: raise ValueError('Bounded market requests required')
     if source_kinds is not None and (not isinstance(source_kinds,(list,tuple)) or not 1<=len(source_kinds)<=50
             or any(not isinstance(kind,str) or not re.fullmatch(r'[A-Z_]{1,50}',kind) for kind in source_kinds)):
@@ -381,23 +404,25 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
         if cooldown['reason']=='HTTP_404': state['cooldowns'].pop(host)
         elif host=='api.finra.org' and cooldown['reason']=='HTTP_204':state['cooldowns'].pop(host)
     fetch=fetch or Fetcher()
+    recovery=[s.task('SEC_SUBMISSIONS','0000320193'),s.task('SEC_MAP')] if recover_sec_identity else []
     for _ in range(max_requests):
         now=fixed or datetime.now(timezone.utc)
         if deadline is not None and time.monotonic()>=deadline-40: break
         plan(state,bootstrap,now)
         ready=[t for t in state['pending'] if state['cooldowns'].get(urlsplit(t['url']).hostname,{}).get('retry_at','')<=now.isoformat() and state['checked'].get(s.digest(t),{}).get('retry_at','')<=now.isoformat()]
         if source_kinds is not None:ready=[t for t in ready if t['kind'] in source_kinds]
-        if not ready: break
-        t=ready[0]
+        canary=recovery.pop(0) if recovery else None
+        if not ready and canary is None: break
+        t=canary or ready[0]
         # Large ADR catalogs must not starve prices, shares or index backfill.
-        if sent%5==4 and t['kind'] in ('CITI_NOTICE','CITI_ATTACHMENT'):
+        if canary is None and sent%5==4 and t['kind'] in ('CITI_NOTICE','CITI_ATTACHMENT'):
             t=next((candidate for candidate in ready if candidate['kind'] not in ('CITI_NOTICE','CITI_ATTACHMENT')),t)
         elif t['kind'] in ('CITI_NOTICE','CITI_ATTACHMENT'):
             preferred='CITI_NOTICE' if sent%5==0 else 'CITI_ATTACHMENT'
             t=next((candidate for candidate in ready if candidate['kind']==preferred),t)
         # A short, bounded JPM catalog chain shares half of the other-source
         # lane; a large directory cannot starve all other reference categories.
-        if sent%10==4:
+        if canary is None and sent%10==4:
             t=next((candidate for candidate in ready if candidate['kind'] in ('JPM_UNIVERSE','JPM_ACTIONS')),t)
         key=s.digest(t); host=urlsplit(t['url']).hostname
         status,headers,body=fetch(t); sent+=1; state['requests'][host]=state['requests'].get(host,0)+1
@@ -407,13 +432,15 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
         if status==200:
             try: s.validate_response(t,body)
             except (ValueError,KeyError,TypeError,UnicodeError): reason='RESPONSE_CONTRACT'
-        else: reason=f'HTTP_{status}' if status else 'TRANSPORT_UNAVAILABLE'
+        else: reason=f'HTTP_{status}' if status else ('SEC_IDENTITY_NOT_CONFIGURED' if headers.get('X-PriceLab-Reason')=='SEC_IDENTITY_NOT_CONFIGURED' else 'TRANSPORT_UNAVAILABLE')
         if reason:
-            delay=86400 if status in (400,401,403,404) or reason=='RESPONSE_CONTRACT' else 300
+            delay=86400 if status in (400,401,403,404) or reason in ('RESPONSE_CONTRACT','SEC_IDENTITY_NOT_CONFIGURED') else 300
             if status==429:
                 try: delay=max(60,min(86400,int(headers.get('Retry-After','300'))))
                 except ValueError: delay=300
             state['cooldowns'][host]=dict(reason=reason,retry_at=(now+timedelta(seconds=delay)).isoformat())
+            if t['kind'].startswith('SEC_') and status in (403,429):
+                state['cooldowns'][host]['diagnostic']=s.sec_failure_diagnostic(status,headers,body)
             # A missing historical snapshot does not block current snapshots
             # from the same fund host. Its task remains a dated source gap.
             if status in (400,404) or (status==200 and reason=='RESPONSE_CONTRACT' and not body.lstrip().lower().startswith((b'<html',b'<!doctype'))):
@@ -421,6 +448,14 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
                 state['checked'][key]=dict(status='HISTORY_UNAVAILABLE' if t['kind']=='FUND' else reason,retry_at=(now+timedelta(days=30 if t['kind']=='FUND' else 1)).isoformat(),task=t)
                 state['pending']=[x for x in state['pending'] if s.digest(x)!=key]
         else:
+            if canary is not None:
+                # Explicit operator recovery verifies the same official host
+                # with a declared identity. Failed probes never lift denial.
+                state['cooldowns'].pop(host,None)
+                state['cursors'].setdefault('sec_identity_verified_hosts',{})[host]=now.isoformat()
+                if t['kind']=='SEC_SUBMISSIONS':
+                    fact=s.task('SEC_FACTS',t['entity'])
+                    if s.digest(fact) not in state['checked']:state['pending'].insert(0,fact)
             sha=hashlib.sha256(body).hexdigest()
             changed=state['seen'].get(key)!=sha
             if sha not in state['seen'].values():
@@ -446,7 +481,8 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
                     interval=timedelta(days=30 if t['kind']=='CITI_CATALOG' else 7)
                     refresh=stamp is not None and datetime.fromisoformat(stamp)<=now-interval
                 if t['kind'] in ('JPM_UNIVERSE','JPM_ACTIONS'):
-                    refresh=stamp is not None and datetime.fromisoformat(stamp)<=now-timedelta(days=1)
+                    interval=timedelta(days=30 if child['kind']=='JPM_DOCUMENT' else 1)
+                    refresh=stamp is not None and datetime.fromisoformat(stamp)<=now-interval
                 if t['kind']=='CITI_NOTICE':
                     # A stable cover PDF can link to an in-place corrected
                     # attachment. Recheck that child on the monthly cycle too.
@@ -459,7 +495,9 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
     return dict(state=state,records=records,requests=sent,unchanged=unchanged)
 
 
-def run(bootstrap, directory, *, seconds=600,max_requests=50,max_batches=10,role='cloud',key=None,credentials=None,source_kinds=None):
+def run(bootstrap, directory, *, seconds=600,max_requests=50,max_batches=10,role='cloud',key=None,credentials=None,source_kinds=None,recover_sec_identity=False):
+    if recover_sec_identity and not s.sec_request_identity((credentials or {}).get('SEC_USER_AGENT') or os.environ.get('SEC_USER_AGENT')):
+        raise ValueError('Verified declared SEC identity required for recovery')
     key=key or os.environ.get('PRICE_DATA_KEY'); directory=Path(directory); directory.mkdir(parents=True,exist_ok=True)
     owner=ResearchOwner(role,key=key,namespace=NAMESPACE)
     control=read_control(key=key,namespace=NAMESPACE)
@@ -471,7 +509,7 @@ def run(bootstrap, directory, *, seconds=600,max_requests=50,max_batches=10,role
         for _ in range(max_batches):
             if time.monotonic()>=end-40: break
             owner.guard(force=True)
-            result=collect(state,bootstrap,max_requests=max_requests,fetch=Fetcher(credentials=credentials,guard=owner.guard),deadline=end,source_kinds=source_kinds)
+            result=collect(state,bootstrap,max_requests=max_requests,fetch=Fetcher(credentials=credentials,guard=owner.guard),deadline=end,source_kinds=source_kinds,recover_sec_identity=recover_sec_identity and not summaries)
             if not result['requests']: break
             payload=dict(schema='research-delta-v1',stream_id=s.STREAM,sequence=prior['sequence']+1 if prior else 1,
                          previous_package_sha256=package_digest(prior) if prior else None,bootstrap_anchor_sha256=s.ANCHOR,

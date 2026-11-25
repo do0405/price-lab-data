@@ -12,6 +12,102 @@ from test_market_reference_sources import fund_body,payload,jpm_body
 NOW=datetime(2026,11,24,tzinfo=timezone.utc)
 
 
+def test_sec_identity_uses_configured_environment_even_with_other_provider_keys(monkeypatch):
+    identity='PriceLab Research research@institution.edu'
+    monkeypatch.setenv('SEC_USER_AGENT',identity);calls=[]
+    class Response:
+        status_code=200;headers={}
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+        def iter_content(self,*args):return iter([b'{}'])
+    fetcher=p.Fetcher(credentials={'KRX_API_KEY':'not-the-sec-identity'})
+    monkeypatch.setattr(fetcher.session,'request',lambda *args,**kwargs:(calls.append(kwargs['headers']) or Response()))
+    fetcher(s.task('SEC_SUBMISSIONS','0000320193'))
+    assert calls[-1]['User-Agent']==identity
+    fetcher(s.task('CITI_CATALOG'))
+    assert identity not in str(calls[-1])
+
+
+def test_missing_sec_identity_does_not_send_an_undeclared_request(monkeypatch):
+    monkeypatch.delenv('SEC_USER_AGENT',raising=False)
+    fetcher=p.Fetcher(credentials={'KRX_API_KEY':'other'})
+    monkeypatch.setattr(fetcher.session,'request',lambda *args,**kwargs:pytest.fail('Undeclared SEC request sent'))
+    status,headers,body=fetcher(s.task('SEC_MAP'))
+    assert status==0 and headers['X-PriceLab-Reason']=='SEC_IDENTITY_NOT_CONFIGURED'
+
+
+def test_jpm_document_targets_preserve_other_config_and_enqueue_idempotently(tmp_path):
+    path=tmp_path/'config.json';original=dict(version=3,ciks=['0000320193'],research_targets=[],depositary_attachment_ids=['123'])
+    path.write_text(json.dumps(original));document='a'*32+':3'
+    assert p.enqueue_jpm_documents(path,[document])['added']==1
+    p.enqueue_attachments(path,['124']);p.enqueue_targets(path,[{'fund':'IWB','snapshot_date':'2026-10-21'}])
+    updated=json.loads(path.read_text());assert updated['version']==4
+    assert updated['ciks']==original['ciks'] and updated['jpm_document_ids']==[document]
+    assert updated['depositary_attachment_ids']==['123','124']
+    assert p.enqueue_jpm_documents(path,[document])['status']=='UNCHANGED'
+
+
+@pytest.mark.parametrize('age,due',[(29,False),(31,True)])
+def test_pinned_jpm_documents_recheck_monthly_not_on_every_daily_catalog(age,due):
+    from datetime import timedelta
+    from unittest.mock import patch
+    state=p.initial_state('2026-11-23');catalog=s.task('JPM_ACTIONS');doc=s.task('JPM_DOCUMENT','a'*32+':3')
+    state['pending']=[catalog];state['seen'][s.digest(doc)]='b'*64
+    state['checked'][s.digest(doc)]={'status':'COLLECTED','checked_at':(NOW-timedelta(days=age)).isoformat()}
+    body=jpm_body([dict(cusip='471115402',action='Ratio Change',notices={'pdf':'a'*32},sequenceNo=3)])
+    with patch.object(p,'plan',lambda state,*args:state):
+        out=p.collect(state,bootstrap(),now=NOW,max_requests=1,fetch=lambda t:(200,{},body),sleep=lambda _:None)
+    assert (doc in out['state']['pending']) is due
+
+
+def test_sec_identity_recovery_clears_only_hosts_with_valid_successful_canaries():
+    from unittest.mock import patch
+    state=p.initial_state('2026-11-23')
+    for host in ('data.sec.gov','www.sec.gov','data.krx.co.kr'):
+        state['cooldowns'][host]={'reason':'HTTP_403','retry_at':'2026-11-26T00:00:00+00:00'}
+    seen=[]
+    def fetch(t):
+        seen.append(t['kind'])
+        if t['kind']=='SEC_MAP':return 403,{'Content-Type':'text/html'},b'<h1>Access Denied</h1>'
+        return 200,{},b'{"cik":320193,"filings":{"recent":{},"files":[]}}'
+    with patch.object(p,'plan',lambda state,*args:state):
+        out=p.collect(state,bootstrap(),now=NOW,max_requests=2,fetch=fetch,sleep=lambda _:None,
+            recover_sec_identity=True,source_kinds=['SEC_MAP','SEC_SUBMISSIONS'])
+    assert seen==['SEC_SUBMISSIONS','SEC_MAP']
+    assert 'data.sec.gov' not in out['state']['cooldowns']
+    assert out['state']['cooldowns']['www.sec.gov']['reason']=='HTTP_403'
+    assert out['state']['cooldowns']['data.krx.co.kr']==state['cooldowns']['data.krx.co.kr']
+    assert len(out['records'])==1 and state['cooldowns']['data.sec.gov']['reason']=='HTTP_403'
+
+
+def test_run_recovery_probes_only_the_first_batch(tmp_path,monkeypatch):
+    class Owner:
+        head=None
+        def __init__(self,*args,**kwargs):pass
+        def acquire(self,**kwargs):return True
+        def guard(self,**kwargs):pass
+        def release(self):pass
+    calls=[]
+    monkeypatch.setattr(p,'ResearchOwner',Owner);monkeypatch.setattr(p,'read_control',lambda **kwargs:None)
+    def collect(state,*args,**kwargs):
+        calls.append(kwargs['recover_sec_identity']);return dict(state=state,records=[],requests=1)
+    monkeypatch.setattr(p,'collect',collect)
+    monkeypatch.setattr(p,'publish',lambda payload,*args,**kwargs:dict(sequence=payload['sequence'],package_sha256=p.package_digest(payload)))
+    p.run(bootstrap(),tmp_path,seconds=600,max_requests=1,max_batches=2,key=b'x'*32,
+        credentials={'SEC_USER_AGENT':'PriceLab Research research@institution.edu'},recover_sec_identity=True)
+    assert calls==[True,False]
+
+
+@pytest.mark.parametrize('body,expected',[
+    (b'<title>Your Request Originates from an Undeclared Automated Tool</title>','UNDECLARED_AUTOMATION'),
+    (b'<title>Request Rate Threshold Exceeded</title>','REQUEST_RATE_THRESHOLD'),
+    (b'<h1>Access Denied</h1>','ACCESS_DENIED_UNSPECIFIED')])
+def test_sec_403_diagnostic_is_bounded_and_contains_no_raw_identity(body,expected):
+    d=s.sec_failure_diagnostic(403,{'Content-Type':'text/html'},body)
+    assert d['classification']==expected
+    assert 'body' not in d and 'headers' not in d
+
+
 def test_targeted_reference_collection_preserves_other_pending_sources():
     from unittest.mock import patch
     state=p.initial_state('2026-11-23');other=s.task('CITI_NOTICE','513');target=s.task('JPM_UNIVERSE')
