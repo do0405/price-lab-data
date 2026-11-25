@@ -30,7 +30,10 @@ RUSSELL_ARCHIVE_REPORTS=(
     'https://www.lseg.com/content/dam/ftse-russell/en_us/documents/other/ru3000-additions-20250613.pdf',
     'https://www.lseg.com/content/dam/ftse-russell/en_us/documents/other/ru3000-additions-20260618.pdf',
     'https://www.lseg.com/content/dam/ftse-russell/en_us/documents/other/ru3000-additions-preliminary-20240524.pdf',
-    'https://www.lseg.com/content/dam/ftse-russell/en_us/documents/other/ru3000-deletions-preliminary-20240524.pdf')
+    'https://www.lseg.com/content/dam/ftse-russell/en_us/documents/other/ru3000-deletions-preliminary-20240524.pdf',
+    'https://www.lseg.com/content/dam/ftse-russell/en_us/documents/other/ru3000-deletions-20250627.pdf',
+    'https://www.lseg.com/content/dam/ftse-russell/en_us/documents/other/ru3000-additions-20260605.pdf',
+    'https://www.lseg.com/content/dam/ftse-russell/en_us/documents/other/ru3000-additions-20260522.pdf')
 CITI_CATALOG='https://depositaryreceipts.citi.com/adr/notices/pgm_dispCA.aspx?pageId=16&subpageID=112'
 CITI_PDF='https://depositaryreceipts.citi.com/adr/notices/previewPdf.aspx'
 JPM_PUBLIC='https://adr.api.wsod.com/jpmadr-public/v1/'

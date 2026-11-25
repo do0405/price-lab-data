@@ -193,6 +193,20 @@ def test_reference_reservation_survives_one_request_batches_and_cooldowns(monkey
     assert blocked in state['pending'] and state['cooldowns']['data.sec.gov']['reason']=='HTTP_403'
 
 
+def test_observed_additional_russell_archives_join_existing_checkpoint_once():
+    state=p.initial_state('2026-11-23')
+    completed=s.task('RUSSELL_PDF',s.RUSSELL_ARCHIVE_REPORTS[0])
+    state['checked'][s.digest(completed)]=dict(status='COLLECTED',checked_at=NOW.isoformat())
+    p.plan(state,bootstrap(),NOW)
+    urls={t['url'] for t in state['pending'] if t['kind']=='RUSSELL_PDF'}
+    assert completed['url'] not in urls
+    assert all('https://www.lseg.com/content/dam/ftse-russell/en_us/documents/other/'+name in urls for name in (
+        'ru3000-deletions-20250627.pdf','ru3000-additions-20260605.pdf','ru3000-additions-20260522.pdf'))
+    original=[s.digest(t) for t in state['pending'] if t['kind']=='RUSSELL_PDF']
+    p.plan(state,bootstrap(),NOW)
+    assert [s.digest(t) for t in state['pending'] if t['kind']=='RUSSELL_PDF']==original
+
+
 def test_attachment_targets_preserve_issuer_and_fund_targets_and_are_idempotent(tmp_path):
     path=tmp_path/'bootstrap.json';initial=dict(version=2,ciks=['0000320193'],research_targets=[])
     path.write_text(json.dumps(initial))
@@ -266,7 +280,8 @@ def test_successful_batch_resumes_without_refetching_completed_task():
 def test_pending_topup_is_bounded_even_with_denied_providers():
     state=p.initial_state('2026-11-23'); b=bootstrap(); b['kr_sessions']=['2010-01-04']*1000
     for _ in range(1000): p.plan(state,b,NOW)
-    assert len(state['pending'])<100
+    # Fixed, verified archive seeds are separate from bounded queue top-ups.
+    assert len(state['pending'])-len(s.RUSSELL_ARCHIVE_REPORTS)<100
 
 
 def test_old_catalog_checkpoint_migrates_without_repeating_404_or_losing_scope():
