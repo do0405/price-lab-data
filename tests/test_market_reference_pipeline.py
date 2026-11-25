@@ -12,6 +12,23 @@ from test_market_reference_sources import fund_body,payload,jpm_body
 NOW=datetime(2026,11,24,tzinfo=timezone.utc)
 
 
+def test_capitalization_targets_are_prioritized_without_resetting_scan_or_other_queues(tmp_path):
+    path=tmp_path/'config.json'
+    path.write_text(json.dumps(dict(version=4,ciks=['0000000009'],research_targets=[],depositary_attachment_ids=['123'],jpm_document_ids=['a'*32])))
+    document=dict(entity='0001023128:0001023128-26-000060:10-Q:lad-20260930.htm',filed_date='2026-10-28')
+    assert p.enqueue_capitalization_targets(path,['0001023128'],[document])['status']=='UPDATED'
+    p.enqueue_jpm_documents(path,['b'*32]);p.enqueue_attachments(path,['124']);p.enqueue_targets(path,[dict(fund='IVV',snapshot_date='2026-09-30')])
+    cfg=json.loads(path.read_text());assert cfg['version']==5 and cfg['capitalization_ciks']==['0001023128']
+    assert cfg['sec_primary_documents']==[document] and cfg['ciks']==['0000000009']
+    assert p.enqueue_capitalization_targets(path,['0001023128'],[document])['status']=='UNCHANGED'
+    state=p.initial_state('2026-11-23');state['cursors']['sec']=1
+    b=bootstrap();b.update(capitalization_ciks=cfg['capitalization_ciks'],sec_primary_documents=[document])
+    p.plan(state,b,NOW)
+    assert state['cursors']['sec']==1
+    assert state['pending'][0]['kind']=='SEC_PRIMARY'
+    assert any(t['kind']=='SEC_SUBMISSIONS' and t['entity']=='0001023128' for t in state['pending'])
+
+
 def test_sec_identity_uses_configured_environment_even_with_other_provider_keys(monkeypatch):
     identity='PriceLab Research research@institution.edu'
     monkeypatch.setenv('SEC_USER_AGENT',identity);calls=[]

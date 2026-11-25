@@ -27,9 +27,21 @@ ASSET='market-reference.pldelta'
 
 def _config_targets(config):
     version=config.get('version')
-    expected={'version','ciks'}|({'research_targets'} if version in (2,3,4) else set())|({'depositary_attachment_ids'} if version in (3,4) else set())|({'jpm_document_ids'} if version==4 else set())
-    if type(version) is not int or version not in (1,2,3,4) or set(config)!=expected:
+    if type(version) is not int or version not in (1,2,3,4,5):raise ValueError('Market bootstrap contract mismatch')
+    expected={'version','ciks'}|({'research_targets'} if version>=2 else set())|({'depositary_attachment_ids'} if version>=3 else set())|({'jpm_document_ids'} if version>=4 else set())
+    if version>=5:expected|={'capitalization_ciks','sec_primary_documents'}
+    if set(config)!=expected:
         raise ValueError('Market bootstrap contract mismatch')
+    priority=config.get('capitalization_ciks',[])
+    if not isinstance(priority,list) or len(priority)>500 or len(set(priority))!=len(priority) or any(not isinstance(c,str) or not re.fullmatch('[0-9]{10}',c) for c in priority):
+        raise ValueError('Bounded capitalization CIKs required')
+    primary=config.get('sec_primary_documents',[])
+    if not isinstance(primary,list) or len(primary)>2000:raise ValueError('Bounded primary document targets required')
+    primary_keys=[]
+    for item in primary:
+        if not isinstance(item,dict) or set(item)!={'entity','filed_date'}:raise ValueError('Exact primary document target required')
+        t=s.task('SEC_PRIMARY',item['entity'],item['filed_date']);primary_keys.append(s.digest(t))
+    if len(set(primary_keys))!=len(primary_keys):raise ValueError('Duplicate primary document targets')
     ids=config.get('depositary_attachment_ids',[])
     if not isinstance(ids,list) or len(ids)>5000 or any(not isinstance(v,str) or not re.fullmatch('[1-9][0-9]{0,7}',v) for v in ids) or len(set(ids))!=len(ids):
         raise ValueError('Bounded unique depositary attachment IDs required')
@@ -77,9 +89,7 @@ def enqueue_targets(config_path,targets):
         merged[(row['fund'],row['snapshot_date'])]=row
     combined=sorted(merged.values(),key=lambda t:(t['snapshot_date'],t['fund']))
     if combined==old:return dict(status='UNCHANGED',targets=len(old))
-    updated=dict(version=2,ciks=config['ciks'],research_targets=combined)
-    if config['version'] in (3,4):updated.update(version=config['version'],depositary_attachment_ids=config['depositary_attachment_ids'])
-    if config['version']==4:updated['jpm_document_ids']=config['jpm_document_ids']
+    updated={**config,'version':max(2,config['version']),'research_targets':combined}
     _config_targets(updated);_atomic(path,updated)
     return dict(status='UPDATED',targets=len(combined))
 
@@ -90,8 +100,7 @@ def enqueue_attachments(config_path,ids):
     if not isinstance(ids,list) or any(not isinstance(v,str) or not re.fullmatch('[1-9][0-9]{0,7}',v) for v in ids):
         raise ValueError('Exact public attachment IDs required')
     merged=sorted(set(config.get('depositary_attachment_ids',[]))|set(ids),key=int)
-    updated=dict(version=3,ciks=config['ciks'],research_targets=targets,depositary_attachment_ids=merged)
-    if config['version']==4:updated.update(version=4,jpm_document_ids=config['jpm_document_ids'])
+    updated={**config,'version':max(3,config['version']),'research_targets':targets,'depositary_attachment_ids':merged}
     _config_targets(updated)
     if updated==config:return dict(status='UNCHANGED',attachments=len(merged))
     _atomic(path,updated)
@@ -103,12 +112,27 @@ def enqueue_jpm_documents(config_path,ids):
     if not isinstance(ids,list):raise ValueError('Public document list required')
     for document in ids:s.task('JPM_DOCUMENT',document)
     merged=sorted(set(config.get('jpm_document_ids',[]))|set(ids))
-    updated=dict(version=4,ciks=config['ciks'],research_targets=targets,
-        depositary_attachment_ids=config.get('depositary_attachment_ids',[]),jpm_document_ids=merged)
+    updated={**config,'version':max(4,config['version']),'research_targets':targets,
+        'depositary_attachment_ids':config.get('depositary_attachment_ids',[]),'jpm_document_ids':merged}
     _config_targets(updated)
     if updated==config:return dict(status='UNCHANGED',documents=len(merged))
     _atomic(path,updated)
     return dict(status='UPDATED',documents=len(merged),added=len(merged)-len(config.get('jpm_document_ids',[])))
+
+
+def enqueue_capitalization_targets(config_path,ciks,documents=()):
+    """A small daily priority lane; do not rewind the 16k-issuer backfill."""
+    path=Path(config_path);config=json.loads(path.read_text(encoding='utf-8'));_config_targets(config)
+    priority=sorted(set(config.get('capitalization_ciks',[]))|set(ciks))
+    combined={(d['entity'],d['filed_date']):d for d in config.get('sec_primary_documents',[])}
+    for document in documents:combined[(document['entity'],document['filed_date'])]=document
+    updated={**config,'version':5,'research_targets':config.get('research_targets',[]),
+        'depositary_attachment_ids':config.get('depositary_attachment_ids',[]),'jpm_document_ids':config.get('jpm_document_ids',[]),
+        'capitalization_ciks':priority,'sec_primary_documents':sorted(combined.values(),key=lambda x:(x['filed_date'],x['entity']))}
+    _config_targets(updated)
+    if updated==config:return dict(status='UNCHANGED',priority_issuers=len(priority),primary_documents=len(combined))
+    _atomic(path,updated)
+    return dict(status='UPDATED',priority_issuers=len(priority),primary_documents=len(combined))
 
 
 def bootstrap(config_path,now=None):
@@ -126,7 +150,8 @@ def bootstrap(config_path,now=None):
     months={d[:7]:d for d in us if d[:7]<through[:7]}
     return dict(through=through,kr_sessions=kr,us_month_ends=list(months.values()),
                 ciks=list(dict.fromkeys(config['ciks'])),research_targets=targets,
-                depositary_attachment_ids=config.get('depositary_attachment_ids',[]),jpm_document_ids=config.get('jpm_document_ids',[]))
+                depositary_attachment_ids=config.get('depositary_attachment_ids',[]),jpm_document_ids=config.get('jpm_document_ids',[]),
+                capitalization_ciks=config.get('capitalization_ciks',[]),sec_primary_documents=config.get('sec_primary_documents',[]))
 
 
 def _atomic(path, value):
@@ -371,7 +396,16 @@ def plan(state, bootstrap, now):
         elif name=='finra':add(s.task('FINRA_DAILY',day=(date.fromisoformat(through)-timedelta(days=value)).isoformat()))
         else: add(s.task('LSEG_CATALOG' if name=='lseg' else 'SP_ARCHIVE',str(value)))
         state['cursors'][name]=cursor+1
-    state['pending']=list(pending.values())
+    priority=set(bootstrap.get('capitalization_ciks',[]));urgent={}
+    for item in bootstrap.get('sec_primary_documents',[]):
+        t=s.task('SEC_PRIMARY',item['entity'],item['filed_date']);key=s.digest(t)
+        if key not in state['checked']:pending.setdefault(key,t)
+    for cik in sorted(priority):
+        for kind in ('SEC_SUBMISSIONS','SEC_FACTS'):
+            t=s.task(kind,cik);key=s.digest(t);stamp=state['checked'].get(key,{}).get('checked_at')
+            if stamp is None or datetime.fromisoformat(stamp)<=now-timedelta(days=1):urgent[key]=t
+    primary={k:t for k,t in pending.items() if t['kind']=='SEC_PRIMARY'}
+    state['pending']=list({**primary,**urgent,**pending}.values())
     return s.validate_state(state)
 
 
@@ -386,6 +420,7 @@ class Fetcher:
             identity=s.sec_request_identity(self.credentials.get('SEC_USER_AGENT') or os.environ.get('SEC_USER_AGENT'))
             if identity is None:return 0,{'X-PriceLab-Reason':'SEC_IDENTITY_NOT_CONFIGURED'},b''
             headers.update({'User-Agent':identity,'Accept':'application/json'})
+            if task['kind']=='SEC_PRIMARY':headers['Accept']='text/html,application/xhtml+xml,application/xml'
         if task['kind']=='NASDAQ_WEIGHTS':
             # The public PDF endpoint needs ordinary document Accept headers.
             # No cookies, login session or authorization is sent to this host.
@@ -503,7 +538,9 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
                 state['cursors']['issuer_additions']=list(dict.fromkeys(prior+observed))
             state['pending']=[x for x in state['pending'] if s.digest(x)!=key]
             existing={s.digest(x) for x in state['pending']}
-            for child in s.discovered(t,body):
+            targeted=t['kind']=='SEC_SUBMISSIONS' and t['entity'] in bootstrap.get('capitalization_ciks',[])
+            children=(s.discovered(t,body,primary=True,through=bootstrap['through']) if targeted else s.discovered(t,body))
+            for child in children:
                 child_key=s.digest(child)
                 stamp=state['checked'].get(child_key,{}).get('checked_at')
                 refresh=(changed and t['kind'] in ('LSEG_CATALOG','SP_ARCHIVE') and

@@ -3,6 +3,29 @@ from datetime import datetime,timezone
 import hashlib
 import json
 import pytest
+
+
+def test_sec_primary_uses_exact_official_document_and_dated_metadata():
+    entity='0001023128:0001023128-26-000060:10-Q:lad-20260930.htm'
+    t=s.task('SEC_PRIMARY',entity,'2026-10-28')
+    assert t['url']=='https://www.sec.gov/Archives/edgar/data/1023128/000102312826000060/lad-20260930.htm'
+    assert s.sec_primary_metadata(t)['form']=='10-Q'
+    s.validate_task(t)
+    for bad in ['../other.htm','https://other.test/doc.htm','one.htm?token=x']:
+        with pytest.raises(ValueError):s.task('SEC_PRIMARY',entity.rsplit(':',1)[0]+':'+bad,'2026-10-28')
+    with pytest.raises(ValueError):s.validate_response(t,b'{"error":"not a filing"}')
+
+
+def test_targeted_submissions_discover_bounded_primary_reports_only_when_requested():
+    t=s.task('SEC_SUBMISSIONS','0001023128')
+    recent=dict(form=['10-Q','10-Q','10-K','8-K','10-Q'],filingDate=['2026-10-28','2026-07-28','2026-02-28','2026-11-01','2027-01-01'],
+        accessionNumber=['0001023128-26-000060','0001023128-26-000040','0001023128-26-000020','0001023128-26-000070','0001023128-27-000001'],
+        primaryDocument=['q3.htm','q2.htm','annual.htm','event.htm','future.htm'])
+    body=json.dumps(dict(cik=1023128,filings={'recent':recent,'files':[]})).encode()
+    assert not s.discovered(t,body)
+    tasks=s.discovered(t,body,primary=True,through='2026-11-24')
+    assert len(tasks)==3 and all(x['kind']=='SEC_PRIMARY' for x in tasks)
+    assert {s.sec_primary_metadata(x)['form'] for x in tasks}=={'10-Q','10-K'}
 from price_lab import market_reference_sources as s
 from price_lab.research_delta_codec import seal_package,open_package,package_digest
 

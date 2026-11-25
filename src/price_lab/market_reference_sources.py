@@ -76,6 +76,14 @@ def sec_failure_diagnostic(status,headers,body):
     return result
 
 
+def sec_primary_metadata(request):
+    match=re.fullmatch(r'([0-9]{10}):([0-9]{10}-[0-9]{2}-[0-9]{6}):(10-[KQ](?:/A)?|20-F(?:/A)?|40-F(?:/A)?):([A-Za-z0-9_.-]{1,180}\.(?:htm|html|xml|txt))',request['entity'])
+    if not match or '..' in match[4] or not request['requested_date']:
+        raise ValueError('Exact SEC primary filing metadata required')
+    date.fromisoformat(request['requested_date'])
+    return dict(cik=match[1],accession=match[2],form=match[3],primary_document=match[4],filed_date=request['requested_date'])
+
+
 def task(kind, entity='', day='', page=0):
     """Only fixed official endpoints; discovered notices have narrow URL scopes."""
     if day:
@@ -108,6 +116,10 @@ def task(kind, entity='', day='', page=0):
             params = dict(bld='dbms/MDC/STAT/standard/MDCSTAT03901', mktId={'KOSPI': 'STK', 'KOSDAQ': 'KSQ'}[entity], trdDd=day.replace('-', ''), money='1', csvxls_isNo='false')
     elif kind == 'SEC_MAP':
         url='https://www.sec.gov/files/company_tickers_exchange.json'
+    elif kind=='SEC_PRIMARY':
+        if page:raise ValueError('SEC primary document has no page cursor')
+        meta=sec_primary_metadata(dict(entity=entity,requested_date=day))
+        url=f"https://www.sec.gov/Archives/edgar/data/{int(meta['cik'])}/{meta['accession'].replace('-','')}/{meta['primary_document']}"
     elif kind in ('SEC_FACTS', 'SEC_SUBMISSIONS', 'SEC_ARCHIVE'):
         if not re.fullmatch(r'\d{10}', entity): raise ValueError('Exact CIK required')
         if kind=='SEC_ARCHIVE':
@@ -413,6 +425,12 @@ def validate_response(request, body):
     elif kind=='SEC_MAP':
         value=json.loads(body)
         if value.get('fields')!=['cik','name','ticker','exchange'] or not isinstance(value.get('data'),list) or not value['data']: raise ValueError('SEC directory contract mismatch')
+    elif kind=='SEC_PRIMARY':
+        lower=body[:3000].lower()
+        if not any(marker in lower for marker in (b'<html',b'<!doctype html',b'<xbrl',b'<xbrli:xbrl')):
+            raise ValueError('SEC primary filing markup required')
+        if b'undeclared automated tool' in body.lower() or b'request rate threshold exceeded' in body.lower():
+            raise ValueError('SEC access denial is not a filing')
     elif kind=='SEC_ARCHIVE':
         value=json.loads(body)
         if not isinstance(value.get('accessionNumber'),list) or not isinstance(value.get('filingDate'),list): raise ValueError('SEC archive contract mismatch')
@@ -438,7 +456,7 @@ def validate_response(request, body):
     return body
 
 
-def discovered(request, body):
+def discovered(request, body,*,primary=False,through=None):
     """Discover only official, narrowly scoped follow-ups; no arbitrary URL fetch."""
     kind=request['kind']; result=[]
     if kind in ('JPM_UNIVERSE','JPM_ACTIONS'):
@@ -480,10 +498,26 @@ def discovered(request, body):
         value=json.loads(body)
         if (request['page']+1)*50<value['TotalCount']: result.append(task(kind,request['entity'],day=request['requested_date'],page=request['page']+1))
     elif kind=='SEC_SUBMISSIONS':
-        for item in json.loads(body)['filings'].get('files',[]):
+        filings=json.loads(body)['filings']
+        for item in filings.get('files',[]):
             name=item.get('name','')
             match=re.fullmatch(r'CIK'+request['entity']+r'-submissions-(\d{3})\.json',name)
             if match: result.append(task('SEC_ARCHIVE',request['entity'],page=int(match.group(1))))
+        if primary:
+            recent=filings.get('recent',{});forms=recent.get('form',[]);candidates=[]
+            for n,form in enumerate(forms):
+                if form not in ('10-K','10-K/A','10-Q','10-Q/A','20-F','20-F/A','40-F','40-F/A'):continue
+                filed=recent.get('filingDate',[])[n]
+                if through and filed>through:continue
+                entity=':'.join((request['entity'],recent['accessionNumber'][n],form,recent['primaryDocument'][n]))
+                try:candidate=task('SEC_PRIMARY',entity,filed)
+                except ValueError:continue
+                candidates.append(candidate)
+            candidates.sort(key=lambda x:(x['requested_date'],x['entity']),reverse=True)
+            selected=candidates[:2]
+            annual=next((t for t in candidates if sec_primary_metadata(t)['form'].startswith(('10-K','20-F','40-F'))),None)
+            if annual is not None and annual not in selected:selected.append(annual)
+            result.extend(selected)
     return list({digest(t):t for t in result}.values())
 
 
