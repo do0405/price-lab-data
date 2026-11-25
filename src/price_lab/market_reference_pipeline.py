@@ -407,6 +407,22 @@ class Fetcher:
         except requests.RequestException: return 0,{},b''
 
 
+def _reserved_reference(ready, cursor):
+    """Rotate the existing fifth request slot without bypassing eligibility."""
+    others=[t for t in ready if t['kind'] not in ('CITI_NOTICE','CITI_ATTACHMENT')]
+    def lane(t):
+        kind=t['kind']
+        if kind.startswith('SEC_'):return 0
+        if kind=='FINRA_DAILY':return 2
+        if kind.startswith(('JPM_','CITI_','BNY_')):return 3
+        return 1
+    for offset in range(4):
+        selected=(cursor+offset)%4
+        candidate=next((t for t in others if lane(t)==selected),None)
+        if candidate is not None:return candidate,(selected+1)%4
+    return ready[0],cursor
+
+
 def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sleep,deadline=None,source_kinds=None,recover_sec_identity=False):
     if type(max_requests) is not int or not 1<=max_requests<=100: raise ValueError('Bounded market requests required')
     if source_kinds is not None and (not isinstance(source_kinds,(list,tuple)) or not 1<=len(source_kinds)<=50
@@ -429,18 +445,19 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
         canary=recovery.pop(0) if recovery else None
         if not ready and canary is None: break
         t=canary or ready[0]
-        # Large ADR catalogs must not starve prices, shares or index backfill.
-        if canary is None and sent%5==4 and t['kind'] in ('CITI_NOTICE','CITI_ATTACHMENT'):
-            t=next((candidate for candidate in ready if candidate['kind'] not in ('CITI_NOTICE','CITI_ATTACHMENT')),t)
+        # Persist both positions in the signed checkpoint: even one-request
+        # runs must reach the reserved slot. An older non-ADR backlog must
+        # not monopolize it while SEC, OTC or depositary evidence is ready.
+        slot=state['cursors'].get('reference_request_slot',0)
+        if canary is None and slot==4:
+            t,position=_reserved_reference(ready,state['cursors'].get('reference_other_lane',0))
+            state['cursors']['reference_other_lane']=position
         elif t['kind'] in ('CITI_NOTICE','CITI_ATTACHMENT'):
-            preferred='CITI_NOTICE' if sent%5==0 else 'CITI_ATTACHMENT'
+            preferred='CITI_NOTICE' if slot==0 else 'CITI_ATTACHMENT'
             t=next((candidate for candidate in ready if candidate['kind']==preferred),t)
-        # A short, bounded JPM catalog chain shares half of the other-source
-        # lane; a large directory cannot starve all other reference categories.
-        if canary is None and sent%10==4:
-            t=next((candidate for candidate in ready if candidate['kind'] in ('JPM_UNIVERSE','JPM_ACTIONS')),t)
         key=s.digest(t); host=urlsplit(t['url']).hostname
         status,headers,body=fetch(t); sent+=1; state['requests'][host]=state['requests'].get(host,0)+1
+        state['cursors']['reference_request_slot']=(slot+1)%5
         empty_finra=t['kind']=='FINRA_DAILY' and status==204 and not body
         if empty_finra:status,body=200,b'[]'
         reason=None

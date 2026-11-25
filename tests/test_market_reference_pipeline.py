@@ -158,6 +158,41 @@ def test_citi_backfill_keeps_a_slot_for_other_reference_categories():
     assert calls[:4]==['CITI_NOTICE']*4 and calls[4]=='FRED_INDEX'
 
 
+def test_reserved_reference_slot_rotates_past_an_older_non_citi_backlog(monkeypatch):
+    state=p.initial_state('2026-11-23')
+    state['pending']=([s.task('CITI_NOTICE',str(n)) for n in range(1,40)]
+        +[s.task('LSEG_CATALOG',str(y)) for y in range(2026,2009,-1)]
+        +[s.task('SEC_SUBMISSIONS','0000320193'),s.task('FINRA_DAILY',day='2026-11-20'),s.task('JPM_UNIVERSE')])
+    calls=[]
+    monkeypatch.setattr(p,'plan',lambda state,*args:state)
+    monkeypatch.setattr(s,'validate_response',lambda *args:None)
+    monkeypatch.setattr(s,'discovered',lambda *args:[])
+    def fetch(t):
+        calls.append(t['kind'])
+        return 200,{},b'{}'
+    result=p.collect(state,bootstrap(),now=NOW,max_requests=20,fetch=fetch,sleep=lambda _:None)
+    assert calls[4::5]==['SEC_SUBMISSIONS','LSEG_CATALOG','FINRA_DAILY','JPM_UNIVERSE']
+    assert result['state']['pending'] and len(state['pending'])==59
+
+
+def test_reference_reservation_survives_one_request_batches_and_cooldowns(monkeypatch):
+    state=p.initial_state('2026-11-23')
+    blocked=s.task('SEC_SUBMISSIONS','0000320193')
+    state['pending']=[s.task('CITI_NOTICE',str(n)) for n in range(1,20)]+[blocked,s.task('FINRA_DAILY',day='2026-11-20')]
+    state['cooldowns']['data.sec.gov']=dict(reason='HTTP_403',retry_at='2026-11-26T00:00:00+00:00')
+    calls=[]
+    monkeypatch.setattr(p,'plan',lambda state,*args:state)
+    monkeypatch.setattr(s,'validate_response',lambda *args:None)
+    monkeypatch.setattr(s,'discovered',lambda *args:[])
+    def fetch(t):
+        calls.append(t['kind'])
+        return 200,{},b'{}'
+    for _ in range(5):
+        state=p.collect(state,bootstrap(),now=NOW,max_requests=1,fetch=fetch,sleep=lambda _:None)['state']
+    assert calls==['CITI_NOTICE']*4+['FINRA_DAILY']
+    assert blocked in state['pending'] and state['cooldowns']['data.sec.gov']['reason']=='HTTP_403'
+
+
 def test_attachment_targets_preserve_issuer_and_fund_targets_and_are_idempotent(tmp_path):
     path=tmp_path/'bootstrap.json';initial=dict(version=2,ciks=['0000320193'],research_targets=[])
     path.write_text(json.dumps(initial))
