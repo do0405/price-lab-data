@@ -53,6 +53,29 @@ def yahoo_body(symbol='AATC',currency='USD'):
         'timestamp':[stamp],'indicators':{'quote':[{'close':[2.5],'volume':[100]}]}}]}}).encode()
 
 
+def stockanalysis_body(symbol='CMLSQ',currency='USD',day='2026-10-16',price='.01118'):
+    return f'<html><script>const data={{curr:{{main:"{currency}",price:"{currency}"}},quote:{{p:{price},v:46325,td:"{day}",uid:"OTC-{symbol}",symbol:"OTC-{symbol}",u:"At close: Oct 16, 2026"}}}};</script></html>'.encode()
+
+
+def test_public_secondary_quote_is_dated_and_scoped_without_executing_javascript():
+    t=s.task('STOCKANALYSIS_PRICE','CMLSQ','2026-11-25')
+    assert t['url']=='https://stockanalysis.com/quote/otc/CMLSQ/'
+    r=s.stockanalysis_quote(t,stockanalysis_body())
+    assert r['price']==.01118 and r['price_asof']=='2026-10-16' and r['currency']=='USD'
+    for body in [stockanalysis_body(symbol='OTHER'),stockanalysis_body(currency='CAD'),stockanalysis_body(day='2026-11-26'),stockanalysis_body(price='NaN'),b'<html>Access denied</html>']:
+        with pytest.raises(ValueError):s.stockanalysis_quote(t,body)
+
+
+def test_sec_name_catalog_has_fixed_endpoint_and_does_not_expand_other_response_limits():
+    t=s.task('SEC_CIK_NAMES')
+    assert t['url']=='https://www.sec.gov/Archives/edgar/cik-lookup-data.txt'
+    body=b':0001003197:\nEXAMPLE: HOLDINGS INC:0001234567:\nOLD COMPANY CORP:0000000001:\n'
+    assert list(s.sec_cik_names(body))==[('EXAMPLE: HOLDINGS INC','0001234567'),('OLD COMPANY CORP','0000000001')]
+    s.validate_response(t,body)
+    assert s.response_limit(t)==42*1024**2 and s.response_limit(s.task('SEC_MAP'))==s.MAX_BODY
+    with pytest.raises(ValueError):s.validate_response(t,b'<html>SEC Access Denied</html>')
+
+
 def test_yahoo_price_is_an_exact_bounded_dated_public_quote():
     t=s.task('YAHOO_PRICE','AATC','2026-11-24');s.validate_task(t)
     assert t['url']=='https://query1.finance.yahoo.com/v8/finance/chart/AATC'

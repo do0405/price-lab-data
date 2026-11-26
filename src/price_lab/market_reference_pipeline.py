@@ -361,6 +361,7 @@ def plan(state, bootstrap, now):
         key=s.digest(t)
         checked=state['checked'].get(key,{})
         if key not in state['checked'] or (refresh and checked.get('checked_at','')<(now-timedelta(days=7)).isoformat()): pending.setdefault(key,t)
+    add(s.task('SEC_CIK_NAMES'),refresh=True)
     window=today+f'T{now.hour//6*6:02d}'
     if state['cursors'].get('current_window')!=window:
         current=[s.task('FUND_LATEST',f) for f in s.FUNDS]
@@ -431,6 +432,11 @@ def plan(state, bootstrap, now):
         if symbol not in pending_quotes and stamp.get('retry_at','')<=now.isoformat():
             t=s.task('YAHOO_PRICE',symbol,through);key=s.digest(t)
             if key not in state['checked']:pending.setdefault(key,t)
+        primary_quote=state['cursors'].get('price_quote_checks',{}).get(symbol,{})
+        secondary=state['cursors'].get('secondary_price_quote_checks',{}).get(symbol,{})
+        if primary_quote.get('status') in ('HTTP_404','RESPONSE_CONTRACT') and secondary.get('retry_at','')<=now.isoformat():
+            t=s.task('STOCKANALYSIS_PRICE',symbol,through);key=s.digest(t)
+            if key not in state['checked']:pending.setdefault(key,t)
     state['pending']=list({**primary,**urgent,**pending}.values())
     return s.validate_state(state)
 
@@ -467,7 +473,7 @@ class Fetcher:
                 chunks=[]; total=0
                 for chunk in response.iter_content(1024**2):
                     total+=len(chunk)
-                    if total>s.MAX_BODY: raise ValueError('Oversized provider response')
+                    if total>s.response_limit(task): raise ValueError('Oversized provider response')
                     chunks.append(chunk)
                 return response.status_code,dict(response.headers),b''.join(chunks)
         except requests.RequestException as exc:
@@ -485,7 +491,7 @@ def _reserved_reference(ready, cursor):
     others=[t for t in ready if t['kind'] not in ('CITI_NOTICE','CITI_ATTACHMENT')]
     def lane(t):
         kind=t['kind']
-        if kind=='YAHOO_PRICE':return 4
+        if kind in ('YAHOO_PRICE','STOCKANALYSIS_PRICE'):return 4
         if kind.startswith('SEC_'):return 0
         if kind=='FINRA_DAILY':return 2
         if kind.startswith(('JPM_','CITI_','BNY_')):return 3
@@ -557,16 +563,22 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
                 state['cooldowns'][host]['diagnostic']=s.sec_failure_diagnostic(status,headers,body)
             # A missing historical snapshot does not block current snapshots
             # from the same fund host. Its task remains a dated source gap.
-            if status in (400,404) or (status==200 and reason=='RESPONSE_CONTRACT' and not body.lstrip().lower().startswith((b'<html',b'<!doctype'))):
+            secondary_absent=t['kind']=='STOCKANALYSIS_PRICE' and (status in (301,302,404) or reason=='RESPONSE_CONTRACT')
+            if status in (400,404) or secondary_absent or (status==200 and reason=='RESPONSE_CONTRACT' and not body.lstrip().lower().startswith((b'<html',b'<!doctype'))):
                 state['cooldowns'].pop(host,None)
                 state['checked'][key]=dict(status='HISTORY_UNAVAILABLE' if t['kind']=='FUND' else reason,retry_at=(now+timedelta(days=30 if t['kind']=='FUND' else 1)).isoformat(),task=t)
                 state['pending']=[x for x in state['pending'] if s.digest(x)!=key]
                 if t['kind']=='YAHOO_PRICE':
                     state['cursors'].setdefault('price_quote_checks',{})[t['entity']]=dict(retry_at=(now+timedelta(days=30)).isoformat(),status=reason)
+                if t['kind']=='STOCKANALYSIS_PRICE':
+                    state['cursors'].setdefault('secondary_price_quote_checks',{})[t['entity']]=dict(retry_at=(now+timedelta(days=30)).isoformat(),status=reason)
         else:
             state['cooldowns'].pop(host,None)
             if t['kind']=='YAHOO_PRICE':
                 state['cursors'].setdefault('price_quote_checks',{})[t['entity']]=dict(retry_at=(now+timedelta(days=7)).isoformat(),status='COLLECTED')
+            if t['kind']=='STOCKANALYSIS_PRICE':
+                quote=s.stockanalysis_quote(t,body);age=(date.fromisoformat(t['requested_date'])-date.fromisoformat(quote['price_asof'])).days
+                state['cursors'].setdefault('secondary_price_quote_checks',{})[t['entity']]=dict(retry_at=(now+timedelta(days=30 if age>30 else 7)).isoformat(),status='COLLECTED')
             if canary is not None:
                 # Explicit operator recovery verifies the same official host
                 # with a declared identity. Failed probes never lift denial.

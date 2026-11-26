@@ -22,6 +22,46 @@ NASDAQ_DIRECTORIES={'nasdaq':'https://www.nasdaqtrader.com/dynamic/SymDir/nasdaq
                     'other':'https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt'}
 LSEG = 'https://www.lseg.com/content/lseg/en_us/ftse-russell/index-resources/notices/jcr:content/root/container/page_content_region/page-content-region/section/section-fw/index_announcements_.indexannouncement.json'
 MAX_BODY = 28 * 1024**2
+
+
+def response_limit(request):
+    # The complete SEC name directory is ~39 MiB. Other provider contracts
+    # keep their original limit; this still fits one bounded encrypted batch.
+    return 42*1024**2 if request['kind']=='SEC_CIK_NAMES' else MAX_BODY
+
+
+def sec_cik_names(body):
+    for line in body.decode('utf-8-sig').splitlines():
+        if not line.strip():continue
+        fields=line.rsplit(':',2)
+        if len(fields)!=3 or fields[2] or not re.fullmatch(r'[0-9]{10}',fields[1]):
+            raise ValueError('SEC name/CIK line contract mismatch')
+        if fields[0].strip():yield fields[0].strip(),fields[1]
+
+
+def stockanalysis_quote(request,body):
+    """Read a flat public quote literal; never evaluate the page's scripts."""
+    text=body.decode('utf-8-sig')
+    def field(value,key):
+        m=re.search(r'(?:^|,)\s*'+re.escape(key)+r':("(?:\\.|[^"\\])*"|-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|true|false|null)(?=\s*(?:,|$))',value)
+        if not m:return None
+        token=m[1]
+        return json.loads(token) if token.startswith('"') or token in ('true','false','null') else float(token)
+    currencies=re.findall(r'\bcurr:\{([^{}]{1,1000})\}',text)
+    if len(currencies)!=1 or field(currencies[0],'price')!='USD':raise ValueError('Explicit USD quote currency required')
+    candidates=[]
+    for value in re.findall(r'\bquote:\{([^{}]{1,6000})\}',text):
+        if field(value,'uid')!='OTC-'+request['entity'] or field(value,'symbol')!='OTC-'+request['entity']:continue
+        day=field(value,'td');price=field(value,'p');volume=field(value,'v')
+        if not isinstance(day,str):continue
+        date.fromisoformat(day)
+        if not '2010-01-01'<=day<=request['requested_date']:continue
+        if type(price) not in (int,float) or not math.isfinite(price) or price<=0:continue
+        if type(volume) not in (int,float) or not math.isfinite(volume) or volume<0:continue
+        candidates.append(dict(symbol=request['entity'],currency='USD',price_asof=day,price=price,volume=volume,
+            price_basis='SECONDARY_PUBLIC_QUOTE_SPLIT_BASIS_UNVERIFIED',provider='STOCKANALYSIS_PUBLIC_PAGE'))
+    if len(candidates)!=1:raise ValueError('One exact dated public quote required')
+    return candidates[0]
 NASDAQ_REPORTS=('https://indexes.nasdaqomx.com/docs/202601%20NDX%20Reconstitution%20and%20Performance%20Highlights.pdf',)
 LSEG_WEIGHT_CATALOG='https://www.lseg.com/content/lseg/en_us/ftse-russell/index-resources/constituent-weights/jcr:content/root/container/page_content_region/page-content-region/section/section-fw/data_table.constituentsandweights.json'
 LSEG_WEIGHT_DOWNLOAD='https://research.ftserussell.com/analytics/factsheets/Home/DownloadConstituentsWeights/'
@@ -143,6 +183,9 @@ def task(kind, entity='', day='', page=0):
             params = dict(bld='dbms/MDC/STAT/standard/MDCSTAT03901', mktId={'KOSPI': 'STK', 'KOSDAQ': 'KSQ'}[entity], trdDd=day.replace('-', ''), money='1', csvxls_isNo='false')
     elif kind == 'SEC_MAP':
         url='https://www.sec.gov/files/company_tickers_exchange.json'
+    elif kind=='SEC_CIK_NAMES':
+        if entity or day or page:raise ValueError('Fixed SEC name directory required')
+        url='https://www.sec.gov/Archives/edgar/cik-lookup-data.txt'
     elif kind=='NASDAQ_DIRECTORY':
         if entity not in NASDAQ_DIRECTORIES or day or page:raise ValueError('Exact Nasdaq directory required')
         url=NASDAQ_DIRECTORIES[entity]
@@ -155,6 +198,10 @@ def task(kind, entity='', day='', page=0):
         end=int(datetime.fromisoformat(day).replace(tzinfo=timezone.utc).timestamp())+86400
         url='https://query1.finance.yahoo.com/v8/finance/chart/'+entity
         params={'period1':end-8*86400,'period2':end,'interval':'1d','includePrePost':'false'}
+    elif kind=='STOCKANALYSIS_PRICE':
+        if not re.fullmatch(r'[A-Z][A-Z0-9.-]{0,19}',entity) or not day or day<'2010-01-01' or page:
+            raise ValueError('Exact dated OTC quote target required')
+        url='https://stockanalysis.com/quote/otc/'+entity+'/'
     elif kind=='SEC_PRIMARY':
         if page:raise ValueError('SEC primary document has no page cursor')
         meta=sec_primary_metadata(dict(entity=entity,requested_date=day))
@@ -463,9 +510,14 @@ def yahoo_quote(request,body):
 
 def validate_response(request, body):
     validate_task(request)
-    if not isinstance(body,bytes) or not 0<len(body)<=MAX_BODY: raise ValueError('Reference body bound')
+    if not isinstance(body,bytes) or not 0<len(body)<=response_limit(request): raise ValueError('Reference body bound')
     kind=request['kind']
     if kind=='YAHOO_PRICE':yahoo_quote(request,body)
+    elif kind=='STOCKANALYSIS_PRICE':stockanalysis_quote(request,body)
+    elif kind=='SEC_CIK_NAMES':
+        if not any(sec_cik_names(body)):raise ValueError('Nonempty SEC company name directory required')
+        # Validate the complete file, not just its first usable row.
+        for _ in sec_cik_names(body):pass
     elif kind in ('JPM_UNIVERSE','JPM_ACTIONS'):jpm_page(request,body)
     elif kind=='FINRA_DAILY':
         rows=json.loads(body)
@@ -620,9 +672,10 @@ def validate_payload(payload):
         validate_task(record['task']); _hash(record['body_sha256'])
         if _instant(record['retrieved_at'])>stamp: raise ValueError('Future retrieval')
         encoded=record['body_base64']
-        if not isinstance(encoded,str) or len(encoded)>MAX_BODY*4//3+4: raise ValueError('Encoded body bound')
+        limit=response_limit(record['task'])
+        if not isinstance(encoded,str) or len(encoded)>limit*4//3+4: raise ValueError('Encoded body bound')
         body=base64.b64decode(encoded,validate=True)
-        if not 0<len(body)<=MAX_BODY or hashlib.sha256(body).hexdigest()!=record['body_sha256']: raise ValueError('Body integrity failure')
+        if not 0<len(body)<=limit or hashlib.sha256(body).hexdigest()!=record['body_sha256']: raise ValueError('Body integrity failure')
         key=digest(record['task'])
         if key in ids: raise ValueError('Duplicate task record')
         ids.add(key)
