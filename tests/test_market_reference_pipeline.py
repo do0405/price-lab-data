@@ -12,6 +12,23 @@ from test_market_reference_sources import fund_body,payload,jpm_body
 NOW=datetime(2026,11,24,tzinfo=timezone.utc)
 
 
+def test_primary_context_survives_batch_boundary_and_is_pruned_after_completion(monkeypatch):
+    monkeypatch.setattr(p,'plan',lambda *args:None)
+    parent=s.task('SEC_SUBMISSIONS','0000000001')
+    recent=dict(form=['N-CSR'],filingDate=['2026-09-03'],reportDate=['2026-06-30'],
+        accessionNumber=['0000000001-26-000001'],primaryDocument=['fund.htm'])
+    body=json.dumps(dict(cik=1,name='Example Fund',tickers=['FUND'],filings={'recent':recent})).encode()
+    state=p.initial_state('2026-11-23');state['pending']=[parent]
+    b=bootstrap();b['capitalization_ciks']=['0000000001']
+    out=p.collect(state,b,max_requests=1,now=NOW,fetch=lambda t:(200,{},body),sleep=lambda _:None)
+    child=out['state']['pending'][0];key=s.digest(child)
+    assert out['state']['cursors']['primary_filing_contexts'][key]['tickers']==['FUND']
+    out=p.collect(out['state'],b,max_requests=1,now=NOW,fetch=lambda t:(200,{},b'<html><p>report</p></html>'),sleep=lambda _:None)
+    assert key in out['state']['cursors']['primary_filing_contexts']
+    out=p.collect(out['state'],b,max_requests=1,now=NOW,fetch=lambda t:None,sleep=lambda _:None)
+    assert out['state']['cursors']['primary_filing_contexts']=={}
+
+
 def test_nasdaq_screener_uses_public_json_request_headers(monkeypatch):
     fetcher=p.Fetcher();calls=[]
     class Response:

@@ -503,6 +503,10 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
             or any(not isinstance(kind,str) or not re.fullmatch(r'[A-Z_]{1,50}',kind) for kind in source_kinds)):
         raise ValueError('Bounded source kind selection required')
     fixed=now; now=now or datetime.now(timezone.utc); state=copy.deepcopy(s.validate_state(state)); records=[]; sent=0; unchanged=0
+    pending_keys={s.digest(t) for t in state['pending']}
+    contexts=state['cursors'].setdefault('primary_filing_contexts',{})
+    for k in list(contexts):
+        if k not in pending_keys:contexts.pop(k)
     # Legacy 404 endpoint failures are task-scoped. Keep authentication denials
     # intact; an absent catalog URL does not deny all notices on that host.
     for host,cooldown in list(state['cooldowns'].items()):
@@ -599,6 +603,8 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
             children=(s.discovered(t,body,primary=True,through=bootstrap['through']) if targeted else s.discovered(t,body))
             for child in children:
                 child_key=s.digest(child)
+                context=s.primary_filing_context(t,body,child)
+                if context is not None:contexts[child_key]=context
                 stamp=state['checked'].get(child_key,{}).get('checked_at')
                 refresh=(changed and t['kind'] in ('LSEG_CATALOG','SP_ARCHIVE') and
                          (child['kind'] in ('LSEG_CATALOG','SP_ARCHIVE') or

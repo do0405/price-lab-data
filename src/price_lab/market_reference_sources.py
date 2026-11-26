@@ -86,6 +86,31 @@ def sec_primary_metadata(request):
     return dict(cik=match[1],accession=match[2],form=match[3],primary_document=match[4],filed_date=request['requested_date'])
 
 
+def primary_filing_context(parent,body,child):
+    """Carry exact official submission fields, without changing request IDs."""
+    if parent['kind']!='SEC_SUBMISSIONS' or child['kind']!='SEC_PRIMARY':return None
+    meta=sec_primary_metadata(child)
+    if meta['cik']!=parent['entity']:return None
+    value=json.loads(body)
+    if str(value.get('cik','')).zfill(10)!=meta['cik']:return None
+    recent=value.get('filings',{}).get('recent',{})
+    for n,accession in enumerate(recent.get('accessionNumber',[])):
+        def field(k):
+            values=recent.get(k,[])
+            return values[n] if n<len(values) else None
+        if (accession,field('form'),field('primaryDocument'),field('filingDate'))!=(
+                meta['accession'],meta['form'],meta['primary_document'],meta['filed_date']):continue
+        report=field('reportDate')
+        if report:
+            try:date.fromisoformat(report)
+            except (ValueError,TypeError):return None
+            if report>meta['filed_date']:return None
+        return dict(report_date=report,issuer_name=value.get('name',''),
+            tickers=[x for x in value.get('tickers',[]) if isinstance(x,str) and re.fullmatch(r'[A-Z][A-Z0-9.-]{0,19}',x)],
+            parent_source_id=hashlib.sha256(body).hexdigest())
+    return None
+
+
 def task(kind, entity='', day='', page=0):
     """Only fixed official endpoints; discovered notices have narrow URL scopes."""
     if day:

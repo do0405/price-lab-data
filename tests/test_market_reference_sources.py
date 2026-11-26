@@ -34,6 +34,19 @@ def test_fund_reports_are_discovered_for_continuous_share_updates():
     assert {s.sec_primary_metadata(t)['form'] for t in tasks}=={'N-CSRS','N-CSR'}
 
 
+def test_primary_context_reuses_exact_submissions_without_changing_task_identity():
+    recent=dict(form=['N-CSRS'],filingDate=['2026-09-03'],reportDate=['2026-06-30'],
+        accessionNumber=['0001193125-26-381557'],primaryDocument=['semi.htm'])
+    body=json.dumps(dict(cik=1160864,name='Example Income Fund',tickers=['FUND'],filings={'recent':recent})).encode()
+    parent=s.task('SEC_SUBMISSIONS','0001160864');child=s.task('SEC_PRIMARY','0001160864:0001193125-26-381557:N-CSRS:semi.htm','2026-09-03')
+    context=s.primary_filing_context(parent,body,child)
+    assert context['report_date']=='2026-06-30' and context['tickers']==['FUND']
+    assert context['issuer_name']=='Example Income Fund'
+    assert context['parent_source_id']==hashlib.sha256(body).hexdigest()
+    other=s.task('SEC_PRIMARY','0001160864:0001193125-26-381558:N-CSRS:other.htm','2026-09-03')
+    assert s.primary_filing_context(parent,body,other) is None
+
+
 def yahoo_body(symbol='AATC',currency='USD'):
     stamp=int(datetime(2026,11,24,14,30,tzinfo=timezone.utc).timestamp())
     return json.dumps({'chart':{'error':None,'result':[{'meta':{'symbol':symbol,'currency':currency},
