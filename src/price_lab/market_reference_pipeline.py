@@ -134,15 +134,20 @@ def enqueue_jpm_documents(config_path,ids):
     return dict(status='UPDATED',documents=len(merged),added=len(merged)-len(config.get('jpm_document_ids',[])))
 
 
-def enqueue_capitalization_targets(config_path,ciks,documents=()):
+def enqueue_capitalization_targets(config_path,ciks,documents=(),*,replace_priority=False):
     """A small daily priority lane; do not rewind the 16k-issuer backfill."""
     path=Path(config_path);config=json.loads(path.read_text(encoding='utf-8'));_config_targets(config)
-    priority=sorted(set(config.get('capitalization_ciks',[]))|set(ciks))
+    prior=config.get('capitalization_ciks',[])
+    priority=sorted(set(ciks) if replace_priority else set(prior)|set(ciks))
     combined={(d['entity'],d['filed_date']):d for d in config.get('sec_primary_documents',[])}
     for document in documents:combined[(document['entity'],document['filed_date'])]=document
     updated={**config,'version':max(5,config['version']),'research_targets':config.get('research_targets',[]),
         'depositary_attachment_ids':config.get('depositary_attachment_ids',[]),'jpm_document_ids':config.get('jpm_document_ids',[]),
         'capitalization_ciks':priority,'sec_primary_documents':sorted(combined.values(),key=lambda x:(x['filed_date'],x['entity']))}
+    if replace_priority:
+        # A displaced priority target still belongs to the resumable general
+        # scan. Preserve its prefix so the saved position never shifts.
+        updated['ciks']=list(dict.fromkeys([*config['ciks'],*prior,*priority]))
     _config_targets(updated)
     if updated==config:return dict(status='UNCHANGED',priority_issuers=len(priority),primary_documents=len(combined))
     _atomic(path,updated)
@@ -637,7 +642,9 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
                 if child_key not in existing and (child_key not in state['seen'] or refresh):
                     state['pending'].append(child); existing.add(child_key)
         if sum(len(r['body_base64']) for r in records)>60*1024**2: break
-        sleep(1)
+        # The secondary site rate-limits bursts; keep a conservative cadence
+        # in addition to honoring its persisted 429/Retry-After cooldown.
+        sleep(6 if t['kind']=='STOCKANALYSIS_PRICE' else 1)
     return dict(state=state,records=records,requests=sent,unchanged=unchanged)
 
 

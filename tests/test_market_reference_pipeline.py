@@ -40,6 +40,23 @@ def test_secondary_quotes_resume_only_for_missing_primary_and_back_off_inactive_
     assert out['state']['cooldowns']=={} and out['state']['pending']==[]
 
 
+def test_secondary_quote_cadence_and_retry_after_survive_resume(monkeypatch):
+    from datetime import timedelta
+    from test_market_reference_sources import stockanalysis_body
+    monkeypatch.setattr(p,'plan',lambda *a:None)
+    t=s.task('STOCKANALYSIS_PRICE','CMLSQ','2026-11-23')
+    state=p.initial_state('2026-11-23');state['pending']=[t];waits=[]
+    out=p.collect(state,bootstrap(),max_requests=1,now=NOW,
+        fetch=lambda t:(200,{},stockanalysis_body()),sleep=waits.append)
+    assert waits==[6]
+    state=p.initial_state('2026-11-23');state['pending']=[t]
+    out=p.collect(state,bootstrap(),max_requests=1,now=NOW,
+        fetch=lambda t:(429,{'Retry-After':'1800'},b''),sleep=lambda _:None)
+    assert out['state']['cooldowns']['stockanalysis.com']['retry_at']==(NOW+timedelta(seconds=1800)).isoformat()
+    assert p.collect(out['state'],bootstrap(),max_requests=1,now=NOW+timedelta(minutes=29),
+        fetch=lambda t:pytest.fail('Retry-After ignored'),sleep=lambda _:None)['requests']==0
+
+
 def test_primary_context_survives_batch_boundary_and_is_pruned_after_completion(monkeypatch):
     monkeypatch.setattr(p,'plan',lambda *args:None)
     parent=s.task('SEC_SUBMISSIONS','0000000001')
@@ -143,6 +160,20 @@ def test_capitalization_targets_are_prioritized_without_resetting_scan_or_other_
     assert state['cursors']['sec']==1
     assert next(t for t in state['pending'] if t['kind']!='SEC_CIK_NAMES')['kind']=='SEC_PRIMARY'
     assert any(t['kind']=='SEC_SUBMISSIONS' and t['entity']=='0001023128' for t in state['pending'])
+
+
+def test_priority_refocus_keeps_displaced_issuers_and_existing_queues(tmp_path):
+    path=tmp_path/'config.json'
+    path.write_text(json.dumps(dict(version=1,ciks=['0000000009'])))
+    p.enqueue_price_symbols(path,['AATC'])
+    document=dict(entity='0000000001:0000000001-26-000001:10-K:old.htm',filed_date='2026-01-01')
+    p.enqueue_capitalization_targets(path,['0000000001'],[document])
+    p.enqueue_capitalization_targets(path,['0000000002'],replace_priority=True)
+    cfg=json.loads(path.read_text())
+    assert cfg['capitalization_ciks']==['0000000002']
+    assert cfg['ciks']==['0000000009','0000000001','0000000002']
+    assert cfg['sec_primary_documents']==[document] and cfg['price_symbols']==['AATC']
+    assert p.enqueue_capitalization_targets(path,['0000000002'],replace_priority=True)['status']=='UNCHANGED'
 
 
 def test_sec_identity_uses_configured_environment_even_with_other_provider_keys(monkeypatch):

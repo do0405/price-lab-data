@@ -1,6 +1,7 @@
 """Public reference/secondary quote contracts; no database or credential I/O."""
 import base64
 import csv
+from decimal import Decimal,InvalidOperation
 from datetime import date, datetime, timezone
 import hashlib
 import io
@@ -51,6 +52,15 @@ def stockanalysis_quote(request,body):
         return json.loads(token) if token.startswith('"') or token in ('true','false','null') else float(token)
     currencies=re.findall(r'\bcurr:\{([^{}]{1,1000})\}',text)
     if len(currencies)!=1 or field(currencies[0],'price')!='USD':raise ValueError('Explicit USD quote currency required')
+    declared=set(re.findall(r'\bexchange_symbol:"([A-Z][A-Z0-9.-]{0,19})"',text))
+    if declared!={request['entity']}:raise ValueError('Exact main-page exchange symbol required')
+    capital=None
+    tokens=re.findall(r'\bmarketCap:(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)',text)
+    if field(currencies[0],'main')=='USD' and len(tokens)==1:
+        try:
+            value=Decimal(tokens[0])
+            if value.is_finite() and value>0:capital=str(value)
+        except InvalidOperation:pass
     candidates=[]
     for value in re.findall(r'\bquote:\{([^{}]{1,6000})\}',text):
         if field(value,'uid')!='OTC-'+request['entity'] or field(value,'symbol')!='OTC-'+request['entity']:continue
@@ -61,7 +71,8 @@ def stockanalysis_quote(request,body):
         if type(price) not in (int,float) or not math.isfinite(price) or price<=0:continue
         if type(volume) not in (int,float) or not math.isfinite(volume) or volume<0:continue
         candidates.append(dict(symbol=request['entity'],currency='USD',price_asof=day,price=price,volume=volume,
-            price_basis='SECONDARY_PUBLIC_QUOTE_SPLIT_BASIS_UNVERIFIED',provider='STOCKANALYSIS_PUBLIC_PAGE'))
+            price_basis='SECONDARY_PUBLIC_QUOTE_SPLIT_BASIS_UNVERIFIED',provider='STOCKANALYSIS_PUBLIC_PAGE',
+            market_cap_usd=capital,capitalization_basis='CURRENT_AT_RETRIEVAL_NOT_HISTORICAL'))
     if len(candidates)!=1:raise ValueError('One exact dated public quote required')
     return candidates[0]
 NASDAQ_REPORTS=('https://indexes.nasdaqomx.com/docs/202601%20NDX%20Reconstitution%20and%20Performance%20Highlights.pdf',)

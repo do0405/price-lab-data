@@ -54,7 +54,7 @@ def yahoo_body(symbol='AATC',currency='USD'):
 
 
 def stockanalysis_body(symbol='CMLSQ',currency='USD',day='2026-10-16',price='.01118'):
-    return f'<html><script>const data={{curr:{{main:"{currency}",price:"{currency}"}},quote:{{p:{price},v:46325,td:"{day}",uid:"OTC-{symbol}",symbol:"OTC-{symbol}",u:"At close: Oct 16, 2026"}}}};</script></html>'.encode()
+    return f'<html><script>const data={{exchange_symbol:"{symbol}",curr:{{main:"{currency}",price:"{currency}"}},quote:{{p:{price},v:46325,td:"{day}",uid:"OTC-{symbol}",symbol:"OTC-{symbol}",u:"At close: Oct 16, 2026"}}}};</script></html>'.encode()
 
 
 def test_public_secondary_quote_is_dated_and_scoped_without_executing_javascript():
@@ -64,6 +64,9 @@ def test_public_secondary_quote_is_dated_and_scoped_without_executing_javascript
     assert r['price']==.01118 and r['price_asof']=='2026-10-16' and r['currency']=='USD'
     for body in [stockanalysis_body(symbol='OTHER'),stockanalysis_body(currency='CAD'),stockanalysis_body(day='2026-11-26'),stockanalysis_body(price='NaN'),b'<html>Access denied</html>']:
         with pytest.raises(ValueError):s.stockanalysis_quote(t,body)
+    with pytest.raises(ValueError):s.stockanalysis_quote(t,stockanalysis_body().replace(b'exchange_symbol:"CMLSQ"',b'exchange_symbol:"OTHER"'))
+    cap=s.stockanalysis_quote(t,stockanalysis_body().replace(b'quote:{',b'marketCap:197529,quote:{'))
+    assert cap['market_cap_usd']=='197529' and cap['capitalization_basis']=='CURRENT_AT_RETRIEVAL_NOT_HISTORICAL'
 
 
 def test_sec_name_catalog_has_fixed_endpoint_and_does_not_expand_other_response_limits():
