@@ -140,7 +140,7 @@ def enqueue_capitalization_targets(config_path,ciks,documents=()):
     priority=sorted(set(config.get('capitalization_ciks',[]))|set(ciks))
     combined={(d['entity'],d['filed_date']):d for d in config.get('sec_primary_documents',[])}
     for document in documents:combined[(document['entity'],document['filed_date'])]=document
-    updated={**config,'version':5,'research_targets':config.get('research_targets',[]),
+    updated={**config,'version':max(5,config['version']),'research_targets':config.get('research_targets',[]),
         'depositary_attachment_ids':config.get('depositary_attachment_ids',[]),'jpm_document_ids':config.get('jpm_document_ids',[]),
         'capitalization_ciks':priority,'sec_primary_documents':sorted(combined.values(),key=lambda x:(x['filed_date'],x['entity']))}
     _config_targets(updated)

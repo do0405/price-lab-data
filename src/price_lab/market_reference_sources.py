@@ -427,7 +427,7 @@ def yahoo_quotes(request,body):
         volume=volumes[i] if i<len(volumes) else None
         if type(volume) not in (int,float) or not math.isfinite(volume) or volume<0:volume=None
         accepted.append({'symbol':meta['symbol'],'currency':'USD','price':close,'price_asof':on,
-            'reported_volume':volume,'price_basis':'PUBLIC_UNADJUSTED_DAILY_CLOSE'})
+            'reported_volume':volume,'price_basis':'PROVIDER_DAILY_CLOSE_SPLIT_BASIS_UNVERIFIED'})
     if not accepted:raise ValueError('Positive dated reference quote required')
     return accepted
 
