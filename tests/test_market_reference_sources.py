@@ -34,6 +34,21 @@ def test_fund_reports_are_discovered_for_continuous_share_updates():
     assert {s.sec_primary_metadata(t)['form'] for t in tasks}=={'N-CSRS','N-CSR'}
 
 
+def yahoo_body(symbol='AATC',currency='USD'):
+    stamp=int(datetime(2026,11,24,14,30,tzinfo=timezone.utc).timestamp())
+    return json.dumps({'chart':{'error':None,'result':[{'meta':{'symbol':symbol,'currency':currency},
+        'timestamp':[stamp],'indicators':{'quote':[{'close':[2.5],'volume':[100]}]}}]}}).encode()
+
+
+def test_yahoo_price_is_an_exact_bounded_dated_public_quote():
+    t=s.task('YAHOO_PRICE','AATC','2026-11-24');s.validate_task(t)
+    assert t['url']=='https://query1.finance.yahoo.com/v8/finance/chart/AATC'
+    s.validate_response(t,yahoo_body())
+    with pytest.raises(ValueError):s.task('YAHOO_PRICE','../secret','2026-11-24')
+    with pytest.raises(ValueError):s.validate_response(t,yahoo_body('OTHER'))
+    with pytest.raises(ValueError):s.validate_response(t,yahoo_body(currency='CAD'))
+
+
 def test_targeted_submissions_discover_bounded_primary_reports_only_when_requested():
     t=s.task('SEC_SUBMISSIONS','0001023128')
     recent=dict(form=['10-Q','10-Q','10-K','8-K','10-Q'],filingDate=['2026-10-28','2026-07-28','2026-02-28','2026-11-01','2027-01-01'],

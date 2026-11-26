@@ -49,6 +49,21 @@ def test_whole_market_snapshots_are_scheduled_without_resetting_sec_cursor():
     assert state['cursors']['sec']==42
 
 
+def test_targeted_price_quotes_resume_and_refresh_weekly(monkeypatch,tmp_path):
+    from test_market_reference_sources import yahoo_body
+    path=tmp_path/'config.json';path.write_text(json.dumps(dict(version=1,ciks=[])))
+    p.enqueue_price_symbols(path,['AATC']);cfg=json.loads(path.read_text())
+    assert cfg['price_symbols']==['AATC'] and cfg['version']==6
+    state=p.initial_state('2026-11-23');b=bootstrap();b['price_symbols']=['AATC']
+    p.plan(state,b,NOW)
+    out=p.collect(state,b,max_requests=1,now=NOW,source_kinds=['YAHOO_PRICE'],fetch=lambda t:(200,{},yahoo_body()),sleep=lambda _:None)
+    state=out['state'];p.plan(state,b,NOW)
+    assert not any(t['kind']=='YAHOO_PRICE' for t in state['pending'])
+    from datetime import timedelta
+    later=NOW+timedelta(days=8);b['through']='2026-12-01';p.plan(state,b,later)
+    assert len([t for t in state['pending'] if t['kind']=='YAHOO_PRICE'])==1
+
+
 def test_directory_footer_only_refresh_does_not_duplicate_raw_or_observations(monkeypatch):
     monkeypatch.setattr(p,'plan',lambda *args:None)
     t=s.task('NASDAQ_DIRECTORY','nasdaq');body=b'Symbol|Security Name|ETF|Test Issue\nABC|ABC Common Stock|N|N\nFile Creation Time: 1126202610:00|||\n'

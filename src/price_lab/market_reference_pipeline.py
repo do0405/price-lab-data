@@ -27,11 +27,15 @@ ASSET='market-reference.pldelta'
 
 def _config_targets(config):
     version=config.get('version')
-    if type(version) is not int or version not in (1,2,3,4,5):raise ValueError('Market bootstrap contract mismatch')
+    if type(version) is not int or version not in (1,2,3,4,5,6):raise ValueError('Market bootstrap contract mismatch')
     expected={'version','ciks'}|({'research_targets'} if version>=2 else set())|({'depositary_attachment_ids'} if version>=3 else set())|({'jpm_document_ids'} if version>=4 else set())
     if version>=5:expected|={'capitalization_ciks','sec_primary_documents'}
+    if version>=6:expected|={'price_symbols'}
     if set(config)!=expected:
         raise ValueError('Market bootstrap contract mismatch')
+    symbols=config.get('price_symbols',[])
+    if not isinstance(symbols,list) or len(symbols)>1000 or len(set(symbols))!=len(symbols):raise ValueError('Bounded unique price symbols required')
+    for symbol in symbols:s.task('YAHOO_PRICE',symbol,'2026-01-01')
     priority=config.get('capitalization_ciks',[])
     if not isinstance(priority,list) or len(priority)>500 or len(set(priority))!=len(priority) or any(not isinstance(c,str) or not re.fullmatch('[0-9]{10}',c) for c in priority):
         raise ValueError('Bounded capitalization CIKs required')
@@ -62,6 +66,16 @@ def _config_targets(config):
         if key in seen:raise ValueError('Duplicate research target')
         seen.add(key)
     return targets
+
+
+def enqueue_price_symbols(config_path,symbols):
+    path=Path(config_path);config=json.loads(path.read_text(encoding='utf-8'));_config_targets(config)
+    merged=list(dict.fromkeys([*config.get('price_symbols',[]),*symbols]))
+    updated={**config,'version':6,'price_symbols':merged}
+    for field in ('research_targets','depositary_attachment_ids','jpm_document_ids','capitalization_ciks','sec_primary_documents'):updated.setdefault(field,[])
+    _config_targets(updated)
+    if updated==config:return dict(status='UNCHANGED',symbols=len(merged),added=0)
+    _atomic(path,updated);return dict(status='UPDATED',symbols=len(merged),added=len(merged)-len(config.get('price_symbols',[])))
 
 
 def enqueue_ciks(config_path,ciks):
@@ -151,7 +165,7 @@ def bootstrap(config_path,now=None):
     return dict(through=through,kr_sessions=kr,us_month_ends=list(months.values()),
                 ciks=list(dict.fromkeys(config['ciks'])),research_targets=targets,
                 depositary_attachment_ids=config.get('depositary_attachment_ids',[]),jpm_document_ids=config.get('jpm_document_ids',[]),
-                capitalization_ciks=config.get('capitalization_ciks',[]),sec_primary_documents=config.get('sec_primary_documents',[]))
+                capitalization_ciks=config.get('capitalization_ciks',[]),sec_primary_documents=config.get('sec_primary_documents',[]),price_symbols=config.get('price_symbols',[]))
 
 
 def _atomic(path, value):
@@ -411,6 +425,12 @@ def plan(state, bootstrap, now):
             t=s.task(kind,cik);key=s.digest(t);stamp=state['checked'].get(key,{}).get('checked_at')
             if stamp is None or datetime.fromisoformat(stamp)<=now-timedelta(days=1):urgent[key]=t
     primary={k:t for k,t in pending.items() if t['kind']=='SEC_PRIMARY'}
+    pending_quotes={t['entity'] for t in pending.values() if t['kind']=='YAHOO_PRICE'}
+    for symbol in bootstrap.get('price_symbols',[]):
+        stamp=state['cursors'].get('price_quote_checks',{}).get(symbol,{})
+        if symbol not in pending_quotes and stamp.get('retry_at','')<=now.isoformat():
+            t=s.task('YAHOO_PRICE',symbol,through);key=s.digest(t)
+            if key not in state['checked']:pending.setdefault(key,t)
     state['pending']=list({**primary,**urgent,**pending}.values())
     return s.validate_state(state)
 
@@ -465,14 +485,15 @@ def _reserved_reference(ready, cursor):
     others=[t for t in ready if t['kind'] not in ('CITI_NOTICE','CITI_ATTACHMENT')]
     def lane(t):
         kind=t['kind']
+        if kind=='YAHOO_PRICE':return 4
         if kind.startswith('SEC_'):return 0
         if kind=='FINRA_DAILY':return 2
         if kind.startswith(('JPM_','CITI_','BNY_')):return 3
         return 1
-    for offset in range(4):
-        selected=(cursor+offset)%4
+    for offset in range(5):
+        selected=(cursor+offset)%5
         candidate=next((t for t in others if lane(t)==selected),None)
-        if candidate is not None:return candidate,(selected+1)%4
+        if candidate is not None:return candidate,(selected+1)%5
     return ready[0],cursor
 
 
@@ -536,8 +557,12 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
                 state['cooldowns'].pop(host,None)
                 state['checked'][key]=dict(status='HISTORY_UNAVAILABLE' if t['kind']=='FUND' else reason,retry_at=(now+timedelta(days=30 if t['kind']=='FUND' else 1)).isoformat(),task=t)
                 state['pending']=[x for x in state['pending'] if s.digest(x)!=key]
+                if t['kind']=='YAHOO_PRICE':
+                    state['cursors'].setdefault('price_quote_checks',{})[t['entity']]=dict(retry_at=(now+timedelta(days=30)).isoformat(),status=reason)
         else:
             state['cooldowns'].pop(host,None)
+            if t['kind']=='YAHOO_PRICE':
+                state['cursors'].setdefault('price_quote_checks',{})[t['entity']]=dict(retry_at=(now+timedelta(days=7)).isoformat(),status='COLLECTED')
             if canary is not None:
                 # Explicit operator recovery verifies the same official host
                 # with a declared identity. Failed probes never lift denial.

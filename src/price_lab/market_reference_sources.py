@@ -124,6 +124,12 @@ def task(kind, entity='', day='', page=0):
     elif kind=='NASDAQ_CAPS':
         if entity or day or page:raise ValueError('Fixed Nasdaq capitalization snapshot required')
         url='https://api.nasdaq.com/api/screener/stocks';params={'tableonly':'true','limit':'25000'}
+    elif kind=='YAHOO_PRICE':
+        if not re.fullmatch(r'[A-Z][A-Z0-9.-]{0,19}',entity) or not day or day<'2010-01-01' or page:
+            raise ValueError('Exact dated public quote target required')
+        end=int(datetime.fromisoformat(day).replace(tzinfo=timezone.utc).timestamp())+86400
+        url='https://query1.finance.yahoo.com/v8/finance/chart/'+entity
+        params={'period1':end-8*86400,'period2':end,'interval':'1d','includePrePost':'false'}
     elif kind=='SEC_PRIMARY':
         if page:raise ValueError('SEC primary document has no page cursor')
         meta=sec_primary_metadata(dict(entity=entity,requested_date=day))
@@ -399,11 +405,34 @@ def jpm_page(request,body):
     return unique,p
 
 
+def yahoo_quote(request,body):
+    value=json.loads(body).get('chart',{})
+    records=value.get('result')
+    if value.get('error') or not isinstance(records,list) or len(records)!=1:raise ValueError('Public quote result required')
+    row=records[0];meta=row.get('meta',{})
+    if meta.get('symbol')!=request['entity'] or meta.get('currency')!='USD':raise ValueError('Public quote identity/currency mismatch')
+    stamps=row.get('timestamp',[]);quotes=row.get('indicators',{}).get('quote',[])
+    if not isinstance(stamps,list) or not 1<=len(stamps)<=14 or len(quotes)!=1:raise ValueError('Bounded daily quote series required')
+    closes=quotes[0].get('close',[]);volumes=quotes[0].get('volume',[])
+    if len(closes)!=len(stamps):raise ValueError('Aligned daily quote values required')
+    accepted=[]
+    for i,stamp in enumerate(stamps):
+        if type(stamp) not in (int,float) or not request['params']['period1']<=stamp<request['params']['period2']:raise ValueError('Quote outside requested date window')
+        close=closes[i]
+        if type(close) not in (int,float) or not math.isfinite(close) or close<=0:continue
+        on=datetime.fromtimestamp(stamp,timezone.utc).date().isoformat()
+        accepted.append({'symbol':meta['symbol'],'currency':'USD','price':close,'price_asof':on,
+            'reported_volume':volumes[i] if i<len(volumes) else None,'price_basis':'PUBLIC_UNADJUSTED_DAILY_CLOSE'})
+    if not accepted:raise ValueError('Positive dated reference quote required')
+    return max(accepted,key=lambda r:r['price_asof'])
+
+
 def validate_response(request, body):
     validate_task(request)
     if not isinstance(body,bytes) or not 0<len(body)<=MAX_BODY: raise ValueError('Reference body bound')
     kind=request['kind']
-    if kind in ('JPM_UNIVERSE','JPM_ACTIONS'):jpm_page(request,body)
+    if kind=='YAHOO_PRICE':yahoo_quote(request,body)
+    elif kind in ('JPM_UNIVERSE','JPM_ACTIONS'):jpm_page(request,body)
     elif kind=='FINRA_DAILY':
         rows=json.loads(body)
         if not isinstance(rows,list) or len(rows)>1000:raise ValueError('Bounded FINRA rows required')
