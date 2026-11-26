@@ -405,7 +405,7 @@ def jpm_page(request,body):
     return unique,p
 
 
-def yahoo_quote(request,body):
+def yahoo_quotes(request,body):
     value=json.loads(body).get('chart',{})
     records=value.get('result')
     if value.get('error') or not isinstance(records,list) or len(records)!=1:raise ValueError('Public quote result required')
@@ -424,7 +424,11 @@ def yahoo_quote(request,body):
         accepted.append({'symbol':meta['symbol'],'currency':'USD','price':close,'price_asof':on,
             'reported_volume':volumes[i] if i<len(volumes) else None,'price_basis':'PUBLIC_UNADJUSTED_DAILY_CLOSE'})
     if not accepted:raise ValueError('Positive dated reference quote required')
-    return max(accepted,key=lambda r:r['price_asof'])
+    return accepted
+
+
+def yahoo_quote(request,body):
+    return max(yahoo_quotes(request,body),key=lambda r:r['price_asof'])
 
 
 def validate_response(request, body):
