@@ -12,6 +12,35 @@ from test_market_reference_sources import fund_body,payload,jpm_body
 NOW=datetime(2026,11,24,tzinfo=timezone.utc)
 
 
+def test_nasdaq_screener_uses_public_json_request_headers(monkeypatch):
+    fetcher=p.Fetcher();calls=[]
+    class Response:
+        status_code=200;headers={}
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+        def iter_content(self,*args):return iter([b'{}'])
+    monkeypatch.setattr(fetcher.session,'request',lambda *a,**kw:(calls.append(kw) or Response()))
+    fetcher(s.task('NASDAQ_CAPS'))
+    assert calls[0]['headers']['Accept']=='application/json'
+    assert calls[0]['headers']['Origin']=='https://www.nasdaq.com'
+    assert calls[0]['headers']['Referer']=='https://www.nasdaq.com/market-activity/stocks/screener'
+    assert calls[0]['allow_redirects'] is False
+
+
+def test_transport_diagnostic_retains_only_exception_category(monkeypatch):
+    import requests
+    fetcher=p.Fetcher()
+    def fail(*args,**kwargs):raise requests.exceptions.ReadTimeout('secret-contact-and-proxy')
+    monkeypatch.setattr(fetcher.session,'request',fail)
+    status,headers,body=fetcher(s.task('NASDAQ_CAPS'))
+    assert (status,body)==(0,b'')
+    assert headers=={'X-PriceLab-Reason':'TRANSPORT_READ_TIMEOUT'}
+    monkeypatch.setattr(p,'plan',lambda *args:None)
+    state=p.initial_state('2026-11-23');state['pending']=[s.task('NASDAQ_CAPS')]
+    out=p.collect(state,bootstrap(),max_requests=1,now=NOW,fetch=fetcher,sleep=lambda _:None)
+    assert out['state']['cooldowns']['api.nasdaq.com']['reason']=='TRANSPORT_READ_TIMEOUT'
+
+
 def test_whole_market_snapshots_are_scheduled_without_resetting_sec_cursor():
     state=p.initial_state('2026-11-23');state['cursors']['sec']=42
     p.plan(state,bootstrap(),NOW)

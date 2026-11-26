@@ -26,6 +26,14 @@ def test_sec_primary_uses_exact_official_document_and_dated_metadata():
     with pytest.raises(ValueError):s.validate_response(t,b'{"error":"not a filing"}')
 
 
+def test_fund_reports_are_discovered_for_continuous_share_updates():
+    recent=dict(form=['N-CSRS','N-CSR'],filingDate=['2026-09-03','2026-03-03'],
+        accessionNumber=['0001193125-26-381557','0001193125-26-081557'],primaryDocument=['semi.htm','annual.htm'])
+    body=json.dumps(dict(cik=1160864,filings={'recent':recent,'files':[]})).encode()
+    tasks=s.discovered(s.task('SEC_SUBMISSIONS','0001160864'),body,primary=True,through='2026-11-24')
+    assert {s.sec_primary_metadata(t)['form'] for t in tasks}=={'N-CSRS','N-CSR'}
+
+
 def test_targeted_submissions_discover_bounded_primary_reports_only_when_requested():
     t=s.task('SEC_SUBMISSIONS','0001023128')
     recent=dict(form=['10-Q','10-Q','10-K','8-K','10-Q'],filingDate=['2026-10-28','2026-07-28','2026-02-28','2026-11-01','2027-01-01'],

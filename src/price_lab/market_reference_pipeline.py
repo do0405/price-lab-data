@@ -431,6 +431,11 @@ class Fetcher:
             # The public PDF endpoint needs ordinary document Accept headers.
             # No cookies, login session or authorization is sent to this host.
             headers={'User-Agent':'Mozilla/5.0','Accept':'application/pdf','Accept-Language':'en-US,en;q=0.9'}
+        if task['kind']=='NASDAQ_CAPS':
+            headers={'User-Agent':'Mozilla/5.0','Accept':'application/json',
+                'Origin':'https://www.nasdaq.com',
+                'Referer':'https://www.nasdaq.com/market-activity/stocks/screener',
+                'Accept-Language':'en-US,en;q=0.9'}
         if task['kind']=='FINRA_DAILY':headers['Accept']='application/json'
         if task['kind']=='KRX_INDEX':
             value=self.credentials.get('KRX_API_KEY')
@@ -445,7 +450,14 @@ class Fetcher:
                     if total>s.MAX_BODY: raise ValueError('Oversized provider response')
                     chunks.append(chunk)
                 return response.status_code,dict(response.headers),b''.join(chunks)
-        except requests.RequestException: return 0,{},b''
+        except requests.RequestException as exc:
+            # Exception messages can contain proxy credentials or contact data.
+            reason=('TRANSPORT_READ_TIMEOUT' if isinstance(exc,requests.exceptions.ReadTimeout) else
+                'TRANSPORT_CONNECT_TIMEOUT' if isinstance(exc,requests.exceptions.ConnectTimeout) else
+                'TRANSPORT_TLS_ERROR' if isinstance(exc,requests.exceptions.SSLError) else
+                'TRANSPORT_CONNECTION_ERROR' if isinstance(exc,requests.exceptions.ConnectionError) else
+                'TRANSPORT_UNAVAILABLE')
+            return 0,{'X-PriceLab-Reason':reason},b''
 
 
 def _reserved_reference(ready, cursor):
@@ -505,7 +517,11 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
         if status==200:
             try: s.validate_response(t,body)
             except (ValueError,KeyError,TypeError,UnicodeError): reason='RESPONSE_CONTRACT'
-        else: reason=f'HTTP_{status}' if status else ('SEC_IDENTITY_NOT_CONFIGURED' if headers.get('X-PriceLab-Reason')=='SEC_IDENTITY_NOT_CONFIGURED' else 'TRANSPORT_UNAVAILABLE')
+        else:
+            diagnostic=headers.get('X-PriceLab-Reason')
+            safe={'SEC_IDENTITY_NOT_CONFIGURED','TRANSPORT_READ_TIMEOUT','TRANSPORT_CONNECT_TIMEOUT',
+                'TRANSPORT_TLS_ERROR','TRANSPORT_CONNECTION_ERROR'}
+            reason=f'HTTP_{status}' if status else diagnostic if diagnostic in safe else 'TRANSPORT_UNAVAILABLE'
         if reason:
             delay=86400 if status in (400,401,403,404) or reason in ('RESPONSE_CONTRACT','SEC_IDENTITY_NOT_CONFIGURED') else 300
             if status==429:
@@ -521,6 +537,7 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
                 state['checked'][key]=dict(status='HISTORY_UNAVAILABLE' if t['kind']=='FUND' else reason,retry_at=(now+timedelta(days=30 if t['kind']=='FUND' else 1)).isoformat(),task=t)
                 state['pending']=[x for x in state['pending'] if s.digest(x)!=key]
         else:
+            state['cooldowns'].pop(host,None)
             if canary is not None:
                 # Explicit operator recovery verifies the same official host
                 # with a declared identity. Failed probes never lift denial.
