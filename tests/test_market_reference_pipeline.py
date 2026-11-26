@@ -20,6 +20,17 @@ def test_whole_market_snapshots_are_scheduled_without_resetting_sec_cursor():
     assert state['cursors']['sec']==42
 
 
+def test_directory_footer_only_refresh_does_not_duplicate_raw_or_observations(monkeypatch):
+    monkeypatch.setattr(p,'plan',lambda *args:None)
+    t=s.task('NASDAQ_DIRECTORY','nasdaq');body=b'Symbol|Security Name|ETF|Test Issue\nABC|ABC Common Stock|N|N\nFile Creation Time: 1126202610:00|||\n'
+    state=p.initial_state('2026-11-23');state['pending']=[t]
+    out=p.collect(state,bootstrap(),max_requests=1,now=NOW,fetch=lambda t:(200,{},body),sleep=lambda _:None)
+    state=out['state'];assert len(out['records'])==1;original=state['seen'][s.digest(t)]
+    state['pending']=[t]
+    out=p.collect(state,bootstrap(),max_requests=1,now=NOW,fetch=lambda t:(200,{},body.replace(b'10:00',b'14:00')),sleep=lambda _:None)
+    assert not out['records'] and out['state']['seen'][s.digest(t)]==original
+
+
 def test_capitalization_targets_are_prioritized_without_resetting_scan_or_other_queues(tmp_path):
     path=tmp_path/'config.json'
     path.write_text(json.dumps(dict(version=4,ciks=['0000000009'],research_targets=[],depositary_attachment_ids=['123'],jpm_document_ids=['a'*32])))

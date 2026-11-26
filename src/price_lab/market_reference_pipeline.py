@@ -529,13 +529,22 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
                 if t['kind']=='SEC_SUBMISSIONS':
                     fact=s.task('SEC_FACTS',t['entity'])
                     if s.digest(fact) not in state['checked']:state['pending'].insert(0,fact)
-            sha=hashlib.sha256(body).hexdigest()
+            semantic=None
+            if t['kind']=='NASDAQ_DIRECTORY':
+                import csv,io
+                reader=csv.DictReader(io.StringIO(body.decode('utf-8-sig')),delimiter='|')
+                field='Symbol' if t['entity']=='nasdaq' else 'ACT Symbol'
+                meaningful=[r for r in reader if r.get('Test Issue')=='N' and not str(r.get(field,'')).startswith('File Creation Time')]
+                semantic=s.digest([reader.fieldnames,sorted(meaningful,key=lambda r:r[field])])
+            semantic_unchanged=bool(semantic and state['checked'].get(key,{}).get('semantic_sha256')==semantic and key in state['seen'])
+            sha=state['seen'][key] if semantic_unchanged else hashlib.sha256(body).hexdigest()
             changed=state['seen'].get(key)!=sha
             if sha not in state['seen'].values():
                 retrieved=fixed or datetime.now(timezone.utc)
                 records.append(dict(task=t,retrieved_at=retrieved.isoformat(),body_base64=base64.b64encode(body).decode(),body_sha256=sha))
             else: unchanged+=1
             state['seen'][key]=sha; state['checked'][key]=dict(status='COLLECTED',checked_at=now.isoformat())
+            if semantic:state['checked'][key]['semantic_sha256']=semantic
             if empty_finra:state['checked'][key].update(status='SOURCE_EMPTY',response_status=204)
             if t['kind']=='SEC_MAP':
                 value=json.loads(body); position=value['fields'].index('cik')
