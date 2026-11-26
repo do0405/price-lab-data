@@ -5,6 +5,16 @@ import json
 import pytest
 
 
+def test_current_us_market_sources_have_fixed_bounded_contracts():
+    from price_lab import market_reference_sources as source
+    body=b'Symbol|Security Name|ETF|Test Issue\nABC|ABC Common Stock|N|N\nFile Creation Time: 1126202610:00|||\n'
+    source.validate_response(source.task('NASDAQ_DIRECTORY','nasdaq'),body)
+    with pytest.raises(ValueError):source.task('NASDAQ_DIRECTORY','https://example.com')
+    with pytest.raises(ValueError):source.validate_response(source.task('NASDAQ_DIRECTORY','nasdaq'),body.split(b'File Creation')[0])
+    source.validate_response(source.task('NASDAQ_CAPS'),json.dumps({'data':{'table':{'rows':[{'symbol':'ABC','marketCap':'1000'}]}}}).encode())
+    with pytest.raises(ValueError):source.task('NASDAQ_CAPS','arbitrary')
+
+
 def test_sec_primary_uses_exact_official_document_and_dated_metadata():
     entity='0001023128:0001023128-26-000060:10-Q:lad-20260930.htm'
     t=s.task('SEC_PRIMARY',entity,'2026-10-28')

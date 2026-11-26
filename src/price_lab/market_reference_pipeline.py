@@ -318,7 +318,11 @@ def plan(state, bootstrap, now):
     for url in s.NASDAQ_REPORTS:
         report=s.task('NASDAQ_PDF',url); key=s.digest(report)
         if key not in state['checked'] and key not in pending:pending={key:report,**pending}
-    refresh_kinds={'FUND_LATEST','KIND_INDUSTRY','RUSSELL_PAGE','FRED_INDEX','CBOE_INDEX','SEC_MAP','NASDAQ_FACTSHEET','NASDAQ_WEIGHTS'}
+    refresh_kinds={'FUND_LATEST','KIND_INDUSTRY','RUSSELL_PAGE','FRED_INDEX','CBOE_INDEX','SEC_MAP','NASDAQ_FACTSHEET','NASDAQ_WEIGHTS','NASDAQ_DIRECTORY','NASDAQ_CAPS'}
+    if not state['cursors'].get('us_market_snapshots_v1'):
+        for t in [*[s.task('NASDAQ_DIRECTORY',feed) for feed in s.NASDAQ_DIRECTORIES],s.task('NASDAQ_CAPS')]:
+            if s.digest(t) not in state['checked']:pending.setdefault(s.digest(t),t)
+        state['cursors']['us_market_snapshots_v1']=1
     for key,old in list(pending.items()):
         if old['kind'] in refresh_kinds and old['requested_date']:
             pending.pop(key)
@@ -347,6 +351,8 @@ def plan(state, bootstrap, now):
     if state['cursors'].get('current_window')!=window:
         current=[s.task('FUND_LATEST',f) for f in s.FUNDS]
         current += [s.task('KIND_INDUSTRY'),s.task('RUSSELL_PAGE'),s.task('SEC_MAP')]
+        current += [s.task('NASDAQ_DIRECTORY',feed) for feed in s.NASDAQ_DIRECTORIES]
+        current += [s.task('NASDAQ_CAPS')]
         current += [s.task('FRED_INDEX',index) for index in ('SP500','NASDAQ100','NASDAQCOM')]
         current += [s.task('CBOE_INDEX',index) for index in ('VIX','VVIX')]
         current += [s.task('NASDAQ_FACTSHEET','NDX')]

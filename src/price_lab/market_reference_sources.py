@@ -18,6 +18,8 @@ FUNDS = {'IVV': (239726, 'SP500', 'us-ishares', 'en_US'),
          'IWV': (239714, 'RUSSELL3000', 'us-ishares', 'en_US'),
          'CNDX': (253741, 'NASDAQ100', 'uk', 'en_GB')}
 ISHARES = 'https://www.ishares.com/varnish-api/blk-one01-product-data/product-data/api/v2/get-product-data'
+NASDAQ_DIRECTORIES={'nasdaq':'https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt',
+                    'other':'https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt'}
 LSEG = 'https://www.lseg.com/content/lseg/en_us/ftse-russell/index-resources/notices/jcr:content/root/container/page_content_region/page-content-region/section/section-fw/index_announcements_.indexannouncement.json'
 MAX_BODY = 28 * 1024**2
 NASDAQ_REPORTS=('https://indexes.nasdaqomx.com/docs/202601%20NDX%20Reconstitution%20and%20Performance%20Highlights.pdf',)
@@ -116,6 +118,12 @@ def task(kind, entity='', day='', page=0):
             params = dict(bld='dbms/MDC/STAT/standard/MDCSTAT03901', mktId={'KOSPI': 'STK', 'KOSDAQ': 'KSQ'}[entity], trdDd=day.replace('-', ''), money='1', csvxls_isNo='false')
     elif kind == 'SEC_MAP':
         url='https://www.sec.gov/files/company_tickers_exchange.json'
+    elif kind=='NASDAQ_DIRECTORY':
+        if entity not in NASDAQ_DIRECTORIES or day or page:raise ValueError('Exact Nasdaq directory required')
+        url=NASDAQ_DIRECTORIES[entity]
+    elif kind=='NASDAQ_CAPS':
+        if entity or day or page:raise ValueError('Fixed Nasdaq capitalization snapshot required')
+        url='https://api.nasdaq.com/api/screener/stocks';params={'tableonly':'true','limit':'25000'}
     elif kind=='SEC_PRIMARY':
         if page:raise ValueError('SEC primary document has no page cursor')
         meta=sec_primary_metadata(dict(entity=entity,requested_date=day))
@@ -425,6 +433,16 @@ def validate_response(request, body):
     elif kind=='SEC_MAP':
         value=json.loads(body)
         if value.get('fields')!=['cik','name','ticker','exchange'] or not isinstance(value.get('data'),list) or not value['data']: raise ValueError('SEC directory contract mismatch')
+    elif kind=='NASDAQ_DIRECTORY':
+        text=body.decode('utf-8-sig');reader=csv.DictReader(io.StringIO(text),delimiter='|')
+        symbol='Symbol' if request['entity']=='nasdaq' else 'ACT Symbol'
+        if not {symbol,'Security Name','ETF','Test Issue'}<=set(reader.fieldnames or []):raise ValueError('Nasdaq directory schema mismatch')
+        rows=[r for r in reader if not str(r.get(symbol,'')).startswith('File Creation Time')]
+        if not rows or len(rows)>50000 or not any(x.startswith('File Creation Time') for x in text.splitlines()):raise ValueError('Bounded complete Nasdaq directory required')
+        if any(not r.get(symbol) or r.get('Test Issue') not in ('Y','N') or r.get('ETF') not in ('Y','N') for r in rows):raise ValueError('Nasdaq directory flag mismatch')
+    elif kind=='NASDAQ_CAPS':
+        rows=json.loads(body).get('data',{}).get('table',{}).get('rows')
+        if not isinstance(rows,list) or not 1<=len(rows)<=25000 or any(not r.get('symbol') for r in rows):raise ValueError('Nasdaq capitalization snapshot contract mismatch')
     elif kind=='SEC_PRIMARY':
         lower=body[:3000].lower()
         if not any(marker in lower for marker in (b'<html',b'<!doctype html',b'<xbrl',b'<xbrli:xbrl')):

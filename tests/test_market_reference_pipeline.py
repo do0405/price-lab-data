@@ -12,6 +12,14 @@ from test_market_reference_sources import fund_body,payload,jpm_body
 NOW=datetime(2026,11,24,tzinfo=timezone.utc)
 
 
+def test_whole_market_snapshots_are_scheduled_without_resetting_sec_cursor():
+    state=p.initial_state('2026-11-23');state['cursors']['sec']=42
+    p.plan(state,bootstrap(),NOW)
+    assert {t['entity'] for t in state['pending'] if t['kind']=='NASDAQ_DIRECTORY'}=={'nasdaq','other'}
+    assert any(t['kind']=='NASDAQ_CAPS' for t in state['pending'])
+    assert state['cursors']['sec']==42
+
+
 def test_capitalization_targets_are_prioritized_without_resetting_scan_or_other_queues(tmp_path):
     path=tmp_path/'config.json'
     path.write_text(json.dumps(dict(version=4,ciks=['0000000009'],research_targets=[],depositary_attachment_ids=['123'],jpm_document_ids=['a'*32])))
