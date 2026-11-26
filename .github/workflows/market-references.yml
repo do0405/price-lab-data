@@ -1,4 +1,4 @@
-name: Official index, industry and share references
+name: Index, industry, shares and reference prices
 on:
   schedule:
     - cron: '47 */6 * * *'

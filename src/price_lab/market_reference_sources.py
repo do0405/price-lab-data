@@ -1,4 +1,4 @@
-"""Portable official-reference contracts. No database or credential I/O on import."""
+"""Public reference/secondary quote contracts; no database or credential I/O."""
 import base64
 import csv
 from datetime import date, datetime, timezone
@@ -409,7 +409,10 @@ def yahoo_quotes(request,body):
     value=json.loads(body).get('chart',{})
     records=value.get('result')
     if value.get('error') or not isinstance(records,list) or len(records)!=1:raise ValueError('Public quote result required')
-    row=records[0];meta=row.get('meta',{})
+    row=records[0]
+    if not isinstance(row,dict):raise ValueError('Public quote object required')
+    meta=row.get('meta',{})
+    if not isinstance(meta,dict):raise ValueError('Public quote metadata required')
     if meta.get('symbol')!=request['entity'] or meta.get('currency')!='USD':raise ValueError('Public quote identity/currency mismatch')
     stamps=row.get('timestamp',[]);quotes=row.get('indicators',{}).get('quote',[])
     if not isinstance(stamps,list) or not 1<=len(stamps)<=14 or len(quotes)!=1:raise ValueError('Bounded daily quote series required')
@@ -421,8 +424,10 @@ def yahoo_quotes(request,body):
         close=closes[i]
         if type(close) not in (int,float) or not math.isfinite(close) or close<=0:continue
         on=datetime.fromtimestamp(stamp,timezone.utc).date().isoformat()
+        volume=volumes[i] if i<len(volumes) else None
+        if type(volume) not in (int,float) or not math.isfinite(volume) or volume<0:volume=None
         accepted.append({'symbol':meta['symbol'],'currency':'USD','price':close,'price_asof':on,
-            'reported_volume':volumes[i] if i<len(volumes) else None,'price_basis':'PUBLIC_UNADJUSTED_DAILY_CLOSE'})
+            'reported_volume':volume,'price_basis':'PUBLIC_UNADJUSTED_DAILY_CLOSE'})
     if not accepted:raise ValueError('Positive dated reference quote required')
     return accepted
 
