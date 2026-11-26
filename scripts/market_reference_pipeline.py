@@ -13,13 +13,14 @@ def main():
     parser.add_argument('--seconds',type=int,default=1200)
     parser.add_argument('--max-requests',type=int,default=50)
     parser.add_argument('--max-batches',type=int,default=100)
-    parser.add_argument('--source-scope',choices=('all','sec'),default='all')
+    parser.add_argument('--source-scope',choices=('all','sec','gaps'),default='all')
     args=parser.parse_args()
     if not 60<=args.seconds<=3600 or not 1<=args.max_batches<=100: parser.error('Bounded cloud acquisition required')
     from price_lab.market_reference_pipeline import bootstrap,run
     result=run(bootstrap(ROOT/'config/market-reference-bootstrap.json'),ROOT/'data/research/market-reference-packages',
                seconds=args.seconds,max_requests=args.max_requests,max_batches=args.max_batches,
-               source_kinds=['SEC_MAP','SEC_CIK_NAMES','SEC_SUBMISSIONS','SEC_FACTS','SEC_ARCHIVE','SEC_PRIMARY'] if args.source_scope=='sec' else None)
+               source_kinds=(['SEC_MAP','SEC_CIK_NAMES','SEC_SUBMISSIONS','SEC_FACTS','SEC_ARCHIVE','SEC_PRIMARY'] if args.source_scope=='sec'
+                    else ['SEC_CIK_NAMES','YAHOO_PRICE','STOCKANALYSIS_PRICE'] if args.source_scope=='gaps' else None))
     if 'duckdb' in sys.modules or 'price_lab.local_credentials' in sys.modules: raise ValueError('Cloud reference runtime imported private/database code')
     print(json.dumps(result),flush=True)
 

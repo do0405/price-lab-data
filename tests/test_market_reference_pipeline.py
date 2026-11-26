@@ -12,6 +12,34 @@ from test_market_reference_sources import fund_body,payload,jpm_body
 NOW=datetime(2026,11,24,tzinfo=timezone.utc)
 
 
+def test_weekly_name_catalog_and_focused_primary_reports_are_not_starved():
+    state=p.initial_state('2026-11-23')
+    old=s.task('SEC_PRIMARY','0000000002:0000000002-26-000001:10-K:old.htm','2026-01-01')
+    urgent=s.task('SEC_PRIMARY','0000000001:0000000001-26-000001:10-K:new.htm','2026-01-01')
+    state['pending']=[old,urgent];b=bootstrap();b['capitalization_ciks']=['0000000001']
+    p.plan(state,b,NOW)
+    assert state['pending'][0]['kind']=='SEC_CIK_NAMES'
+    assert [t for t in state['pending'] if t['kind']=='SEC_PRIMARY']==[urgent,old]
+    state['checked'][s.digest(s.task('SEC_CIK_NAMES'))]=dict(status='COLLECTED',checked_at=NOW.isoformat())
+    state['pending']=[t for t in state['pending'] if t['kind']!='SEC_CIK_NAMES'];p.plan(state,b,NOW)
+    assert not any(t['kind']=='SEC_CIK_NAMES' for t in state['pending'])
+
+
+def test_secondary_quotes_resume_only_for_missing_primary_and_back_off_inactive_pages(monkeypatch):
+    from datetime import timedelta
+    from test_market_reference_sources import stockanalysis_body
+    b=bootstrap();b['price_symbols']=['CMLSQ'];state=p.initial_state('2026-11-23')
+    state['cursors']['price_quote_checks']={'CMLSQ':dict(status='HTTP_404',retry_at=(NOW+timedelta(days=30)).isoformat())}
+    out=p.collect(state,b,max_requests=1,now=NOW,source_kinds=['STOCKANALYSIS_PRICE'],fetch=lambda t:(200,{},stockanalysis_body()),sleep=lambda _:None)
+    assert out['requests']==1
+    state=out['state'];assert state['cursors']['secondary_price_quote_checks']['CMLSQ']['retry_at']==(NOW+timedelta(days=30)).isoformat()
+    p.plan(state,b,NOW);assert not any(t['kind']=='STOCKANALYSIS_PRICE' for t in state['pending'])
+    state=p.initial_state('2026-11-23');state['pending']=[s.task('STOCKANALYSIS_PRICE','CMLSQ','2026-11-23')]
+    monkeypatch.setattr(p,'plan',lambda *a:None)
+    out=p.collect(state,b,max_requests=1,now=NOW,fetch=lambda t:(200,{},b'<html>Symbol not found</html>'),sleep=lambda _:None)
+    assert out['state']['cooldowns']=={} and out['state']['pending']==[]
+
+
 def test_primary_context_survives_batch_boundary_and_is_pruned_after_completion(monkeypatch):
     monkeypatch.setattr(p,'plan',lambda *args:None)
     parent=s.task('SEC_SUBMISSIONS','0000000001')
@@ -113,7 +141,7 @@ def test_capitalization_targets_are_prioritized_without_resetting_scan_or_other_
     b=bootstrap();b.update(capitalization_ciks=cfg['capitalization_ciks'],sec_primary_documents=[document])
     p.plan(state,b,NOW)
     assert state['cursors']['sec']==1
-    assert state['pending'][0]['kind']=='SEC_PRIMARY'
+    assert next(t for t in state['pending'] if t['kind']!='SEC_CIK_NAMES')['kind']=='SEC_PRIMARY'
     assert any(t['kind']=='SEC_SUBMISSIONS' and t['entity']=='0001023128' for t in state['pending'])
 
 
@@ -376,9 +404,9 @@ def test_403_is_a_checkpointed_host_cooldown_not_empty_success():
 def test_successful_batch_resumes_without_refetching_completed_task():
     state=p.initial_state('2026-11-23'); calls=[]
     def fetch(t): calls.append(t); return 200,{},fund_body()
-    first=p.collect(state,bootstrap(),now=NOW,max_requests=1,fetch=fetch,sleep=lambda _:None)
+    first=p.collect(state,bootstrap(),now=NOW,max_requests=1,fetch=fetch,sleep=lambda _:None,source_kinds=['FUND_LATEST'])
     assert len(first['records'])==1 and calls[0]['entity']=='IVV'
-    p.collect(first['state'],bootstrap(),now=NOW,max_requests=1,fetch=lambda t:(calls.append(t) or (403,{},b'')),sleep=lambda _:None)
+    p.collect(first['state'],bootstrap(),now=NOW,max_requests=1,fetch=lambda t:(calls.append(t) or (403,{},b'')),sleep=lambda _:None,source_kinds=['FUND_LATEST'])
     assert calls[1]['entity']=='IWB' and calls[1]!=calls[0]
 
 

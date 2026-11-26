@@ -10,9 +10,9 @@ on:
         options: ['1200', '300', '600']
         default: '1200'
       source_scope:
-        description: Collect all references or verify the configured SEC path
+        description: Collect all references, SEC evidence, or gap prices and issuer names
         type: choice
-        options: ['all', 'sec']
+        options: ['all', 'sec', 'gaps']
         default: 'all'
 permissions:
   contents: read

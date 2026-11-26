@@ -425,7 +425,8 @@ def plan(state, bootstrap, now):
         for kind in ('SEC_SUBMISSIONS','SEC_FACTS'):
             t=s.task(kind,cik);key=s.digest(t);stamp=state['checked'].get(key,{}).get('checked_at')
             if stamp is None or datetime.fromisoformat(stamp)<=now-timedelta(days=1):urgent[key]=t
-    primary={k:t for k,t in pending.items() if t['kind']=='SEC_PRIMARY'}
+    primary=dict(sorted(((k,t) for k,t in pending.items() if t['kind']=='SEC_PRIMARY'),
+                        key=lambda item:item[1]['entity'].split(':',1)[0] not in priority))
     pending_quotes={t['entity'] for t in pending.values() if t['kind']=='YAHOO_PRICE'}
     for symbol in bootstrap.get('price_symbols',[]):
         stamp=state['cursors'].get('price_quote_checks',{}).get(symbol,{})
@@ -437,7 +438,8 @@ def plan(state, bootstrap, now):
         if primary_quote.get('status') in ('HTTP_404','RESPONSE_CONTRACT') and secondary.get('retry_at','')<=now.isoformat():
             t=s.task('STOCKANALYSIS_PRICE',symbol,through);key=s.digest(t)
             if key not in state['checked']:pending.setdefault(key,t)
-    state['pending']=list({**primary,**urgent,**pending}.values())
+    catalogs={k:t for k,t in pending.items() if t['kind']=='SEC_CIK_NAMES'}
+    state['pending']=list({**catalogs,**primary,**urgent,**pending}.values())
     return s.validate_state(state)
 
 

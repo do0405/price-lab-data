@@ -31,12 +31,14 @@ def response_limit(request):
 
 
 def sec_cik_names(body):
-    for line in body.decode('utf-8-sig').splitlines():
+    try:text=body.decode('utf-8-sig')
+    except UnicodeDecodeError:text=body.decode('latin-1')
+    for line in text.splitlines():
         if not line.strip():continue
         fields=line.rsplit(':',2)
         if len(fields)!=3 or fields[2] or not re.fullmatch(r'[0-9]{10}',fields[1]):
             raise ValueError('SEC name/CIK line contract mismatch')
-        if fields[0].strip():yield fields[0].strip(),fields[1]
+        if fields[0].strip() and int(fields[1])>0:yield fields[0].strip(),fields[1]
 
 
 def stockanalysis_quote(request,body):
