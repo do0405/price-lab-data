@@ -480,7 +480,10 @@ class Fetcher:
                 chunks=[]; total=0
                 for chunk in response.iter_content(1024**2):
                     total+=len(chunk)
-                    if total>s.response_limit(task): raise ValueError('Oversized provider response')
+                    if total>s.response_limit(task):
+                        # Close this stream without losing the already fetched
+                        # records or preventing other documents from collecting.
+                        return 0,{'X-PriceLab-Reason':'RESPONSE_TOO_LARGE'},b''
                     chunks.append(chunk)
                 return response.status_code,dict(response.headers),b''.join(chunks)
         except requests.RequestException as exc:
@@ -557,10 +560,12 @@ def collect(state,bootstrap,*,max_requests=50,now=None,fetch=None,sleep=time.sle
             except (ValueError,KeyError,TypeError,UnicodeError): reason='RESPONSE_CONTRACT'
         else:
             diagnostic=headers.get('X-PriceLab-Reason')
-            safe={'SEC_IDENTITY_NOT_CONFIGURED','TRANSPORT_READ_TIMEOUT','TRANSPORT_CONNECT_TIMEOUT',
+            safe={'RESPONSE_TOO_LARGE','SEC_IDENTITY_NOT_CONFIGURED','TRANSPORT_READ_TIMEOUT','TRANSPORT_CONNECT_TIMEOUT',
                 'TRANSPORT_TLS_ERROR','TRANSPORT_CONNECTION_ERROR'}
             reason=f'HTTP_{status}' if status else diagnostic if diagnostic in safe else 'TRANSPORT_UNAVAILABLE'
-        if reason:
+        if reason=='RESPONSE_TOO_LARGE':
+            state['checked'][key]=dict(status=reason,retry_at=(now+timedelta(days=30)).isoformat(),task=t)
+        elif reason:
             delay=86400 if status in (400,401,403,404) or reason in ('RESPONSE_CONTRACT','SEC_IDENTITY_NOT_CONFIGURED') else 300
             if status==429:
                 try: delay=max(60,min(86400,int(headers.get('Retry-After','300'))))

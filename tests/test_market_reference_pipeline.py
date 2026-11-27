@@ -103,6 +103,41 @@ def test_transport_diagnostic_retains_only_exception_category(monkeypatch):
     assert out['state']['cooldowns']['api.nasdaq.com']['reason']=='TRANSPORT_READ_TIMEOUT'
 
 
+def test_oversized_stream_closes_response_and_returns_a_bounded_diagnostic(monkeypatch):
+    closed=[]
+    class Response:
+        status_code=200;headers={}
+        def __enter__(self):return self
+        def __exit__(self,*args):closed.append(True)
+        def iter_content(self,*args):return iter([b'12345678',b'9'])
+    fetcher=p.Fetcher()
+    monkeypatch.setattr(s,'response_limit',lambda task:8)
+    monkeypatch.setattr(fetcher.session,'request',lambda *a,**kw:Response())
+    status,headers,body=fetcher(s.task('NASDAQ_CAPS'))
+    assert (status,body)==(0,b'') and headers['X-PriceLab-Reason']=='RESPONSE_TOO_LARGE'
+    assert closed==[True]
+
+
+def test_one_oversized_document_keeps_completed_records_and_other_sec_requests(monkeypatch):
+    from datetime import timedelta
+    monkeypatch.setattr(p,'plan',lambda *a:None)
+    first=s.task('SEC_SUBMISSIONS','0000000001')
+    large=s.task('SEC_PRIMARY','0000000001:0000000001-26-000001:N-CSR:large.htm','2026-01-01')
+    last=s.task('SEC_SUBMISSIONS','0000000002')
+    state=p.initial_state('2026-11-23');state['pending']=[first,large,last]
+    def fetch(task):
+        if task==large:return 0,{'X-PriceLab-Reason':'RESPONSE_TOO_LARGE'},b''
+        return 200,{},json.dumps({'cik':int(task['entity']),'filings':{'recent':{},'files':[]}}).encode()
+    out=p.collect(state,bootstrap(),max_requests=3,now=NOW,fetch=fetch,sleep=lambda _:None)
+    assert out['requests']==3 and [x['task'] for x in out['records']]==[first,last]
+    check=out['state']['checked'][s.digest(large)]
+    assert check['status']=='RESPONSE_TOO_LARGE' and check['task']==large
+    assert check['retry_at']==(NOW+timedelta(days=30)).isoformat()
+    assert out['state']['cooldowns']=={} and out['state']['pending']==[large]
+    assert p.collect(out['state'],bootstrap(),max_requests=1,now=NOW+timedelta(days=29),
+        fetch=lambda t:pytest.fail('oversized document retried too early'),sleep=lambda _:None)['requests']==0
+
+
 def test_whole_market_snapshots_are_scheduled_without_resetting_sec_cursor():
     state=p.initial_state('2026-11-23');state['cursors']['sec']=42
     p.plan(state,bootstrap(),NOW)
