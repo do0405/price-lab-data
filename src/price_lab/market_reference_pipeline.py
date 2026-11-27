@@ -454,7 +454,7 @@ def plan(state, bootstrap, now):
         if primary_quote.get('status') in ('HTTP_404','RESPONSE_CONTRACT') and secondary.get('retry_at','')<=now.isoformat():
             t=s.task('STOCKANALYSIS_PRICE',symbol,through);key=s.digest(t)
             if key not in state['checked']:pending.setdefault(key,t)
-    catalogs={k:t for k,t in pending.items() if t['kind']=='SEC_CIK_NAMES'}
+    catalogs={k:t for kind in ('SEC_CIK_NAMES','SEC_FUND_MAP') for k,t in pending.items() if t['kind']==kind}
     state['pending']=list({**catalogs,**primary,**urgent,**pending}.values())
     return s.validate_state(state)
 

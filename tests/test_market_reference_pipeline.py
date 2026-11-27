@@ -19,6 +19,7 @@ def test_weekly_name_catalog_and_focused_primary_reports_are_not_starved():
     state['pending']=[old,urgent];b=bootstrap();b['capitalization_ciks']=['0000000001']
     p.plan(state,b,NOW)
     assert state['pending'][0]['kind']=='SEC_CIK_NAMES'
+    assert state['pending'][1]['kind']=='SEC_FUND_MAP'
     assert [t for t in state['pending'] if t['kind']=='SEC_PRIMARY']==[urgent,old]
     state['checked'][s.digest(s.task('SEC_CIK_NAMES'))]=dict(status='COLLECTED',checked_at=NOW.isoformat())
     state['pending']=[t for t in state['pending'] if t['kind']!='SEC_CIK_NAMES'];p.plan(state,b,NOW)
@@ -193,7 +194,7 @@ def test_capitalization_targets_are_prioritized_without_resetting_scan_or_other_
     b=bootstrap();b.update(capitalization_ciks=cfg['capitalization_ciks'],sec_primary_documents=[document])
     p.plan(state,b,NOW)
     assert state['cursors']['sec']==1
-    assert next(t for t in state['pending'] if t['kind']!='SEC_CIK_NAMES')['kind']=='SEC_PRIMARY'
+    assert next(t for t in state['pending'] if t['kind'] not in ('SEC_CIK_NAMES','SEC_FUND_MAP'))['kind']=='SEC_PRIMARY'
     assert any(t['kind']=='SEC_SUBMISSIONS' and t['entity']=='0001023128' for t in state['pending'])
 
 
