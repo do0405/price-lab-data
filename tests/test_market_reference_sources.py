@@ -37,6 +37,12 @@ def test_sec_primary_uses_exact_official_document_and_dated_metadata():
     with pytest.raises(ValueError):s.validate_response(t,b'{"error":"not a filing"}')
 
 
+def test_legacy_small_business_reports_use_the_existing_primary_contract():
+    for form in ('10-KSB','10-QSB/A'):
+        t=s.task('SEC_PRIMARY','0001138169:0001138169-07-000001:'+form+':cover.htm','2007-05-14')
+        assert s.sec_primary_metadata(t)['form']==form and s.response_limit(t) is None
+
+
 def test_fund_reports_are_discovered_for_continuous_share_updates():
     recent=dict(form=['N-CSRS','N-CSR'],filingDate=['2026-09-03','2026-03-03'],
         accessionNumber=['0001193125-26-381557','0001193125-26-081557'],primaryDocument=['semi.htm','annual.htm'])

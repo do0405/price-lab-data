@@ -134,7 +134,7 @@ def sec_failure_diagnostic(status,headers,body):
 
 
 def sec_primary_metadata(request):
-    match=re.fullmatch(r'([0-9]{10}):([0-9]{10}-[0-9]{2}-[0-9]{6}):(10-[KQ](?:/A)?|20-F(?:/A)?|40-F(?:/A)?|N-CSR[S]?(?:/A)?|N-2(?:ASR|/A)?|[SF]-1(?:/A)?):([A-Za-z0-9_.-]{1,180}\.(?:htm|html|xml|txt))',request['entity'])
+    match=re.fullmatch(r'([0-9]{10}):([0-9]{10}-[0-9]{2}-[0-9]{6}):(10-(?:[KQ]SB|[KQ])(?:/A)?|20-F(?:/A)?|40-F(?:/A)?|N-CSR[S]?(?:/A)?|N-2(?:ASR|/A)?|[SF]-1(?:/A)?):([A-Za-z0-9_.-]{1,180}\.(?:htm|html|xml|txt))',request['entity'])
     if not match or '..' in match[4] or not request['requested_date']:
         raise ValueError('Exact SEC primary filing metadata required')
     date.fromisoformat(request['requested_date'])
@@ -666,7 +666,7 @@ def discovered(request, body,*,primary=False,through=None):
         if primary:
             recent=filings.get('recent',{});forms=recent.get('form',[]);candidates=[]
             for n,form in enumerate(forms):
-                if form not in ('10-K','10-K/A','10-Q','10-Q/A','20-F','20-F/A','40-F','40-F/A','N-CSR','N-CSR/A','N-CSRS','N-CSRS/A','N-2','N-2/A','N-2ASR','S-1','S-1/A','F-1','F-1/A'):continue
+                if form not in ('10-K','10-K/A','10-Q','10-Q/A','10-KSB','10-KSB/A','10-QSB','10-QSB/A','20-F','20-F/A','40-F','40-F/A','N-CSR','N-CSR/A','N-CSRS','N-CSRS/A','N-2','N-2/A','N-2ASR','S-1','S-1/A','F-1','F-1/A'):continue
                 filed=recent.get('filingDate',[])[n]
                 if through and filed>through:continue
                 entity=':'.join((request['entity'],recent['accessionNumber'][n],form,recent['primaryDocument'][n]))
@@ -675,7 +675,7 @@ def discovered(request, body,*,primary=False,through=None):
                 candidates.append(candidate)
             candidates.sort(key=lambda x:(x['requested_date'],x['entity']),reverse=True)
             selected=candidates[:2]
-            annual=next((t for t in candidates if sec_primary_metadata(t)['form'].split('/')[0] in ('10-K','20-F','40-F','N-CSR')),None)
+            annual=next((t for t in candidates if sec_primary_metadata(t)['form'].split('/')[0] in ('10-K','10-KSB','20-F','40-F','N-CSR')),None)
             if annual is not None and annual not in selected:selected.append(annual)
             result.extend(selected)
     return list({digest(t):t for t in result}.values())
