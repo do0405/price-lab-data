@@ -196,6 +196,9 @@ def task(kind, entity='', day='', page=0):
             params = dict(bld='dbms/MDC/STAT/standard/MDCSTAT03901', mktId={'KOSPI': 'STK', 'KOSDAQ': 'KSQ'}[entity], trdDd=day.replace('-', ''), money='1', csvxls_isNo='false')
     elif kind == 'SEC_MAP':
         url='https://www.sec.gov/files/company_tickers_exchange.json'
+    elif kind=='SEC_FUND_MAP':
+        if entity or day or page:raise ValueError('Fixed SEC fund-class directory required')
+        url='https://www.sec.gov/files/company_tickers_mf.json'
     elif kind=='SEC_CIK_NAMES':
         if entity or day or page:raise ValueError('Fixed SEC name directory required')
         url='https://www.sec.gov/Archives/edgar/cik-lookup-data.txt'
@@ -561,6 +564,14 @@ def validate_response(request, body):
     elif kind=='SEC_MAP':
         value=json.loads(body)
         if value.get('fields')!=['cik','name','ticker','exchange'] or not isinstance(value.get('data'),list) or not value['data']: raise ValueError('SEC directory contract mismatch')
+    elif kind=='SEC_FUND_MAP':
+        value=json.loads(body)
+        if value.get('fields')!=['cik','seriesId','classId','symbol'] or not isinstance(value.get('data'),list) or not 1<=len(value['data'])<=100000:raise ValueError('SEC fund-class directory contract mismatch')
+        for row in value['data']:
+            if (not isinstance(row,list) or len(row)!=4 or type(row[0]) is not int or not 0<row[0]<10**10
+                or not isinstance(row[1],str) or not re.fullmatch(r'S[0-9]{9}',row[1])
+                or not isinstance(row[2],str) or not re.fullmatch(r'C[0-9]{9}',row[2])
+                or not isinstance(row[3],str) or len(row[3])>30):raise ValueError('SEC fund-class row mismatch')
     elif kind=='NASDAQ_DIRECTORY':
         text=body.decode('utf-8-sig');reader=csv.DictReader(io.StringIO(text),delimiter='|')
         symbol='Symbol' if request['entity']=='nasdaq' else 'ACT Symbol'

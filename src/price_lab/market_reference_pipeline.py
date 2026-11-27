@@ -362,15 +362,26 @@ def plan(state, bootstrap, now):
                 metadata.update(status='RECHECK_AFTER_COUNT_CONTRACT_FIX',retry_at=now.isoformat())
                 pending.setdefault(key,failed)
         state['cursors']['lseg_count_contract']=2
+    if state['cursors'].get('sec_fund_map_contract',0)<1:
+        # Official classes may be registered before a ticker is assigned.
+        # Retry only the pre-fix schema rejection, preserving every other gap.
+        for metadata in state['checked'].values():
+            failed=metadata.get('task',{})
+            if metadata.get('status')=='RESPONSE_CONTRACT' and failed.get('kind')=='SEC_FUND_MAP':
+                metadata.update(status='RECHECK_AFTER_FUND_CLASS_CONTRACT_FIX',retry_at=now.isoformat())
+                pending.setdefault(s.digest(failed),failed)
+        state['cursors']['sec_fund_map_contract']=1
     def add(t,refresh=False):
         key=s.digest(t)
         checked=state['checked'].get(key,{})
-        if key not in state['checked'] or (refresh and checked.get('checked_at','')<(now-timedelta(days=7)).isoformat()): pending.setdefault(key,t)
+        interval=1 if t['kind']=='SEC_FUND_MAP' else 7
+        if key not in state['checked'] or (refresh and checked.get('checked_at','')<(now-timedelta(days=interval)).isoformat()): pending.setdefault(key,t)
     add(s.task('SEC_CIK_NAMES'),refresh=True)
+    add(s.task('SEC_FUND_MAP'),refresh=True)
     window=today+f'T{now.hour//6*6:02d}'
     if state['cursors'].get('current_window')!=window:
         current=[s.task('FUND_LATEST',f) for f in s.FUNDS]
-        current += [s.task('KIND_INDUSTRY'),s.task('RUSSELL_PAGE'),s.task('SEC_MAP')]
+        current += [s.task('KIND_INDUSTRY'),s.task('RUSSELL_PAGE'),s.task('SEC_MAP'),s.task('SEC_FUND_MAP')]
         current += [s.task('NASDAQ_DIRECTORY',feed) for feed in s.NASDAQ_DIRECTORIES]
         current += [s.task('NASDAQ_CAPS')]
         current += [s.task('FRED_INDEX',index) for index in ('SP500','NASDAQ100','NASDAQCOM')]

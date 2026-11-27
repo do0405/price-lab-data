@@ -19,8 +19,8 @@ def main():
     from price_lab.market_reference_pipeline import bootstrap,run
     result=run(bootstrap(ROOT/'config/market-reference-bootstrap.json'),ROOT/'data/research/market-reference-packages',
                seconds=args.seconds,max_requests=args.max_requests,max_batches=args.max_batches,
-               source_kinds=(['SEC_MAP','SEC_CIK_NAMES','SEC_SUBMISSIONS','SEC_FACTS','SEC_ARCHIVE','SEC_PRIMARY'] if args.source_scope=='sec'
-                    else ['SEC_CIK_NAMES','YAHOO_PRICE','STOCKANALYSIS_PRICE'] if args.source_scope=='gaps' else None))
+               source_kinds=(['SEC_MAP','SEC_FUND_MAP','SEC_CIK_NAMES','SEC_SUBMISSIONS','SEC_FACTS','SEC_ARCHIVE','SEC_PRIMARY'] if args.source_scope=='sec'
+                    else ['SEC_CIK_NAMES','SEC_FUND_MAP','YAHOO_PRICE','STOCKANALYSIS_PRICE'] if args.source_scope=='gaps' else None))
     if 'duckdb' in sys.modules or 'price_lab.local_credentials' in sys.modules: raise ValueError('Cloud reference runtime imported private/database code')
     print(json.dumps(result),flush=True)
 

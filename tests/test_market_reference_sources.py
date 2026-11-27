@@ -15,6 +15,17 @@ def test_current_us_market_sources_have_fixed_bounded_contracts():
     with pytest.raises(ValueError):source.task('NASDAQ_CAPS','arbitrary')
 
 
+def test_sec_registered_fund_class_map_keeps_the_series_and_share_class():
+    from price_lab import market_reference_sources as source
+    task=source.task('SEC_FUND_MAP')
+    assert task['url']=='https://www.sec.gov/files/company_tickers_mf.json'
+    body=json.dumps({'fields':['cik','seriesId','classId','symbol'],
+        'data':[[1597389,'S000068241','C000218475','USE'],[1884021,'S000110182','C000281429','']]}).encode()
+    source.validate_response(task,body)
+    with pytest.raises(ValueError):source.task('SEC_FUND_MAP','another')
+    with pytest.raises(ValueError):source.validate_response(task,body.replace(b'S000068241',b'C000068241'))
+
+
 def test_sec_primary_uses_exact_official_document_and_dated_metadata():
     entity='0001023128:0001023128-26-000060:10-Q:lad-20260930.htm'
     t=s.task('SEC_PRIMARY',entity,'2026-10-28')

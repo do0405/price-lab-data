@@ -480,7 +480,9 @@ def test_pending_topup_is_bounded_even_with_denied_providers():
     state=p.initial_state('2026-11-23'); b=bootstrap(); b['kr_sessions']=['2010-01-04']*1000
     for _ in range(1000): p.plan(state,b,NOW)
     # Fixed, verified archive seeds are separate from bounded queue top-ups.
-    assert len(state['pending'])-len(s.RUSSELL_ARCHIVE_REPORTS)<100
+    fund_maps=sum(t['kind']=='SEC_FUND_MAP' for t in state['pending'])
+    assert fund_maps==1
+    assert len(state['pending'])-len(s.RUSSELL_ARCHIVE_REPORTS)-fund_maps<100
 
 
 def test_old_catalog_checkpoint_migrates_without_repeating_404_or_losing_scope():
