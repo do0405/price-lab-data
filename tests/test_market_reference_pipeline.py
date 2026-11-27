@@ -119,6 +119,30 @@ def test_oversized_stream_closes_response_and_returns_a_bounded_diagnostic(monke
     assert closed==[True]
 
 
+def test_sec_document_stream_is_not_subject_to_other_provider_limits(monkeypatch):
+    body=b'<html>'+b' '*(s.MAX_BODY+1)+b'</html>';closed=[]
+    class Response:
+        status_code=200;headers={}
+        def __enter__(self):return self
+        def __exit__(self,*args):closed.append(True)
+        def iter_content(self,*args):return iter([body[:s.MAX_BODY],body[s.MAX_BODY:]])
+    fetcher=p.Fetcher(credentials={'SEC_USER_AGENT':'PriceLab Research test@example.edu'})
+    monkeypatch.setattr(fetcher.session,'request',lambda *a,**kw:Response())
+    task=s.task('SEC_PRIMARY','0000000001:0000000001-26-000001:N-CSR:large.htm','2026-01-01')
+    assert fetcher(task)==(200,{},body) and closed==[True]
+
+
+def test_lifting_sec_document_limit_requeues_only_its_prior_size_failures():
+    from datetime import timedelta
+    task=s.task('SEC_PRIMARY','0000000001:0000000001-26-000001:N-CSR:large.htm','2026-01-01')
+    other=s.task('NASDAQ_CAPS');state=p.initial_state('2026-11-23')
+    for t in (task,other):state['checked'][s.digest(t)]=dict(status='RESPONSE_TOO_LARGE',retry_at=(NOW+timedelta(days=30)).isoformat(),task=t)
+    p.plan(state,bootstrap(),NOW)
+    assert state['checked'][s.digest(task)]['retry_at']==NOW.isoformat()
+    assert state['checked'][s.digest(other)]['status']=='RESPONSE_TOO_LARGE'
+    tasks=[t for t in state['pending'] if t['kind']=='SEC_PRIMARY'];assert tasks[0]==task
+
+
 def test_one_oversized_document_keeps_completed_records_and_other_sec_requests(monkeypatch):
     from datetime import timedelta
     monkeypatch.setattr(p,'plan',lambda *a:None)

@@ -53,3 +53,20 @@ def test_cross_domain_daily_cipher_rejected(tmp_path):
     p=payload();path=tmp_path/'x';codec.seal_package(p,path,b'x'*32)
     from price_lab.daily_delta_codec import open_package
     with pytest.raises(ValueError):open_package(path,b'x'*32)
+
+
+def test_large_market_sec_roundtrip_keeps_authentication_and_kr_limits(tmp_path,monkeypatch):
+    import os
+    from test_market_reference_sources import payload as market_payload
+    from price_lab import market_reference_sources as s
+    p=market_payload();body=b'<html>'+os.urandom(32768).hex().encode()+b'</html>'
+    t=s.task('SEC_PRIMARY','0000000001:0000000001-26-000001:N-CSR:large.htm','2026-01-01')
+    p['records']=[dict(task=t,retrieved_at=p['collected_at'],body_base64=base64.b64encode(body).decode(),body_sha256=hashlib.sha256(body).hexdigest())]
+    monkeypatch.setattr(codec,'MAX_RAW_BYTES',4096)
+    path=tmp_path/'large.pldelta';codec.seal_package(p,path,b'x'*32)
+    assert codec.open_package(path,b'x'*32)==p
+    raw=bytearray(path.read_bytes());raw[-1]^=1;path.write_bytes(raw)
+    monkeypatch.setattr(codec.gzip,'GzipFile',lambda *a,**k:pytest.fail('Unauthenticated data must not be decompressed'))
+    with pytest.raises(ValueError,match='authentication'):codec.open_package(path,b'x'*32)
+    kr=payload();large=b'x'*8192;kr['records'][0].update(body_base64=base64.b64encode(large).decode(),body_sha256=hashlib.sha256(large).hexdigest())
+    with pytest.raises(ValueError,match='payload size limit'):codec.validate_payload(kr)

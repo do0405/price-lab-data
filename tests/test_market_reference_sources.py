@@ -163,6 +163,20 @@ def payload():
                 state=initial_state('2026-11-23'))
 
 
+def test_sec_primary_has_no_response_or_aggregate_body_size_cap(monkeypatch):
+    t=s.task('SEC_PRIMARY','0000000001:0000000001-26-000001:N-CSR:large.htm','2026-01-01')
+    assert s.response_limit(t) is None
+    body=b'<html>'+b' '*(s.MAX_BODY+1)+b'</html>'
+    s.validate_response(t,body)
+    p=payload();record=dict(task=t,retrieved_at='2026-11-23T23:00:00+00:00',body_base64=base64.b64encode(body).decode(),body_sha256=hashlib.sha256(body).hexdigest())
+    p['records'].append(record)
+    monkeypatch.setattr(s,'MAX_PACKAGE_BYTES',4096)
+    assert s.validate_payload(p)==p
+    p['records'][0]['body_base64']=base64.b64encode(b'x'*8192).decode()
+    p['records'][0]['body_sha256']=hashlib.sha256(b'x'*8192).hexdigest()
+    with pytest.raises(ValueError,match='Market package bound'):s.validate_payload(p)
+
+
 @pytest.mark.parametrize('field,value',[('url','https://attacker.example/'),('params',{'AUTH_KEY':'secret'}),('method','PUT'),('entity','IWM')])
 def test_endpoint_and_parameter_tampering_rejected(field,value):
     t=s.task('FUND','IVV','2026-11-20'); t[field]=value

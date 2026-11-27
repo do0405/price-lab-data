@@ -193,7 +193,7 @@ def load(head, directory, *, key=None, token=None):
         release=_api('GET','/releases/tags/'+tag(head),revalidate=True,token=token)
         if release.get('tag_name')!=tag(head) or release.get('draft') or release.get('prerelease'): raise ValueError('Committed reference release unavailable')
         assets=[a for a in release.get('assets',[]) if a.get('name')==ASSET]
-        if len(assets)!=1 or not 0<assets[0]['size']<=135*1024**2: raise ValueError('Reference asset contract mismatch')
+        if len(assets)!=1 or type(assets[0]['size']) is not int or assets[0]['size']<=0: raise ValueError('Reference asset contract mismatch')
         asset=assets[0]; url=f"https://api.github.com/repos/do0405/price-lab-data/releases/assets/{int(asset['id'])}"
         partial=path.with_suffix('.working')
         try:
@@ -371,6 +371,13 @@ def plan(state, bootstrap, now):
                 metadata.update(status='RECHECK_AFTER_FUND_CLASS_CONTRACT_FIX',retry_at=now.isoformat())
                 pending.setdefault(s.digest(failed),failed)
         state['cursors']['sec_fund_map_contract']=1
+    if not state['cursors'].get('sec_primary_unbounded_response_v1'):
+        for key,metadata in state['checked'].items():
+            failed=metadata.get('task',{})
+            if metadata.get('status')=='RESPONSE_TOO_LARGE' and failed.get('kind')=='SEC_PRIMARY':
+                metadata.update(status='RECHECK_AFTER_DOCUMENT_SIZE_LIMIT_REMOVAL',retry_at=now.isoformat())
+                pending.setdefault(key,failed)
+        state['cursors']['sec_primary_unbounded_response_v1']=1
     def add(t,refresh=False):
         key=s.digest(t)
         checked=state['checked'].get(key,{})
@@ -455,7 +462,8 @@ def plan(state, bootstrap, now):
             t=s.task('STOCKANALYSIS_PRICE',symbol,through);key=s.digest(t)
             if key not in state['checked']:pending.setdefault(key,t)
     catalogs={k:t for kind in ('SEC_CIK_NAMES','SEC_FUND_MAP') for k,t in pending.items() if t['kind']==kind}
-    state['pending']=list({**catalogs,**primary,**urgent,**pending}.values())
+    restored={k:t for k,t in pending.items() if state['checked'].get(k,{}).get('status')=='RECHECK_AFTER_DOCUMENT_SIZE_LIMIT_REMOVAL'}
+    state['pending']=list({**catalogs,**restored,**primary,**urgent,**pending}.values())
     return s.validate_state(state)
 
 
@@ -488,10 +496,10 @@ class Fetcher:
         options={'json':task['params']} if task['kind'] in ('LSEG_CATALOG','FINRA_DAILY') else {'data':task['params']} if task['method']=='POST' else {'params':task['params']}
         try:
             with self.session.request(task['method'],task['url'],headers=headers,timeout=(15,35),allow_redirects=False,stream=True,**options) as response:
-                chunks=[]; total=0
+                chunks=[]; total=0;limit=s.response_limit(task)
                 for chunk in response.iter_content(1024**2):
                     total+=len(chunk)
-                    if total>s.response_limit(task):
+                    if limit is not None and total>limit:
                         # Close this stream without losing the already fetched
                         # records or preventing other documents from collecting.
                         return 0,{'X-PriceLab-Reason':'RESPONSE_TOO_LARGE'},b''

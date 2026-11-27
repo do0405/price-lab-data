@@ -23,11 +23,13 @@ NASDAQ_DIRECTORIES={'nasdaq':'https://www.nasdaqtrader.com/dynamic/SymDir/nasdaq
                     'other':'https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt'}
 LSEG = 'https://www.lseg.com/content/lseg/en_us/ftse-russell/index-resources/notices/jcr:content/root/container/page_content_region/page-content-region/section/section-fw/index_announcements_.indexannouncement.json'
 MAX_BODY = 28 * 1024**2
+MAX_PACKAGE_BYTES = 100 * 1024**2
 
 
 def response_limit(request):
-    # The complete SEC name directory is ~39 MiB. Other provider contracts
-    # keep their original limit; this still fits one bounded encrypted batch.
+    # Official filing documents have no artificial byte ceiling. Catalog and
+    # other provider contracts retain their independent response limits.
+    if request['kind']=='SEC_PRIMARY':return None
     return 42*1024**2 if request['kind']=='SEC_CIK_NAMES' else MAX_BODY
 
 
@@ -526,7 +528,8 @@ def yahoo_quote(request,body):
 
 def validate_response(request, body):
     validate_task(request)
-    if not isinstance(body,bytes) or not 0<len(body)<=response_limit(request): raise ValueError('Reference body bound')
+    limit=response_limit(request)
+    if not isinstance(body,bytes) or not body or (limit is not None and len(body)>limit): raise ValueError('Reference body bound')
     kind=request['kind']
     if kind=='YAHOO_PRICE':yahoo_quote(request,body)
     elif kind=='STOCKANALYSIS_PRICE':stockanalysis_quote(request,body)
@@ -690,20 +693,21 @@ def validate_payload(payload):
     stamp=_instant(payload['collected_at']); _json_tree(payload['state']); validate_state(payload['state'])
     records=payload['records']
     if not isinstance(records,list) or len(records)>100: raise ValueError('Bounded reference records required')
-    ids=set()
+    ids=set();primary_encoded_bytes=0
     for record in records:
         _fields(record,('task','retrieved_at','body_base64','body_sha256'))
         validate_task(record['task']); _hash(record['body_sha256'])
         if _instant(record['retrieved_at'])>stamp: raise ValueError('Future retrieval')
         encoded=record['body_base64']
         limit=response_limit(record['task'])
-        if not isinstance(encoded,str) or len(encoded)>limit*4//3+4: raise ValueError('Encoded body bound')
+        if not isinstance(encoded,str) or (limit is not None and len(encoded)>limit*4//3+4): raise ValueError('Encoded body bound')
         body=base64.b64decode(encoded,validate=True)
-        if not 0<len(body)<=limit or hashlib.sha256(body).hexdigest()!=record['body_sha256']: raise ValueError('Body integrity failure')
+        if not body or (limit is not None and len(body)>limit) or hashlib.sha256(body).hexdigest()!=record['body_sha256']: raise ValueError('Body integrity failure')
+        if record['task']['kind']=='SEC_PRIMARY':primary_encoded_bytes+=len(encoded)
         key=digest(record['task'])
         if key in ids: raise ValueError('Duplicate task record')
         ids.add(key)
-    if len(canonical(payload).encode())>100*1024**2: raise ValueError('Market package bound')
+    if len(canonical(payload).encode())-primary_encoded_bytes>MAX_PACKAGE_BYTES: raise ValueError('Market package bound')
     return payload
 
 

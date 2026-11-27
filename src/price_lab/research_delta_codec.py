@@ -191,7 +191,7 @@ def open_bootstrap(path,key):
 
 def seal_package(payload,path,key):
     validate_payload(payload);raw=_canonical(payload)
-    if len(raw)>MAX_RAW_BYTES:raise ValueError('Package raw size limit exceeded')
+    if payload['stream_id']!='market-reference-v1' and len(raw)>MAX_RAW_BYTES:raise ValueError('Package raw size limit exceeded')
     digest=hashlib.sha256(raw).hexdigest()
     public={k:payload[k] for k in _IDENTITY};public['package_sha256']=digest
     header=_canonical(public)
@@ -211,21 +211,28 @@ def seal_package(payload,path,key):
 
 def open_package(path,key):
     path=Path(path)
-    if path.stat().st_size>MAX_RAW_BYTES+MAX_RAW_BYTES//1000+MAX_HEADER_BYTES+128:raise ValueError('Package ciphertext size limit exceeded')
+    oversized=path.stat().st_size>MAX_RAW_BYTES+MAX_RAW_BYTES//1000+MAX_HEADER_BYTES+128
     with path.open('rb') as stream:
         prefix=stream.read(12)
         if len(prefix)!=12 or prefix[:8]!=MAGIC:raise ValueError('Invalid research package format')
         length=struct.unpack('>I',prefix[8:])[0]
         if not 1<=length<=MAX_HEADER_BYTES:raise ValueError('Package header limit exceeded')
-        header=stream.read(length);nonce=stream.read(12);ciphertext=stream.read()
+        header=stream.read(length)
+        if oversized:
+            # This bounded public header only selects the stream's byte policy.
+            # GCM authentication still precedes decompression and body parsing.
+            hint=_loads(header)
+            if not isinstance(hint,dict) or hint.get('stream_id')!='market-reference-v1':raise ValueError('Package ciphertext size limit exceeded')
+        nonce=stream.read(12);ciphertext=stream.read()
     if len(header)!=length or len(nonce)!=12 or len(ciphertext)<16:raise ValueError('Truncated research package')
     try:compressed=AESGCM(_key(key)).decrypt(nonce,ciphertext,prefix+header)
     except InvalidTag:raise ValueError('Research package authentication failed') from None
     public=_loads(header)
+    market=isinstance(public,dict) and public.get('stream_id')=='market-reference-v1'
     try:
-        with gzip.GzipFile(fileobj=io.BytesIO(compressed),mode='rb') as source:raw=source.read(MAX_RAW_BYTES+1)
+        with gzip.GzipFile(fileobj=io.BytesIO(compressed),mode='rb') as source:raw=source.read() if market else source.read(MAX_RAW_BYTES+1)
     except (OSError,EOFError):raise ValueError('Invalid authenticated package compression') from None
-    if len(raw)>MAX_RAW_BYTES:raise ValueError('Package raw size limit exceeded')
+    if not market and len(raw)>MAX_RAW_BYTES:raise ValueError('Package raw size limit exceeded')
     payload=validate_payload(_loads(raw))
     expected={k:payload[k] for k in _IDENTITY};expected['package_sha256']=hashlib.sha256(_canonical(payload)).hexdigest()
     if public!=expected:raise ValueError('Package header/payload identity mismatch')
