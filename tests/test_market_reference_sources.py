@@ -115,6 +115,18 @@ def test_targeted_submissions_discover_bounded_primary_reports_only_when_request
     tasks=s.discovered(t,body,primary=True,through='2026-11-24')
     assert len(tasks)==3 and all(x['kind']=='SEC_PRIMARY' for x in tasks)
     assert {s.sec_primary_metadata(x)['form'] for x in tasks}=={'10-Q','10-K'}
+
+
+def test_latest_annual_amendments_also_discover_the_actual_base_report():
+    t=s.task('SEC_SUBMISSIONS','0001611110')
+    recent=dict(form=['10-K/A','10-K/A','10-K','10-Q'],
+        filingDate=['2021-04-30','2021-04-05','2021-03-31','2020-11-16'],
+        accessionNumber=['0001611110-21-000030','0001611110-21-000020','0001611110-21-000010','0001611110-20-000010'],
+        primaryDocument=['amend2.htm','amend1.htm','base.htm','quarter.htm'])
+    body=json.dumps(dict(cik=1611110,filings={'recent':recent,'files':[]})).encode()
+    tasks=s.discovered(t,body,primary=True,through='2026-11-25')
+    assert len(tasks)==3
+    assert {x['url'].rsplit('/',1)[-1] for x in tasks}=={'amend2.htm','amend1.htm','base.htm'}
 from price_lab import market_reference_sources as s
 from price_lab.research_delta_codec import seal_package,open_package,package_digest
 

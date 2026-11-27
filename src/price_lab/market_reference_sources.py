@@ -677,6 +677,13 @@ def discovered(request, body,*,primary=False,through=None):
             selected=candidates[:2]
             annual=next((t for t in candidates if sec_primary_metadata(t)['form'].split('/')[0] in ('10-K','10-KSB','20-F','40-F','N-CSR')),None)
             if annual is not None and annual not in selected:selected.append(annual)
+            if annual is not None and sec_primary_metadata(annual)['form'].endswith('/A'):
+                # An amendment can contain only signatures or corrected fees.
+                # Keep the last actual annual report as well, without replaying
+                # every historical filing of this issuer.
+                base_form=sec_primary_metadata(annual)['form'].split('/')[0]
+                original=next((t for t in candidates if sec_primary_metadata(t)['form']==base_form),None)
+                if original is not None and original not in selected:selected.append(original)
             result.extend(selected)
     return list({digest(t):t for t in result}.values())
 
